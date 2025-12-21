@@ -81,9 +81,6 @@ Desktop.ini
 *.log
 logs/
 
-# Data
-data/
-
 # Temporary files
 *.tmp
 *.temp
@@ -92,3 +89,9 @@ tmp/
 
 # Distribution / packaging
 *.whl
+
+# Data
+data/
+
+# Output
+output/
