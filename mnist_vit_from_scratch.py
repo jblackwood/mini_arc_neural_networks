@@ -296,6 +296,53 @@ def _main_inner(logger: logging.Logger) -> int:
     logger.info("%s", pr)
     (OUTPUT_DIR / "test_examples.txt").write_text(gt + "\n" + pr + "\n", encoding="utf-8")
 
+    # Collect bad predictions (misclassified examples)
+    logger.info("Collecting bad predictions...")
+    bad_predictions = []
+    model.eval()
+    with torch.no_grad():
+        for data in test_loader:
+            images, labels = data
+            images_dev, labels_dev = images.to(device), labels.to(device)
+            outputs = model(images_dev)
+            _, predicted = torch.max(outputs, 1)
+
+            # Find misclassified examples
+            misclassified_mask = predicted != labels_dev
+            misclassified_indices = torch.where(misclassified_mask)[0]
+
+            for idx in misclassified_indices:
+                bad_predictions.append({
+                    'image': images[idx],
+                    'true_label': labels[idx].item(),
+                    'predicted_label': predicted[idx].item()
+                })
+
+                # Stop after collecting 5 bad predictions
+                if len(bad_predictions) >= 5:
+                    break
+
+            if len(bad_predictions) >= 5:
+                break
+
+    # Visualize bad predictions if we found any
+    if bad_predictions:
+        logger.info("Bad Predictions (Misclassified Examples):")
+
+        # Create grid of misclassified images
+        bad_images = torch.stack([bp['image'] for bp in bad_predictions])
+        grid = torchvision.utils.make_grid(bad_images)
+        _save_grid_image(grid, OUTPUT_DIR / "bad_predictions.png", title="Bad Predictions")
+
+        # Create text output
+        gt_bad = "GroundTruth:  " + " ".join(f"{bp['true_label']}" for bp in bad_predictions)
+        pr_bad = "Predicted:    " + " ".join(f"{bp['predicted_label']}" for bp in bad_predictions)
+        logger.info("%s", gt_bad)
+        logger.info("%s", pr_bad)
+        (OUTPUT_DIR / "bad_predictions.txt").write_text(gt_bad + "\n" + pr_bad + "\n", encoding="utf-8")
+    else:
+        logger.info("No bad predictions found! Model is perfect on the test set.")
+
     # Persist metrics
     metrics = {
         "test_accuracy_percent": float(test_acc),
