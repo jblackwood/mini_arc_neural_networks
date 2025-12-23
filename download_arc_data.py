@@ -183,3 +183,33 @@ else:
     os.remove(conceptarc_zip_filename)
     
     print(f"ConceptARC dataset extracted to '{conceptarc_dataset_path}' directory.")
+
+# Download MINI-ARC from GitHub
+miniarc_zip_url = "https://github.com/KSB21ST/MINI-ARC/archive/refs/heads/master.zip"
+miniarc_dataset_folder = "MINI-ARC"
+miniarc_dataset_path = os.path.join(data_dir, miniarc_dataset_folder)
+
+if os.path.exists(miniarc_dataset_path) and os.listdir(miniarc_dataset_path):
+    print(f"MINI-ARC dataset already exists in '{miniarc_dataset_path}'. Skipping download.")
+else:
+    print(f"Downloading MINI-ARC from GitHub...")
+
+    # Download the zip file
+    miniarc_zip_filename = os.path.join(data_dir, "mini-arc-master.zip")
+    os.makedirs(data_dir, exist_ok=True)
+    urllib.request.urlretrieve(miniarc_zip_url, miniarc_zip_filename)
+
+    print(f"Downloaded to: {miniarc_zip_filename}")
+
+    # Extract the zip file
+    with zipfile.ZipFile(miniarc_zip_filename, 'r') as zip_ref:
+        zip_ref.extractall(data_dir)
+
+    # Rename the extracted folder
+    extracted_folder = os.path.join(data_dir, "MINI-ARC-master")
+    os.rename(extracted_folder, miniarc_dataset_path)
+
+    # Remove the zip file
+    os.remove(miniarc_zip_filename)
+
+    print(f"MINI-ARC dataset extracted to '{miniarc_dataset_path}' directory.")
