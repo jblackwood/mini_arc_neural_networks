@@ -1,7 +1,7 @@
 """Core data structures for ARC datasets."""
 
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Literal, Optional
 
@@ -33,23 +33,19 @@ def parse_arc_json(file_path: Path) -> ARCTask:
         file_path: Path to the JSON file
 
     Returns:
-        ARCTask object containing train and test examples
+        ARCTask object containing train and test examples, and optional metadata
     """
     with open(file_path, "r") as f:
         data = json.load(f)
 
-    train_examples = [
-        ARCExample(input=ex["input"], output=ex["output"]) for ex in data["train"]
-    ]
-
-    test_examples = [
-        ARCExample(input=ex["input"], output=ex["output"]) for ex in data["test"]
-    ]
-
-    return ARCTask(train=train_examples, test=test_examples)
+    return ARCTask(
+        train=[ARCExample(**ex) for ex in data.pop("train")],
+        test=[ARCExample(**ex) for ex in data.pop("test")],
+        **data
+    )
 
 
-def task_to_dict(task: ARCTask) -> Dict:
+def _task_to_dict(task: ARCTask) -> Dict:
     """Convert an ARCTask to a dictionary suitable for JSON serialization.
 
     Args:
@@ -58,22 +54,9 @@ def task_to_dict(task: ARCTask) -> Dict:
     Returns:
         Dictionary with train and test examples, and optional metadata
     """
-    result = {
-        "train": [{"input": ex.input, "output": ex.output} for ex in task.train],
-        "test": [{"input": ex.input, "output": ex.output} for ex in task.test],
-    }
-
-    # Add optional metadata fields if present
-    if task.task_id is not None:
-        result["task_id"] = task.task_id
-    if task.task_type is not None:
-        result["task_type"] = task.task_type
-    if task.transformation is not None:
-        result["transformation"] = task.transformation
-    if task.color_permutation is not None:
-        result["color_permutation"] = task.color_permutation
-
-    return result
+    result = asdict(task)
+    # Remove None values from optional fields
+    return {k: v for k, v in result.items() if v is not None}
 
 
 def save_task_json(task: ARCTask, file_path: Path) -> None:
@@ -85,5 +68,5 @@ def save_task_json(task: ARCTask, file_path: Path) -> None:
     """
     file_path.parent.mkdir(parents=True, exist_ok=True)
     with open(file_path, "w") as f:
-        json.dump(task_to_dict(task), f, indent=2)
+        json.dump(_task_to_dict(task), f, indent=2)
         f.write("\n")

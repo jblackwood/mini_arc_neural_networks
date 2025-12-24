@@ -95,7 +95,7 @@ def save_to_csv(grid_dimensions: List[GridDimension], output_path: Path) -> None
 def main():
     """Main function to analyze MiniARC grid dimensions."""
     data_dir = Path("data/MINI-ARC/data/MiniARC")
-    output_path = Path("output/mini_arc_data_augmentations/grid_dimensions.csv")
+    output_path = Path("output/mini_arc_analysis/grid_dimensions.csv")
 
     print(f"Analyzing grid dimensions in {data_dir}...")
     grid_dimensions = analyze_mini_arc_dimensions(data_dir)
