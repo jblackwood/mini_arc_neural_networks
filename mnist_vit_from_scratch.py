@@ -24,7 +24,6 @@ import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
 
-
 OUTPUT_DIR = Path("output/mnist_vit")
 
 
@@ -38,7 +37,9 @@ def _setup_logging(output_dir: Path) -> logging.Logger:
     logger.handlers.clear()
     logger.propagate = False
 
-    fmt = logging.Formatter(fmt="%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    fmt = logging.Formatter(
+        fmt="%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
 
     file_handler = logging.FileHandler(output_dir / "run.log", encoding="utf-8")
     file_handler.setLevel(logging.INFO)
@@ -112,8 +113,12 @@ class VisionTransformer(nn.Module):
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
 
         # Transformer Encoder
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_head, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_head, batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=n_layers
+        )
 
         # Classification head
         self.classifier = nn.Linear(d_model, n_classes)
@@ -125,7 +130,9 @@ class VisionTransformer(nn.Module):
 
         # Create patches
         # Unfold to get patches: (B, C, H, W) -> (B, n_patches, patch_size*patch_size)
-        x = x.unfold(2, self.patch_size, self.patch_size).unfold(3, self.patch_size, self.patch_size)
+        x = x.unfold(2, self.patch_size, self.patch_size).unfold(
+            3, self.patch_size, self.patch_size
+        )
         x = x.contiguous().view(b, -1, self.patch_size * self.patch_size)
 
         # Embed patches
@@ -164,12 +171,16 @@ def _main_inner(logger: logging.Logger) -> int:
 
     # Set device
     device = torch.device(
-        "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+        "mps"
+        if torch.backends.mps.is_available()
+        else "cuda" if torch.cuda.is_available() else "cpu"
     )
     logger.info("Using device: %s", device)
 
     cfg = Config()
-    (OUTPUT_DIR / "config.json").write_text(json.dumps(asdict(cfg), indent=2) + "\n", encoding="utf-8")
+    (OUTPUT_DIR / "config.json").write_text(
+        json.dumps(asdict(cfg), indent=2) + "\n", encoding="utf-8"
+    )
 
     # Hyperparameters
     BATCH_SIZE = cfg.batch_size
@@ -191,12 +202,20 @@ def _main_inner(logger: logging.Logger) -> int:
     )
 
     # Download and load training data
-    train_dataset = torchvision.datasets.MNIST(root="./data", train=True, download=True, transform=transform)
-    train_loader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    train_dataset = torchvision.datasets.MNIST(
+        root="./data", train=True, download=True, transform=transform
+    )
+    train_loader = torch.utils.data.DataLoader(
+        dataset=train_dataset, batch_size=BATCH_SIZE, shuffle=True
+    )
 
     # Download and load test data
-    test_dataset = torchvision.datasets.MNIST(root="./data", train=False, download=True, transform=transform)
-    test_loader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    test_dataset = torchvision.datasets.MNIST(
+        root="./data", train=False, download=True, transform=transform
+    )
+    test_loader = torch.utils.data.DataLoader(
+        dataset=test_dataset, batch_size=BATCH_SIZE, shuffle=False
+    )
 
     logger.info("Data loaded.")
 
@@ -206,12 +225,18 @@ def _main_inner(logger: logging.Logger) -> int:
 
     logger.info("Sample binary images:")
     grid = torchvision.utils.make_grid(images[:8])
-    _save_grid_image(grid, OUTPUT_DIR / "sample_binary_images.png", title="Sample binary images")
+    _save_grid_image(
+        grid, OUTPUT_DIR / "sample_binary_images.png", title="Sample binary images"
+    )
     label_line = "Labels: " + " ".join(f"{labels[j].item()}" for j in range(8))
     logger.info("%s", label_line)
-    (OUTPUT_DIR / "sample_binary_images_labels.txt").write_text(label_line + "\n", encoding="utf-8")
+    (OUTPUT_DIR / "sample_binary_images_labels.txt").write_text(
+        label_line + "\n", encoding="utf-8"
+    )
 
-    model = VisionTransformer(IMG_SIZE, PATCH_SIZE, D_MODEL, N_HEAD, N_LAYERS, N_CLASSES).to(device)
+    model = VisionTransformer(
+        IMG_SIZE, PATCH_SIZE, D_MODEL, N_HEAD, N_LAYERS, N_CLASSES
+    ).to(device)
     logger.info("Model:\n%s", model)
     (OUTPUT_DIR / "model.txt").write_text(str(model) + "\n", encoding="utf-8")
 
@@ -294,7 +319,9 @@ def _main_inner(logger: logging.Logger) -> int:
     pr = "Predicted:    " + " ".join(f"{predicted[j].item()}" for j in range(8))
     logger.info("%s", gt)
     logger.info("%s", pr)
-    (OUTPUT_DIR / "test_examples.txt").write_text(gt + "\n" + pr + "\n", encoding="utf-8")
+    (OUTPUT_DIR / "test_examples.txt").write_text(
+        gt + "\n" + pr + "\n", encoding="utf-8"
+    )
 
     # Collect bad predictions (misclassified examples)
     logger.info("Collecting bad predictions...")
@@ -312,11 +339,13 @@ def _main_inner(logger: logging.Logger) -> int:
             misclassified_indices = torch.where(misclassified_mask)[0]
 
             for idx in misclassified_indices:
-                bad_predictions.append({
-                    'image': images[idx],
-                    'true_label': labels[idx].item(),
-                    'predicted_label': predicted[idx].item()
-                })
+                bad_predictions.append(
+                    {
+                        "image": images[idx],
+                        "true_label": labels[idx].item(),
+                        "predicted_label": predicted[idx].item(),
+                    }
+                )
 
                 # Stop after collecting 5 bad predictions
                 if len(bad_predictions) >= 5:
@@ -330,16 +359,24 @@ def _main_inner(logger: logging.Logger) -> int:
         logger.info("Bad Predictions (Misclassified Examples):")
 
         # Create grid of misclassified images
-        bad_images = torch.stack([bp['image'] for bp in bad_predictions])
+        bad_images = torch.stack([bp["image"] for bp in bad_predictions])
         grid = torchvision.utils.make_grid(bad_images)
-        _save_grid_image(grid, OUTPUT_DIR / "bad_predictions.png", title="Bad Predictions")
+        _save_grid_image(
+            grid, OUTPUT_DIR / "bad_predictions.png", title="Bad Predictions"
+        )
 
         # Create text output
-        gt_bad = "GroundTruth:  " + " ".join(f"{bp['true_label']}" for bp in bad_predictions)
-        pr_bad = "Predicted:    " + " ".join(f"{bp['predicted_label']}" for bp in bad_predictions)
+        gt_bad = "GroundTruth:  " + " ".join(
+            f"{bp['true_label']}" for bp in bad_predictions
+        )
+        pr_bad = "Predicted:    " + " ".join(
+            f"{bp['predicted_label']}" for bp in bad_predictions
+        )
         logger.info("%s", gt_bad)
         logger.info("%s", pr_bad)
-        (OUTPUT_DIR / "bad_predictions.txt").write_text(gt_bad + "\n" + pr_bad + "\n", encoding="utf-8")
+        (OUTPUT_DIR / "bad_predictions.txt").write_text(
+            gt_bad + "\n" + pr_bad + "\n", encoding="utf-8"
+        )
     else:
         logger.info("No bad predictions found! Model is perfect on the test set.")
 
@@ -350,7 +387,9 @@ def _main_inner(logger: logging.Logger) -> int:
         "epochs": int(EPOCHS),
         "elapsed_seconds": float(time.time() - start_time),
     }
-    (OUTPUT_DIR / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
+    (OUTPUT_DIR / "metrics.json").write_text(
+        json.dumps(metrics, indent=2) + "\n", encoding="utf-8"
+    )
 
     logger.info("Wrote outputs to: %s", OUTPUT_DIR)
 
