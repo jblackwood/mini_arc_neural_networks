@@ -185,7 +185,7 @@ def generate_augmentations(
     result.append(original_arc_task)
 
     # Generate augmented tasks
-    augmentations_generated = 1  # Count the original
+    augmentations_generated = 0  # Count the original
     attempts = 0
     max_attempts = max_augmentations * 2  # Prevent infinite loops
 
@@ -302,9 +302,9 @@ def process_files(
 def create_train_test_datasets(
     data_dir: Path,
     output_dir: Path,
-    test_ratio: float = 0.2,
-    random_seed: int = 42,
-    max_augmentations: int = 100,
+    test_ratio: float,
+    random_seed: int,
+    max_augmentations: int,
 ) -> None:
     """Create train and test datasets from MiniARC tasks with augmentations.
 
@@ -359,7 +359,7 @@ def main() -> None:
         output_dir=output_dir,
         test_ratio=0.2,
         random_seed=42,
-        max_augmentations=100,
+        max_augmentations=500,
     )
 
 
