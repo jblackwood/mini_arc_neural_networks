@@ -1,8 +1,4 @@
-"""Create train and test datasets from MiniARC tasks with augmentations.
-
-This script processes MiniARC JSON files and creates train.jsonl and test.jsonl files
-where each line contains a single example with task_id, type, idx, input, and output fields.
-Tasks are augmented by applying rotations/flips and color permutations.
+"""Create train and post_train datasets from MiniARC tasks with augmentations.
 """
 
 import random
@@ -299,19 +295,19 @@ def process_files(
     print(f"Wrote {total_tasks} task JSON files to {output_dir}")
 
 
-def create_train_test_datasets(
+def create_dataset(
     data_dir: Path,
     output_dir: Path,
-    test_ratio: float,
+    post_train_ratio: float,
     random_seed: int,
     max_augmentations: int,
 ) -> None:
-    """Create train and test datasets from MiniARC tasks with augmentations.
+    """Create train and post_train datasets from MiniARC tasks with augmentations.
 
     Args:
         data_dir: Path to the MiniARC data directory
         output_dir: Path to the output directory
-        test_ratio: Ratio of tasks to put in test set (default: 0.2)
+        post_train_ratio: Ratio of tasks to put in post_train set (default: 0.2)
         random_seed: Random seed for deterministic splitting (default: 42)
         max_augmentations: Maximum number of augmented tasks per original task (default: 100)
     """
@@ -322,42 +318,46 @@ def create_train_test_datasets(
     json_files = sorted(data_dir.glob("*.json"))
     print(f"Found {len(json_files)} task files")
 
-    # Shuffle and split into train and test
+    # Shuffle and split into train and post_train
     random.shuffle(json_files)
-    num_test = int(len(json_files) * test_ratio)
-    test_files = json_files[:num_test]
-    train_files = json_files[num_test:]
+    num_post_train = int(len(json_files) * post_train_ratio)
+    post_train_files = json_files[:num_post_train]
+    train_files = json_files[num_post_train:]
 
     print(f"Train tasks: {len(train_files)}")
-    print(f"Test tasks: {len(test_files)}")
+    print(f"Post Train tasks: {len(post_train_files)}")
 
     # Create output directories
     train_output_dir = output_dir / "train"
-    test_output_dir = output_dir / "test"
+    post_train_output_dir = output_dir / "post_train"
 
     # Process train files
     print(f"\nProcessing train files...")
     process_files(train_files, train_output_dir, max_augmentations, random_seed)
 
-    # Process test files
-    print(f"\nProcessing test files...")
-    process_files(test_files, test_output_dir, max_augmentations, random_seed + 1)
+    # Process post_train files
+    print(f"\nProcessing post_train files...")
+    process_files(
+        post_train_files, post_train_output_dir, max_augmentations, random_seed + 1
+    )
 
     print(f"\nDatasets created successfully!")
     print(f"Train directory: {train_output_dir}")
-    print(f"Test directory: {test_output_dir}")
+    print(f"Post Train directory: {post_train_output_dir}")
 
 
 def main() -> None:
-    """Main function to create train and test datasets with augmentations."""
+    """Main function to create train and post_train datasets with augmentations."""
     data_dir = Path("data/MINI-ARC/data/MiniARC")
     output_dir = Path("output/mini_arc_analysis")
 
-    print("Creating train and test datasets from MiniARC tasks with augmentations...")
-    create_train_test_datasets(
+    print(
+        "Creating train and post_train datasets from MiniARC tasks with augmentations..."
+    )
+    create_dataset(
         data_dir=data_dir,
         output_dir=output_dir,
-        test_ratio=0.2,
+        post_train_ratio=0.2,
         random_seed=42,
         max_augmentations=500,
     )
