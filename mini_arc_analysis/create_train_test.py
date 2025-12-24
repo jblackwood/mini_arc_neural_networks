@@ -187,7 +187,7 @@ def generate_augmentations(
     # Generate augmented tasks
     augmentations_generated = 1  # Count the original
     attempts = 0
-    max_attempts = max_augmentations * 10  # Prevent infinite loops
+    max_attempts = max_augmentations * 2  # Prevent infinite loops
 
     while augmentations_generated < max_augmentations and attempts < max_attempts:
         attempts += 1
