@@ -115,34 +115,40 @@ class ARCTransformer(nn.Module):
 
     Args:
         num_tasks: Number of unique tasks in vocabulary
-        num_colors: Number of unique colors (0-9, so 10)
+        task_embedding_num_tokens: Number of tokens to use for task embedding
         d_model: Dimension of embeddings and transformer
         nhead: Number of attention heads
         num_layers: Number of transformer encoder layers
         dim_feedforward: Dimension of feedforward network
         max_seq_len: Maximum sequence length for positional embeddings
+        num_colors: Number of unique colors (0-9, so 10)
     """
 
     def __init__(
         self,
         num_tasks: int,
-        d_model: int = 128,
-        nhead: int = 4,
-        num_layers: int = 3,
-        dim_feedforward: int = 512,
-        max_seq_len: int = 51,
-        num_colors: int = 10,
+        task_embedding_num_tokens: int,
+        d_model: int,
+        nhead: int,
+        num_layers: int,
+        dim_feedforward: int,
+        max_seq_len: int,
+        num_colors: int,
     ):
         super().__init__()
 
         self.d_model = d_model
         self.num_colors = num_colors
+        self.task_embedding_num_tokens = task_embedding_num_tokens
 
         # MASK token is added as an extra embedding (index = num_colors)
         self.mask_token_idx = num_colors
 
         # Embedding layers
-        self.task_embedding = nn.Embedding(num_tasks, d_model)
+        # Task embedding is larger: num_tokens * d_model
+        self.task_embedding = nn.Embedding(
+            num_tasks, d_model * task_embedding_num_tokens
+        )
         # Grid embedding now includes the MASK token (num_colors + 1 total)
         self.grid_embedding = nn.Embedding(num_colors + 1, d_model)
         self.pos_embedding = nn.Embedding(max_seq_len, d_model)
@@ -179,10 +185,15 @@ class ARCTransformer(nn.Module):
         # Flatten input grid
         input_flat = input_grid.view(batch_size, -1)  # (batch_size, H*W)
 
-        # Get embeddings
-        task_emb = self.task_embedding(task_idx).unsqueeze(
-            1
-        )  # (batch_size, 1, d_model)
+        # Get task embedding and reshape into multiple tokens
+        task_emb_flat = self.task_embedding(
+            task_idx
+        )  # (batch_size, d_model * num_tokens)
+        task_emb = task_emb_flat.view(
+            batch_size, self.task_embedding_num_tokens, self.d_model
+        )  # (batch_size, num_tokens, d_model)
+
+        # Get grid embeddings
         input_emb = self.grid_embedding(input_flat)  # (batch_size, H*W, d_model)
 
         # Create mask tokens for all output positions (same size as input)
@@ -194,10 +205,10 @@ class ARCTransformer(nn.Module):
         )
         output_emb = self.grid_embedding(mask_tokens)  # (batch_size, H*W, d_model)
 
-        # Concatenate: [task, input, masked_output]
+        # Concatenate: [task_tokens, input, masked_output]
         seq = torch.cat(
             [task_emb, input_emb, output_emb], dim=1
-        )  # (batch_size, 1+2*H*W, d_model)
+        )  # (batch_size, num_tokens+2*H*W, d_model)
         seq_len = seq.shape[1]
 
         # Add positional embeddings
@@ -211,7 +222,7 @@ class ARCTransformer(nn.Module):
         encoded = self.transformer(seq)  # (batch_size, seq_len, d_model)
 
         # Extract output portion and project
-        output_start = 1 + H * W
+        output_start = self.task_embedding_num_tokens + H * W
         output_encoded = encoded[:, output_start:, :]  # (batch_size, H*W, d_model)
         logits = self.output_proj(output_encoded)  # (batch_size, H*W, num_colors)
 
@@ -296,6 +307,15 @@ def main():
     num_epochs = 100
     learning_rate = 1e-4
 
+    # Model architecture hyperparameters
+    TASK_EMBEDDING_NUM_TOKENS = 5
+    D_MODEL = 128
+    NHEAD = 4
+    NUM_LAYERS = 3
+    DIM_FEEDFORWARD = 512
+    MAX_SEQ_LEN = 55
+    NUM_COLORS = 10
+
     # Select device
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -330,12 +350,13 @@ def main():
     # Create model
     model = ARCTransformer(
         num_tasks=train_dataset.vocab_size,
-        d_model=128,
-        nhead=4,
-        num_layers=3,
-        dim_feedforward=512,
-        max_seq_len=51,
-        num_colors=10,
+        task_embedding_num_tokens=TASK_EMBEDDING_NUM_TOKENS,
+        d_model=D_MODEL,
+        nhead=NHEAD,
+        num_layers=NUM_LAYERS,
+        dim_feedforward=DIM_FEEDFORWARD,
+        max_seq_len=MAX_SEQ_LEN,
+        num_colors=NUM_COLORS,
     ).to(device)
 
     # Count parameters
@@ -380,12 +401,13 @@ def main():
             "test_loss": test_loss,
             "vocab_size": train_dataset.vocab_size,
             "model_config": {
-                "d_model": 128,
-                "nhead": 4,
-                "num_layers": 3,
-                "dim_feedforward": 512,
-                "max_seq_len": 51,
-                "num_colors": 10,
+                "task_embedding_num_tokens": TASK_EMBEDDING_NUM_TOKENS,
+                "d_model": D_MODEL,
+                "nhead": NHEAD,
+                "num_layers": NUM_LAYERS,
+                "dim_feedforward": DIM_FEEDFORWARD,
+                "max_seq_len": MAX_SEQ_LEN,
+                "num_colors": NUM_COLORS,
             },
         },
         model_path,
