@@ -111,7 +111,7 @@ def flatten_collate(batch: List[List[GridDict]]) -> List[GridDict]:
 
 
 class ARCTransformer(nn.Module):
-    """Transformer model for ARC tasks.
+    """Transformer model for ARC tasks using BERT-style masking.
 
     Args:
         num_tasks: Number of unique tasks in vocabulary
@@ -136,10 +136,15 @@ class ARCTransformer(nn.Module):
         super().__init__()
 
         self.d_model = d_model
+        self.num_colors = num_colors
+
+        # MASK token is added as an extra embedding (index = num_colors)
+        self.mask_token_idx = num_colors
 
         # Embedding layers
         self.task_embedding = nn.Embedding(num_tasks, d_model)
-        self.grid_embedding = nn.Embedding(num_colors, d_model)
+        # Grid embedding now includes the MASK token (num_colors + 1 total)
+        self.grid_embedding = nn.Embedding(num_colors + 1, d_model)
         self.pos_embedding = nn.Embedding(max_seq_len, d_model)
 
         # Transformer encoder
@@ -158,14 +163,12 @@ class ARCTransformer(nn.Module):
         self,
         task_idx: torch.Tensor,
         input_grid: torch.Tensor,
-        output_grid: torch.Tensor,
     ):
-        """Forward pass.
+        """Forward pass using BERT-style masking.
 
         Args:
             task_idx: (batch_size,) task indices
             input_grid: (batch_size, H, W) input grids
-            output_grid: (batch_size, H, W) output grids
 
         Returns:
             logits: (batch_size, H*W, num_colors) predictions for output grid
@@ -173,18 +176,25 @@ class ARCTransformer(nn.Module):
         batch_size = task_idx.shape[0]
         H, W = input_grid.shape[1], input_grid.shape[2]
 
-        # Flatten grids
+        # Flatten input grid
         input_flat = input_grid.view(batch_size, -1)  # (batch_size, H*W)
-        output_flat = output_grid.view(batch_size, -1)  # (batch_size, H*W)
 
         # Get embeddings
         task_emb = self.task_embedding(task_idx).unsqueeze(
             1
         )  # (batch_size, 1, d_model)
         input_emb = self.grid_embedding(input_flat)  # (batch_size, H*W, d_model)
-        output_emb = self.grid_embedding(output_flat)  # (batch_size, H*W, d_model)
 
-        # Concatenate: [task, input, output]
+        # Create mask tokens for all output positions (same size as input)
+        mask_tokens = torch.full(
+            (batch_size, H * W),
+            self.mask_token_idx,
+            dtype=torch.long,
+            device=input_grid.device,
+        )
+        output_emb = self.grid_embedding(mask_tokens)  # (batch_size, H*W, d_model)
+
+        # Concatenate: [task, input, masked_output]
         seq = torch.cat(
             [task_emb, input_emb, output_emb], dim=1
         )  # (batch_size, 1+2*H*W, d_model)
@@ -197,18 +207,11 @@ class ARCTransformer(nn.Module):
         pos_emb = self.pos_embedding(positions)
         seq = seq + pos_emb
 
-        # Create mask: mask out the output portion
-        # We want to predict output, so mask it during attention
-        mask = torch.zeros(seq_len, seq_len, device=seq.device, dtype=torch.bool)
-        output_start = 1 + H * W
-        mask[output_start:, output_start:] = (
-            True  # Mask output tokens from seeing each other
-        )
-
-        # Pass through transformer
-        encoded = self.transformer(seq, mask=mask)  # (batch_size, seq_len, d_model)
+        # No attention mask needed - BERT style allows all positions to attend to each other
+        encoded = self.transformer(seq)  # (batch_size, seq_len, d_model)
 
         # Extract output portion and project
+        output_start = 1 + H * W
         output_encoded = encoded[:, output_start:, :]  # (batch_size, H*W, d_model)
         logits = self.output_proj(output_encoded)  # (batch_size, H*W, num_colors)
 
@@ -229,11 +232,11 @@ def train_epoch(
         input_grids = torch.stack([item["input"] for item in batch]).to(device)
         output_grids = torch.stack([item["output"] for item in batch]).to(device)
 
-        # Forward pass
-        logits = model(task_indices, input_grids, output_grids)
+        # Forward pass (model only needs task_idx and input_grid)
+        logits = model(task_indices, input_grids)
 
         # Compute loss
-        batch_size, seq_len, num_colors = logits.shape
+        _, _, num_colors = logits.shape
         logits_flat = logits.view(-1, num_colors)
         targets_flat = output_grids.view(-1)
         loss = criterion(logits_flat, targets_flat)
@@ -266,11 +269,11 @@ def test_epoch(model: ARCTransformer, dataloader: DataLoader, criterion, device)
             input_grids = torch.stack([item["input"] for item in batch]).to(device)
             output_grids = torch.stack([item["output"] for item in batch]).to(device)
 
-            # Forward pass
-            logits = model(task_indices, input_grids, output_grids)
+            # Forward pass (model only needs task_idx and input_grid)
+            logits = model(task_indices, input_grids)
 
             # Compute loss
-            batch_size, seq_len, num_colors = logits.shape
+            _, _, num_colors = logits.shape
             logits_flat = logits.view(-1, num_colors)
             targets_flat = output_grids.view(-1)
             loss = criterion(logits_flat, targets_flat)
