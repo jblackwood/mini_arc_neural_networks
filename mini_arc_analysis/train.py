@@ -249,9 +249,9 @@ def train_epoch(
         total_loss += loss.item()
         num_batches += 1
 
-        print(
-            f"  Train batch {batch_idx+1}/{len(dataloader)} - Loss: {loss.item():.4f}"
-        )
+        # print(
+        #     f"  Train batch {batch_idx+1}/{len(dataloader)} - Loss: {loss.item():.4f}"
+        # )
 
     return total_loss / num_batches
 
@@ -281,9 +281,9 @@ def test_epoch(model: ARCTransformer, dataloader: DataLoader, criterion, device)
             total_loss += loss.item()
             num_batches += 1
 
-            print(
-                f"  Test batch {batch_idx+1}/{len(dataloader)} - Loss: {loss.item():.4f}"
-            )
+            # print(
+            #     f"  Test batch {batch_idx+1}/{len(dataloader)} - Loss: {loss.item():.4f}"
+            # )
 
     return total_loss / num_batches
 
@@ -293,7 +293,7 @@ def main():
     # Hyperparameters
     folder_path = "output/mini_arc_analysis/train"
     batch_size = 512
-    num_epochs = 10
+    num_epochs = 100
     learning_rate = 1e-4
 
     # Select device
