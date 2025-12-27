@@ -60,13 +60,16 @@ def predict_output(
         # Add batch dimension
         task_idx = task_idx.unsqueeze(0).to(device)
         input_grid = input_grid.unsqueeze(0).to(device)
+        # Create dummy output grid (not used in forward pass)
+        output_grid = torch.zeros_like(input_grid)
 
-        # Get predictions (model automatically uses mask tokens)
-        logits = model(task_idx, input_grid)  # (1, H*W, num_colors)
+        # Get predictions
+        predictions = model(task_idx, input_grid, output_grid)
+        output_logits = predictions["output_logits"]  # (1, H*W, num_colors)
 
         # Get most probable predictions
-        predictions = torch.argmax(logits, dim=-1)  # (1, H*W)
-        predicted_grid = predictions.view(H, W)  # (H, W)
+        predicted = torch.argmax(output_logits, dim=-1)  # (1, H*W)
+        predicted_grid = predicted.view(H, W)  # (H, W)
 
     return predicted_grid.cpu().numpy()
 
@@ -115,30 +118,48 @@ def calculate_test_loss(
             input_grids = torch.stack([item["input"] for item in batch]).to(device)
             output_grids = torch.stack([item["output"] for item in batch]).to(device)
 
-            # Forward pass (model only needs task_idx and input_grid)
-            logits = model(task_indices, input_grids)
+            # Forward pass
+            predictions = model(task_indices, input_grids, output_grids)
 
-            # Compute loss
-            _, _, num_colors = logits.shape
-            logits_flat = logits.view(-1, num_colors)
-            targets_flat = output_grids.view(-1)
-            loss = criterion(logits_flat, targets_flat)
+            # Compute loss for each part of the sequence
+            # Task loss
+            task_logits = predictions["task_logits"]  # (batch_size, num_tasks)
+            task_loss = criterion(task_logits, task_indices)
+
+            # Input loss
+            input_logits = predictions["input_logits"]
+            input_targets = input_grids.view(input_logits.shape[0], -1)
+            input_loss = criterion(
+                input_logits.view(-1, input_logits.shape[-1]), input_targets.view(-1)
+            )
+
+            # Output loss
+            output_logits = predictions["output_logits"]
+            output_targets = output_grids.view(output_logits.shape[0], -1)
+            output_loss = criterion(
+                output_logits.view(-1, output_logits.shape[-1]), output_targets.view(-1)
+            )
+
+            # Total loss
+            loss = task_loss + input_loss + output_loss
 
             total_loss += loss.item()
             num_batches += 1
 
-            # Get predictions for debugging
-            predictions = torch.argmax(logits, dim=-1)  # (batch_size, seq_len)
+            # Get predictions for debugging (use output predictions)
+            output_predictions = torch.argmax(
+                output_logits, dim=-1
+            )  # (batch_size, H*W)
 
             # Vectorized: Check for all-black predictions
             # Check if all predictions in each grid are 0
-            is_all_black = (predictions == 0).all(dim=1)  # (batch_size,)
+            is_all_black = (output_predictions == 0).all(dim=1)  # (batch_size,)
             all_black_count += is_all_black.sum().item()
-            total_predictions += predictions.shape[0]
+            total_predictions += output_predictions.shape[0]
 
             # Vectorized: Count color predictions
             for color in range(10):
-                color_counts[color] += (predictions == color).sum().item()
+                color_counts[color] += (output_predictions == color).sum().item()
 
             print(f"  Processed {batch_idx + 1}/{len(dataloader)} batches...")
 
@@ -208,7 +229,7 @@ def main():
     torch.manual_seed(42)
 
     # Paths
-    model_path = "output/mini_arc_analysis/model_20251225_125310.pt"
+    model_path = "output/mini_arc_analysis/model_20251226_172827.pt"
     data_path = "output/mini_arc_analysis/train"
     output_path = "output/mini_arc_analysis/analysis/5_random_tasks.png"
 
