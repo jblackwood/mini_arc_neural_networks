@@ -378,6 +378,7 @@ def train_epoch(
     criterion,
     device,
     kl_weight: float,
+    task_mask_weight: float,
 ) -> LossComponents:
     """Train for one epoch.
 
@@ -388,6 +389,7 @@ def train_epoch(
         criterion: Loss criterion
         device: Device to train on
         kl_weight: Weight for KL divergence loss encouraging task embeddings to follow N(0,1)
+        task_mask_weight: Extra weight for task_mask losses
 
     Returns:
         LossComponents containing average losses for the epoch
@@ -489,7 +491,7 @@ def train_epoch(
         # KL(N(μ, σ²) || N(0, 1)) = 0.5 * (σ² + μ² - 1 - log(σ²))
         kl_loss = kl_weight * 0.5 * torch.sum(var + mean**2 - 1 - torch.log(var + 1e-8))
 
-        # Total loss is sum of all 9 losses plus KL loss
+        # Total loss is sum of all 9 losses (with task_mask losses weighted) plus KL loss
         loss = (
             output_grid_mask_task_loss
             + output_grid_mask_input_loss
@@ -497,9 +499,9 @@ def train_epoch(
             + input_grid_mask_task_loss
             + input_grid_mask_input_loss
             + input_grid_mask_output_loss
-            + task_mask_task_loss
-            + task_mask_input_loss
-            + task_mask_output_loss
+            + task_mask_weight * task_mask_task_loss
+            + task_mask_weight * task_mask_input_loss
+            + task_mask_weight * task_mask_output_loss
             + kl_loss
         )
 
@@ -546,6 +548,7 @@ def test_epoch(
     criterion,
     device,
     kl_weight: float,
+    task_mask_weight: float,
 ) -> LossComponents:
     """Evaluate on test set.
 
@@ -555,6 +558,7 @@ def test_epoch(
         criterion: Loss criterion
         device: Device to evaluate on
         kl_weight: Weight for KL divergence loss encouraging task embeddings to follow N(0,1)
+        task_mask_weight: Extra weight for task_mask losses
 
     Returns:
         LossComponents containing average losses for the epoch
@@ -659,7 +663,7 @@ def test_epoch(
                 kl_weight * 0.5 * torch.sum(var + mean**2 - 1 - torch.log(var + 1e-8))
             )
 
-            # Total loss is sum of all 9 losses plus KL loss
+            # Total loss is sum of all 9 losses (with task_mask losses weighted) plus KL loss
             loss = (
                 output_grid_mask_task_loss
                 + output_grid_mask_input_loss
@@ -667,9 +671,9 @@ def test_epoch(
                 + input_grid_mask_task_loss
                 + input_grid_mask_input_loss
                 + input_grid_mask_output_loss
-                + task_mask_task_loss
-                + task_mask_input_loss
-                + task_mask_output_loss
+                + task_mask_weight * task_mask_task_loss
+                + task_mask_weight * task_mask_input_loss
+                + task_mask_weight * task_mask_output_loss
                 + kl_loss
             )
 
@@ -721,6 +725,7 @@ def main():
     learning_rate = 1e-4
     task_embedding_learning_rate = 1e-2
     kl_weight = 1
+    task_mask_weight = 100
 
     # Model architecture hyperparameters
     TASK_EMBEDDING_NUM_TOKENS = 5
@@ -824,6 +829,7 @@ def main():
     print(f"Learning rate (default): {learning_rate}")
     print(f"Learning rate (task embedding): {task_embedding_learning_rate}")
     print(f"KL weight: {kl_weight}")
+    print(f"Task mask weight: {task_mask_weight}")
     print(f"TensorBoard logs: {log_dir}")
 
     # Create checkpoint directory
@@ -841,9 +847,17 @@ def main():
         epoch_start_time = time.time()
 
         train_losses = train_epoch(
-            model, train_loader, optimizer, criterion, device, kl_weight
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            device,
+            kl_weight,
+            task_mask_weight,
         )
-        test_losses = test_epoch(model, test_loader, criterion, device, kl_weight)
+        test_losses = test_epoch(
+            model, test_loader, criterion, device, kl_weight, task_mask_weight
+        )
 
         epoch_time = time.time() - epoch_start_time
 
