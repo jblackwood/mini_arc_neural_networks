@@ -646,6 +646,7 @@ def main():
     batch_size = 256
     num_epochs = 100
     learning_rate = 1e-4
+    task_embedding_learning_rate = 1e-2
 
     # Model architecture hyperparameters
     TASK_EMBEDDING_NUM_TOKENS = 5
@@ -700,7 +701,20 @@ def main():
     ).to(device)
 
     # Optimizer and loss
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    # Separate task embedding parameters from other parameters
+    task_embedding_params = list(model.task_embedding.parameters())
+    task_embedding_param_ids = {id(p) for p in task_embedding_params}
+    other_params = [
+        p for p in model.parameters() if id(p) not in task_embedding_param_ids
+    ]
+
+    # Create optimizer with different learning rates for different parameter groups
+    optimizer = torch.optim.Adam(
+        [
+            {"params": task_embedding_params, "lr": task_embedding_learning_rate},
+            {"params": other_params, "lr": learning_rate},
+        ]
+    )
     criterion = nn.CrossEntropyLoss()
 
     # Load from checkpoint if specified
@@ -733,6 +747,8 @@ def main():
     print(f"Training on {device}")
     print(f"Total model parameters: {total_params:,}")
     print(f"Non-embedding parameters: {non_embedding_params:,}")
+    print(f"Learning rate (default): {learning_rate}")
+    print(f"Learning rate (task embedding): {task_embedding_learning_rate}")
     print(f"TensorBoard logs: {log_dir}")
 
     # Create checkpoint directory
