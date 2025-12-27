@@ -1,5 +1,6 @@
 """PyTorch dataset for ARC tasks."""
 
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -716,10 +717,14 @@ def main():
 
     # Training loop
     for epoch in range(num_epochs):
+        epoch_start_time = time.time()
+
         train_losses = train_epoch(model, train_loader, optimizer, criterion, device)
         test_losses = test_epoch(model, test_loader, criterion, device)
 
-        print(f"\nEpoch {epoch+1}/{num_epochs}")
+        epoch_time = time.time() - epoch_start_time
+
+        print(f"\nEpoch {epoch+1}/{num_epochs} - Time: {epoch_time:.2f}s")
         print(
             f"Total Loss - Train: {train_losses.total_loss:.4f} | Test: {test_losses.total_loss:.4f}"
         )
@@ -839,6 +844,9 @@ def main():
             },
             epoch,
         )
+
+        # Log epoch time
+        writer.add_scalar("Time/EpochTime", epoch_time, epoch)
 
     # Close TensorBoard writer
     writer.close()
