@@ -8,7 +8,7 @@ from typing import Dict, List, Literal, TypedDict
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torch.utils.tensorboard import SummaryWriter
 
 from arc_shared import parse_arc_json
@@ -726,6 +726,9 @@ def main():
     task_embedding_learning_rate = 1e-2
     kl_weight = 1
     task_mask_weight = 100
+    num_training_tasks = (
+        4000  # Number of tasks to use for training (subset of full dataset)
+    )
 
     # Model architecture hyperparameters
     TASK_EMBEDDING_NUM_TOKENS = 5
@@ -747,8 +750,19 @@ def main():
     print(f"Using device: {device}")
 
     # Create datasets
-    train_dataset = ARCTaskDataset(folder_path=folder_path, grid_type="train")
-    test_dataset = ARCTaskDataset(folder_path=folder_path, grid_type="test")
+    train_dataset_full = ARCTaskDataset(folder_path=folder_path, grid_type="train")
+    test_dataset_full = ARCTaskDataset(folder_path=folder_path, grid_type="test")
+
+    # Create subset of both datasets with first num_training_tasks tasks
+    train_dataset = Subset(train_dataset_full, range(num_training_tasks))
+    test_dataset = Subset(test_dataset_full, range(num_training_tasks))
+
+    print(
+        f"Using {num_training_tasks} tasks for training (out of {len(train_dataset_full)} total)"
+    )
+    print(
+        f"Using {num_training_tasks} tasks for testing (out of {len(test_dataset_full)} total)"
+    )
 
     # Create dataloaders
     train_loader = DataLoader(
@@ -768,8 +782,9 @@ def main():
     )
 
     # Create model
+    # Use num_training_tasks for the embedding size since we're only training on a subset
     model = ARCTransformer(
-        num_tasks=train_dataset.vocab_size,
+        num_tasks=num_training_tasks,
         task_embedding_num_tokens=TASK_EMBEDDING_NUM_TOKENS,
         d_model=D_MODEL,
         nhead=NHEAD,
@@ -1004,7 +1019,7 @@ def main():
                     "epoch": epoch + 1,
                     "train_loss": train_losses.total_loss,
                     "test_loss": test_losses.total_loss,
-                    "vocab_size": train_dataset.vocab_size,
+                    "vocab_size": num_training_tasks,
                     "model_config": {
                         "task_embedding_num_tokens": TASK_EMBEDDING_NUM_TOKENS,
                         "d_model": D_MODEL,
@@ -1035,7 +1050,7 @@ def main():
             "epoch": num_epochs,
             "train_loss": train_losses.total_loss,
             "test_loss": test_losses.total_loss,
-            "vocab_size": train_dataset.vocab_size,
+            "vocab_size": num_training_tasks,
             "model_config": {
                 "task_embedding_num_tokens": TASK_EMBEDDING_NUM_TOKENS,
                 "d_model": D_MODEL,
