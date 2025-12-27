@@ -65,7 +65,9 @@ def predict_output(
 
         # Get predictions
         predictions = model(task_idx, input_grid, output_grid)
-        output_logits = predictions["output_logits"]  # (1, H*W, num_colors)
+        output_logits = predictions[
+            "output_grid_mask_output_logits"
+        ]  # (1, H*W, num_colors)
 
         # Get most probable predictions
         predicted = torch.argmax(output_logits, dim=-1)  # (1, H*W)
@@ -121,20 +123,22 @@ def calculate_test_loss(
             # Forward pass
             predictions = model(task_indices, input_grids, output_grids)
 
-            # Compute loss for each part of the sequence
+            # Compute loss for each part of the sequence using output_grid_mask predictions
             # Task loss
-            task_logits = predictions["task_logits"]  # (batch_size, num_tasks)
+            task_logits = predictions[
+                "output_grid_mask_task_logits"
+            ]  # (batch_size, num_tasks)
             task_loss = criterion(task_logits, task_indices)
 
             # Input loss
-            input_logits = predictions["input_logits"]
+            input_logits = predictions["output_grid_mask_input_logits"]
             input_targets = input_grids.view(input_logits.shape[0], -1)
             input_loss = criterion(
                 input_logits.view(-1, input_logits.shape[-1]), input_targets.view(-1)
             )
 
             # Output loss
-            output_logits = predictions["output_logits"]
+            output_logits = predictions["output_grid_mask_output_logits"]
             output_targets = output_grids.view(output_logits.shape[0], -1)
             output_loss = criterion(
                 output_logits.view(-1, output_logits.shape[-1]), output_targets.view(-1)
@@ -229,7 +233,7 @@ def main():
     torch.manual_seed(42)
 
     # Paths
-    model_path = "output/mini_arc_analysis/model_20251226_172827.pt"
+    model_path = "output/mini_arc_analysis/model_20251226_181029.pt"
     data_path = "output/mini_arc_analysis/train"
     output_path = "output/mini_arc_analysis/analysis/5_random_tasks.png"
 
