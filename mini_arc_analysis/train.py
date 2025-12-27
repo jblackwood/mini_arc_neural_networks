@@ -633,15 +633,13 @@ def main():
     """Train and test the ARC transformer model."""
     # Checkpoint configuration
     # Set to None if not loading from a checkpoint, or provide path to checkpoint file
-    LOAD_CHECKPOINT_PATH = (
-        "output/mini_arc_analysis/checkpoints/model_20251226_194054_checkpoint.pt"
-    )
+    LOAD_CHECKPOINT_PATH = None
     assert LOAD_CHECKPOINT_PATH is None or isinstance(
         LOAD_CHECKPOINT_PATH, str
     ), "LOAD_CHECKPOINT_PATH must be explicitly set to None or a string path"
 
     # Save checkpoint every N epochs (set to 0 to disable checkpoint saving)
-    CHECKPOINT_SAVE_INTERVAL = 1
+    CHECKPOINT_SAVE_INTERVAL = 10
 
     # Hyperparameters
     folder_path = "output/mini_arc_analysis/train"
