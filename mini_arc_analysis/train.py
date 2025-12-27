@@ -16,7 +16,7 @@ from arc_shared import parse_arc_json
 
 @dataclass
 class LossComponents:
-    """Container for all 9 loss components from 3 masking patterns.
+    """Container for all 9 loss components from 3 masking patterns plus KL loss.
 
     Attributes:
         output_grid_mask_task_loss: Task loss when output grid is masked
@@ -28,7 +28,8 @@ class LossComponents:
         task_mask_task_loss: Task loss when task is masked
         task_mask_input_loss: Input loss when task is masked
         task_mask_output_loss: Output loss when task is masked
-        total_loss: Sum of all 9 losses
+        kl_loss: KL divergence loss encouraging task embeddings to follow N(0,1)
+        total_loss: Sum of all 9 losses plus KL loss
     """
 
     output_grid_mask_task_loss: float
@@ -40,6 +41,7 @@ class LossComponents:
     task_mask_task_loss: float
     task_mask_input_loss: float
     task_mask_output_loss: float
+    kl_loss: float
     total_loss: float
 
 
@@ -181,6 +183,11 @@ class ARCTransformer(nn.Module):
         self.task_embedding = nn.Embedding(
             num_tasks, d_model * task_embedding_num_tokens
         )
+        # Initialize task embedding weights to small values near 0
+        # Scale down the default initialization to encourage N(0,1) distribution
+        with torch.no_grad():
+            self.task_embedding.weight.data *= 0.01
+
         # Grid embedding now includes the MASK token (num_colors + 1 total)
         self.grid_embedding = nn.Embedding(num_colors + 1, d_model)
         self.pos_embedding = nn.Embedding(max_seq_len, d_model)
@@ -365,16 +372,29 @@ class ARCTransformer(nn.Module):
 
 
 def train_epoch(
-    model: ARCTransformer, dataloader: DataLoader, optimizer, criterion, device
+    model: ARCTransformer,
+    dataloader: DataLoader,
+    optimizer,
+    criterion,
+    device,
+    kl_weight: float,
 ) -> LossComponents:
     """Train for one epoch.
+
+    Args:
+        model: The ARCTransformer model
+        dataloader: DataLoader for training data
+        optimizer: Optimizer for training
+        criterion: Loss criterion
+        device: Device to train on
+        kl_weight: Weight for KL divergence loss encouraging task embeddings to follow N(0,1)
 
     Returns:
         LossComponents containing average losses for the epoch
     """
     model.train()
 
-    # Initialize accumulators for all 9 losses
+    # Initialize accumulators for all 9 losses plus KL loss
     total_output_grid_mask_task_loss = 0
     total_output_grid_mask_input_loss = 0
     total_output_grid_mask_output_loss = 0
@@ -384,6 +404,7 @@ def train_epoch(
     total_task_mask_task_loss = 0
     total_task_mask_input_loss = 0
     total_task_mask_output_loss = 0
+    total_kl_loss = 0
     total_loss = 0
     num_batches = 0
 
@@ -452,7 +473,23 @@ def train_epoch(
             output_targets.view(-1),
         )
 
-        # Total loss is sum of all 9 losses
+        # Compute KL divergence loss to encourage task embeddings to follow N(0,1)
+        # Task embeddings shape: (num_tasks, d_model * task_embedding_num_tokens)
+        # Reshape to: (num_tasks, task_embedding_num_tokens, d_model)
+        task_emb_reshaped = model.task_embedding.weight.view(
+            -1, model.task_embedding_num_tokens, model.d_model
+        )
+        # Flatten to (num_tasks * task_embedding_num_tokens, d_model)
+        # All task tokens share the same latent space
+        task_emb_flat = task_emb_reshaped.view(-1, model.d_model)
+        # Compute mean and variance across ALL tasks and ALL token positions
+        # This ensures all tokens are part of the same N(0,1) latent space
+        mean = task_emb_flat.mean(dim=0, keepdim=True)  # (1, d_model)
+        var = task_emb_flat.var(dim=0, unbiased=False, keepdim=True)  # (1, d_model)
+        # KL(N(μ, σ²) || N(0, 1)) = 0.5 * (σ² + μ² - 1 - log(σ²))
+        kl_loss = kl_weight * 0.5 * torch.sum(var + mean**2 - 1 - torch.log(var + 1e-8))
+
+        # Total loss is sum of all 9 losses plus KL loss
         loss = (
             output_grid_mask_task_loss
             + output_grid_mask_input_loss
@@ -463,6 +500,7 @@ def train_epoch(
             + task_mask_task_loss
             + task_mask_input_loss
             + task_mask_output_loss
+            + kl_loss
         )
 
         # Backward pass
@@ -480,6 +518,7 @@ def train_epoch(
         total_task_mask_task_loss += task_mask_task_loss.item()
         total_task_mask_input_loss += task_mask_input_loss.item()
         total_task_mask_output_loss += task_mask_output_loss.item()
+        total_kl_loss += kl_loss.item()
         total_loss += loss.item()
         num_batches += 1
 
@@ -496,21 +535,33 @@ def train_epoch(
         task_mask_task_loss=total_task_mask_task_loss / num_batches,
         task_mask_input_loss=total_task_mask_input_loss / num_batches,
         task_mask_output_loss=total_task_mask_output_loss / num_batches,
+        kl_loss=total_kl_loss / num_batches,
         total_loss=total_loss / num_batches,
     )
 
 
 def test_epoch(
-    model: ARCTransformer, dataloader: DataLoader, criterion, device
+    model: ARCTransformer,
+    dataloader: DataLoader,
+    criterion,
+    device,
+    kl_weight: float,
 ) -> LossComponents:
     """Evaluate on test set.
+
+    Args:
+        model: The ARCTransformer model
+        dataloader: DataLoader for test data
+        criterion: Loss criterion
+        device: Device to evaluate on
+        kl_weight: Weight for KL divergence loss encouraging task embeddings to follow N(0,1)
 
     Returns:
         LossComponents containing average losses for the epoch
     """
     model.eval()
 
-    # Initialize accumulators for all 9 losses
+    # Initialize accumulators for all 9 losses plus KL loss
     total_output_grid_mask_task_loss = 0
     total_output_grid_mask_input_loss = 0
     total_output_grid_mask_output_loss = 0
@@ -520,6 +571,7 @@ def test_epoch(
     total_task_mask_task_loss = 0
     total_task_mask_input_loss = 0
     total_task_mask_output_loss = 0
+    total_kl_loss = 0
     total_loss = 0
     num_batches = 0
 
@@ -589,7 +641,25 @@ def test_epoch(
                 output_targets.view(-1),
             )
 
-            # Total loss is sum of all 9 losses
+            # Compute KL divergence loss to encourage task embeddings to follow N(0,1)
+            # Task embeddings shape: (num_tasks, d_model * task_embedding_num_tokens)
+            # Reshape to: (num_tasks, task_embedding_num_tokens, d_model)
+            task_emb_reshaped = model.task_embedding.weight.view(
+                -1, model.task_embedding_num_tokens, model.d_model
+            )
+            # Flatten to (num_tasks * task_embedding_num_tokens, d_model)
+            # All task tokens share the same latent space
+            task_emb_flat = task_emb_reshaped.view(-1, model.d_model)
+            # Compute mean and variance across ALL tasks and ALL token positions
+            # This ensures all tokens are part of the same N(0,1) latent space
+            mean = task_emb_flat.mean(dim=0, keepdim=True)  # (1, d_model)
+            var = task_emb_flat.var(dim=0, unbiased=False, keepdim=True)  # (1, d_model)
+            # KL(N(μ, σ²) || N(0, 1)) = 0.5 * (σ² + μ² - 1 - log(σ²))
+            kl_loss = (
+                kl_weight * 0.5 * torch.sum(var + mean**2 - 1 - torch.log(var + 1e-8))
+            )
+
+            # Total loss is sum of all 9 losses plus KL loss
             loss = (
                 output_grid_mask_task_loss
                 + output_grid_mask_input_loss
@@ -600,6 +670,7 @@ def test_epoch(
                 + task_mask_task_loss
                 + task_mask_input_loss
                 + task_mask_output_loss
+                + kl_loss
             )
 
             # Accumulate losses
@@ -612,6 +683,7 @@ def test_epoch(
             total_task_mask_task_loss += task_mask_task_loss.item()
             total_task_mask_input_loss += task_mask_input_loss.item()
             total_task_mask_output_loss += task_mask_output_loss.item()
+            total_kl_loss += kl_loss.item()
             total_loss += loss.item()
             num_batches += 1
 
@@ -625,6 +697,7 @@ def test_epoch(
         task_mask_task_loss=total_task_mask_task_loss / num_batches,
         task_mask_input_loss=total_task_mask_input_loss / num_batches,
         task_mask_output_loss=total_task_mask_output_loss / num_batches,
+        kl_loss=total_kl_loss / num_batches,
         total_loss=total_loss / num_batches,
     )
 
@@ -647,6 +720,7 @@ def main():
     num_epochs = 100
     learning_rate = 1e-4
     task_embedding_learning_rate = 1e-2
+    kl_weight = 1
 
     # Model architecture hyperparameters
     TASK_EMBEDDING_NUM_TOKENS = 5
@@ -749,6 +823,7 @@ def main():
     print(f"Non-embedding parameters: {non_embedding_params:,}")
     print(f"Learning rate (default): {learning_rate}")
     print(f"Learning rate (task embedding): {task_embedding_learning_rate}")
+    print(f"KL weight: {kl_weight}")
     print(f"TensorBoard logs: {log_dir}")
 
     # Create checkpoint directory
@@ -765,14 +840,19 @@ def main():
     for epoch in range(num_epochs):
         epoch_start_time = time.time()
 
-        train_losses = train_epoch(model, train_loader, optimizer, criterion, device)
-        test_losses = test_epoch(model, test_loader, criterion, device)
+        train_losses = train_epoch(
+            model, train_loader, optimizer, criterion, device, kl_weight
+        )
+        test_losses = test_epoch(model, test_loader, criterion, device, kl_weight)
 
         epoch_time = time.time() - epoch_start_time
 
         print(f"\nEpoch {epoch+1}/{num_epochs} - Time: {epoch_time:.2f}s")
         print(
             f"Total Loss - Train: {train_losses.total_loss:.4f} | Test: {test_losses.total_loss:.4f}"
+        )
+        print(
+            f"KL Loss - Train: {train_losses.kl_loss:.4f} | Test: {test_losses.kl_loss:.4f}"
         )
         print("Output Grid Mask:")
         print(
@@ -810,6 +890,13 @@ def main():
         writer.add_scalars(
             "Loss/Total",
             {"Train": train_losses.total_loss, "Test": test_losses.total_loss},
+            epoch,
+        )
+
+        # KL divergence loss
+        writer.add_scalars(
+            "Loss/KL",
+            {"Train": train_losses.kl_loss, "Test": test_losses.kl_loss},
             epoch,
         )
 
