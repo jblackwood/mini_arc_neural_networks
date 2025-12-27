@@ -631,6 +631,18 @@ def test_epoch(
 
 def main():
     """Train and test the ARC transformer model."""
+    # Checkpoint configuration
+    # Set to None if not loading from a checkpoint, or provide path to checkpoint file
+    LOAD_CHECKPOINT_PATH = (
+        "output/mini_arc_analysis/checkpoints/model_20251226_194054_checkpoint.pt"
+    )
+    assert LOAD_CHECKPOINT_PATH is None or isinstance(
+        LOAD_CHECKPOINT_PATH, str
+    ), "LOAD_CHECKPOINT_PATH must be explicitly set to None or a string path"
+
+    # Save checkpoint every N epochs (set to 0 to disable checkpoint saving)
+    CHECKPOINT_SAVE_INTERVAL = 1
+
     # Hyperparameters
     folder_path = "output/mini_arc_analysis/train"
     batch_size = 256
@@ -689,6 +701,20 @@ def main():
         num_colors=NUM_COLORS,
     ).to(device)
 
+    # Optimizer and loss
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    criterion = nn.CrossEntropyLoss()
+
+    # Load from checkpoint if specified
+    start_epoch = 0
+    if LOAD_CHECKPOINT_PATH is not None:
+        print(f"Loading checkpoint from: {LOAD_CHECKPOINT_PATH}")
+        checkpoint = torch.load(LOAD_CHECKPOINT_PATH, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_epoch = checkpoint.get("epoch", 0)
+        print(f"Resumed from epoch {start_epoch}")
+
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     embedding_params = (
@@ -697,10 +723,6 @@ def main():
         + sum(p.numel() for p in model.pos_embedding.parameters())
     )
     non_embedding_params = total_params - embedding_params
-
-    # Optimizer and loss
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    criterion = nn.CrossEntropyLoss()
 
     # Create timestamp for this training run (used for both logs and model)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -714,6 +736,16 @@ def main():
     print(f"Total model parameters: {total_params:,}")
     print(f"Non-embedding parameters: {non_embedding_params:,}")
     print(f"TensorBoard logs: {log_dir}")
+
+    # Create checkpoint directory
+    checkpoint_dir = Path("output/mini_arc_analysis/checkpoints")
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = checkpoint_dir / f"model_{timestamp}_checkpoint.pt"
+
+    if CHECKPOINT_SAVE_INTERVAL > 0:
+        print(
+            f"Checkpoints will be saved every {CHECKPOINT_SAVE_INTERVAL} epochs to: {checkpoint_path}"
+        )
 
     # Training loop
     for epoch in range(num_epochs):
@@ -847,6 +879,30 @@ def main():
 
         # Log epoch time
         writer.add_scalar("Time/EpochTime", epoch_time, epoch)
+
+        # Save checkpoint at specified intervals
+        if CHECKPOINT_SAVE_INTERVAL > 0 and (epoch + 1) % CHECKPOINT_SAVE_INTERVAL == 0:
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "epoch": epoch + 1,
+                    "train_loss": train_losses.total_loss,
+                    "test_loss": test_losses.total_loss,
+                    "vocab_size": train_dataset.vocab_size,
+                    "model_config": {
+                        "task_embedding_num_tokens": TASK_EMBEDDING_NUM_TOKENS,
+                        "d_model": D_MODEL,
+                        "nhead": NHEAD,
+                        "num_layers": NUM_LAYERS,
+                        "dim_feedforward": DIM_FEEDFORWARD,
+                        "max_seq_len": MAX_SEQ_LEN,
+                        "num_colors": NUM_COLORS,
+                    },
+                },
+                checkpoint_path,
+            )
+            print(f"Checkpoint saved to: {checkpoint_path}")
 
     # Close TensorBoard writer
     writer.close()
