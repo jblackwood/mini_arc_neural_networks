@@ -8,6 +8,7 @@ from typing import Dict, List, Literal, TypedDict
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.tensorboard import SummaryWriter
 
 from arc_shared import parse_arc_json
 
@@ -632,7 +633,7 @@ def main():
     # Hyperparameters
     folder_path = "output/mini_arc_analysis/train"
     batch_size = 256
-    num_epochs = 10
+    num_epochs = 100
     learning_rate = 1e-4
 
     # Model architecture hyperparameters
@@ -700,9 +701,18 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     criterion = nn.CrossEntropyLoss()
 
+    # Create timestamp for this training run (used for both logs and model)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # TensorBoard writer
+    log_dir = Path(f"output/mini_arc_analysis/runs/{timestamp}")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(log_dir=str(log_dir))
+
     print(f"Training on {device}")
     print(f"Total model parameters: {total_params:,}")
     print(f"Non-embedding parameters: {non_embedding_params:,}")
+    print(f"TensorBoard logs: {log_dir}")
 
     # Training loop
     for epoch in range(num_epochs):
@@ -744,11 +754,99 @@ def main():
             f"  Output: Train: {train_losses.task_mask_output_loss:.4f} | Test: {test_losses.task_mask_output_loss:.4f}"
         )
 
-    # Save model with timestamp
+        # Log to TensorBoard
+        # Total loss
+        writer.add_scalars(
+            "Loss/Total",
+            {"Train": train_losses.total_loss, "Test": test_losses.total_loss},
+            epoch,
+        )
+
+        # Output grid mask losses
+        writer.add_scalars(
+            "Loss/OutputGridMask/Task",
+            {
+                "Train": train_losses.output_grid_mask_task_loss,
+                "Test": test_losses.output_grid_mask_task_loss,
+            },
+            epoch,
+        )
+        writer.add_scalars(
+            "Loss/OutputGridMask/Input",
+            {
+                "Train": train_losses.output_grid_mask_input_loss,
+                "Test": test_losses.output_grid_mask_input_loss,
+            },
+            epoch,
+        )
+        writer.add_scalars(
+            "Loss/OutputGridMask/Output",
+            {
+                "Train": train_losses.output_grid_mask_output_loss,
+                "Test": test_losses.output_grid_mask_output_loss,
+            },
+            epoch,
+        )
+
+        # Input grid mask losses
+        writer.add_scalars(
+            "Loss/InputGridMask/Task",
+            {
+                "Train": train_losses.input_grid_mask_task_loss,
+                "Test": test_losses.input_grid_mask_task_loss,
+            },
+            epoch,
+        )
+        writer.add_scalars(
+            "Loss/InputGridMask/Input",
+            {
+                "Train": train_losses.input_grid_mask_input_loss,
+                "Test": test_losses.input_grid_mask_input_loss,
+            },
+            epoch,
+        )
+        writer.add_scalars(
+            "Loss/InputGridMask/Output",
+            {
+                "Train": train_losses.input_grid_mask_output_loss,
+                "Test": test_losses.input_grid_mask_output_loss,
+            },
+            epoch,
+        )
+
+        # Task mask losses
+        writer.add_scalars(
+            "Loss/TaskMask/Task",
+            {
+                "Train": train_losses.task_mask_task_loss,
+                "Test": test_losses.task_mask_task_loss,
+            },
+            epoch,
+        )
+        writer.add_scalars(
+            "Loss/TaskMask/Input",
+            {
+                "Train": train_losses.task_mask_input_loss,
+                "Test": test_losses.task_mask_input_loss,
+            },
+            epoch,
+        )
+        writer.add_scalars(
+            "Loss/TaskMask/Output",
+            {
+                "Train": train_losses.task_mask_output_loss,
+                "Test": test_losses.task_mask_output_loss,
+            },
+            epoch,
+        )
+
+    # Close TensorBoard writer
+    writer.close()
+
+    # Save model with same timestamp as logs
     output_dir = Path("output/mini_arc_analysis")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     model_path = output_dir / f"model_{timestamp}.pt"
 
     torch.save(
