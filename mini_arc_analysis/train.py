@@ -512,7 +512,7 @@ def main():
 
     # Model architecture hyperparameters
     TASK_EMBEDDING_NUM_TOKENS = 2
-    D_MODEL = 16
+    D_MODEL = 8
     NHEAD = 4
     NUM_LAYERS_IN_BLOCK = 3  # Number of transformer encoder layers in each block
     DIM_FEEDFORWARD = 32
@@ -539,20 +539,20 @@ def main():
     test_dataset_full = ARCTaskDataset(folder_path=folder_path, grid_type="test")
 
     # Create subset of both datasets with first num_training_tasks tasks, or use full datasets if None
-    if num_training_tasks is None:
+    if use_subset_of_training_tasks is None:
         train_dataset = train_dataset_full
         test_dataset = test_dataset_full
         actual_num_tasks = len(train_dataset_full)
         print(f"Using all {actual_num_tasks} tasks for training and testing")
     else:
-        train_dataset = Subset(train_dataset_full, range(num_training_tasks))
-        test_dataset = Subset(test_dataset_full, range(num_training_tasks))
-        actual_num_tasks = num_training_tasks
+        train_dataset = Subset(train_dataset_full, range(use_subset_of_training_tasks))
+        test_dataset = Subset(test_dataset_full, range(use_subset_of_training_tasks))
+        actual_num_tasks = use_subset_of_training_tasks
         print(
-            f"Using {num_training_tasks} tasks for training (out of {len(train_dataset_full)} total)"
+            f"Using {use_subset_of_training_tasks} tasks for training (out of {len(train_dataset_full)} total)"
         )
         print(
-            f"Using {num_training_tasks} tasks for testing (out of {len(test_dataset_full)} total)"
+            f"Using {use_subset_of_training_tasks} tasks for testing (out of {len(test_dataset_full)} total)"
         )
 
     # Create dataloaders
