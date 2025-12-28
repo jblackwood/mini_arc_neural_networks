@@ -16,30 +16,18 @@ from arc_shared import parse_arc_json
 
 @dataclass
 class LossComponents:
-    """Container for all 9 loss components from 3 masking patterns.
+    """Container for loss components from output grid masking.
 
     Attributes:
-        output_grid_mask_task_loss: Task loss when output grid is masked
-        output_grid_mask_input_loss: Input loss when output grid is masked
-        output_grid_mask_output_loss: Output loss when output grid is masked
-        input_grid_mask_task_loss: Task loss when input grid is masked
-        input_grid_mask_input_loss: Input loss when input grid is masked
-        input_grid_mask_output_loss: Output loss when input grid is masked
-        task_mask_task_loss: Task loss when task is masked
-        task_mask_input_loss: Input loss when task is masked
-        task_mask_output_loss: Output loss when task is masked
-        total_loss: Sum of all 9 losses
+        task_loss: Task prediction loss when output grid is masked
+        input_loss: Input grid prediction loss when output grid is masked
+        output_loss: Output grid prediction loss when output grid is masked
+        total_loss: Sum of all 3 losses
     """
 
-    output_grid_mask_task_loss: float
-    output_grid_mask_input_loss: float
-    output_grid_mask_output_loss: float
-    input_grid_mask_task_loss: float
-    input_grid_mask_input_loss: float
-    input_grid_mask_output_loss: float
-    task_mask_task_loss: float
-    task_mask_input_loss: float
-    task_mask_output_loss: float
+    task_loss: float
+    input_loss: float
+    output_loss: float
     total_loss: float
 
 
@@ -253,34 +241,24 @@ class ARCTransformer(nn.Module):
     ):
         """Forward pass predicting the entire sequence.
 
-        Creates three different masked sequences and returns predictions for each:
-        1. output_grid_mask: Mask output grid (current behavior)
-        2. input_grid_mask: Mask input grid
-        3. task_mask: Mask task embedding
+        Masks the output grid and predicts task, input, and output.
 
         Args:
             task_idx: (batch_size,) task indices
             input_grid: (batch_size, H, W) input grids
-            output_grid: (batch_size, H, W) output grids (not used currently)
+            output_grid: (batch_size, H, W) output grids (not used in forward, only for loss)
 
         Returns:
-            Dictionary containing 9 logits (3 mask types × 3 prediction types):
-                - output_grid_mask_task_logits: (batch_size, num_tasks)
-                - output_grid_mask_input_logits: (batch_size, H*W, num_colors)
-                - output_grid_mask_output_logits: (batch_size, H*W, num_colors)
-                - input_grid_mask_task_logits: (batch_size, num_tasks)
-                - input_grid_mask_input_logits: (batch_size, H*W, num_colors)
-                - input_grid_mask_output_logits: (batch_size, H*W, num_colors)
-                - task_mask_task_logits: (batch_size, num_tasks)
-                - task_mask_input_logits: (batch_size, H*W, num_colors)
-                - task_mask_output_logits: (batch_size, H*W, num_colors)
+            Dictionary containing 3 logits:
+                - task_logits: (batch_size, num_tasks)
+                - input_logits: (batch_size, H*W, num_colors)
+                - output_logits: (batch_size, H*W, num_colors)
         """
         batch_size = task_idx.shape[0]
         H, W = input_grid.shape[1], input_grid.shape[2]
 
-        # Flatten grids
+        # Flatten input grid
         input_flat = input_grid.view(batch_size, -1)  # (batch_size, H*W)
-        output_flat = output_grid.view(batch_size, -1)  # (batch_size, H*W)
 
         # Get task embedding from encoder
         task_emb = self.task_encoder(task_idx)  # (batch_size, d_model * num_tokens)
@@ -290,9 +268,8 @@ class ARCTransformer(nn.Module):
 
         # Get grid embeddings
         input_emb = self.grid_embedding(input_flat)  # (batch_size, H*W, d_model)
-        output_emb = self.grid_embedding(output_flat)  # (batch_size, H*W, d_model)
 
-        # Create mask token embeddings
+        # Create mask token embeddings for output grid
         mask_tokens = torch.full(
             (batch_size, H * W),
             self.mask_token_idx,
@@ -301,78 +278,32 @@ class ARCTransformer(nn.Module):
         )
         mask_emb = self.grid_embedding(mask_tokens)  # (batch_size, H*W, d_model)
 
-        # Create masked task embedding (all mask tokens)
-        task_mask_tokens = torch.full(
-            (batch_size, self.task_embedding_num_tokens, self.d_model),
-            0.0,  # Use zeros for masked task tokens
-            dtype=task_emb.dtype,
-            device=task_emb.device,
-        )
-
-        # Create three different sequences with different masking patterns
-        # 1. Mask output grid (current behavior)
-        seq_output_mask = torch.cat(
+        # Create sequence with masked output grid
+        seq = torch.cat(
             [task_emb, input_emb, mask_emb], dim=1
         )  # (batch_size, num_tokens+2*H*W, d_model)
 
-        # 2. Mask input grid
-        seq_input_mask = torch.cat(
-            [task_emb, mask_emb, output_emb], dim=1
-        )  # (batch_size, num_tokens+2*H*W, d_model)
+        seq_len = seq.shape[1]
 
-        # 3. Mask task embedding
-        seq_task_mask = torch.cat(
-            [task_mask_tokens, input_emb, output_emb], dim=1
-        )  # (batch_size, num_tokens+2*H*W, d_model)
-
-        seq_len = seq_output_mask.shape[1]
-
-        # Add positional embeddings to all three sequences
+        # Add positional embeddings
         positions = (
-            torch.arange(seq_len, device=seq_output_mask.device)
-            .unsqueeze(0)
-            .expand(batch_size, -1)
+            torch.arange(seq_len, device=seq.device).unsqueeze(0).expand(batch_size, -1)
         )
         pos_emb = self.pos_embedding(positions)
+        seq = seq + pos_emb
 
-        seq_output_mask = seq_output_mask + pos_emb
-        seq_input_mask = seq_input_mask + pos_emb
-        seq_task_mask = seq_task_mask + pos_emb
+        # Pass through transformer
+        encoded = self.transformer(seq)
 
-        # Pass all three sequences through transformer
-        encoded_output_mask = self.transformer(seq_output_mask)
-        encoded_input_mask = self.transformer(seq_input_mask)
-        encoded_task_mask = self.transformer(seq_task_mask)
-
-        # Extract logits for all three masked sequences
-        (
-            output_grid_mask_task_logits,
-            output_grid_mask_input_logits,
-            output_grid_mask_output_logits,
-        ) = self.extract_logits(encoded_output_mask, batch_size, H, W)
-
-        (
-            input_grid_mask_task_logits,
-            input_grid_mask_input_logits,
-            input_grid_mask_output_logits,
-        ) = self.extract_logits(encoded_input_mask, batch_size, H, W)
-
-        (
-            task_mask_task_logits,
-            task_mask_input_logits,
-            task_mask_output_logits,
-        ) = self.extract_logits(encoded_task_mask, batch_size, H, W)
+        # Extract logits
+        task_logits, input_logits, output_logits = self.extract_logits(
+            encoded, batch_size, H, W
+        )
 
         return {
-            "output_grid_mask_task_logits": output_grid_mask_task_logits,
-            "output_grid_mask_input_logits": output_grid_mask_input_logits,
-            "output_grid_mask_output_logits": output_grid_mask_output_logits,
-            "input_grid_mask_task_logits": input_grid_mask_task_logits,
-            "input_grid_mask_input_logits": input_grid_mask_input_logits,
-            "input_grid_mask_output_logits": input_grid_mask_output_logits,
-            "task_mask_task_logits": task_mask_task_logits,
-            "task_mask_input_logits": task_mask_input_logits,
-            "task_mask_output_logits": task_mask_output_logits,
+            "task_logits": task_logits,
+            "input_logits": input_logits,
+            "output_logits": output_logits,
         }
 
 
@@ -382,7 +313,6 @@ def train_epoch(
     optimizer,
     criterion,
     device,
-    task_mask_weight: float,
 ) -> LossComponents:
     """Train for one epoch.
 
@@ -392,23 +322,16 @@ def train_epoch(
         optimizer: Optimizer for training
         criterion: Loss criterion
         device: Device to train on
-        task_mask_weight: Extra weight for task_mask losses
 
     Returns:
         LossComponents containing average losses for the epoch
     """
     model.train()
 
-    # Initialize accumulators for all 9 losses
-    total_output_grid_mask_task_loss = 0
-    total_output_grid_mask_input_loss = 0
-    total_output_grid_mask_output_loss = 0
-    total_input_grid_mask_task_loss = 0
-    total_input_grid_mask_input_loss = 0
-    total_input_grid_mask_output_loss = 0
-    total_task_mask_task_loss = 0
-    total_task_mask_input_loss = 0
-    total_task_mask_output_loss = 0
+    # Initialize accumulators for 3 losses
+    total_task_loss = 0
+    total_input_loss = 0
+    total_output_loss = 0
     total_loss = 0
     num_batches = 0
 
@@ -425,70 +348,21 @@ def train_epoch(
         input_targets = input_grids.view(input_grids.shape[0], -1)
         output_targets = output_grids.view(output_grids.shape[0], -1)
 
-        # Compute all 9 losses
-        # Output grid mask losses
-        output_grid_mask_task_loss = criterion(
-            predictions["output_grid_mask_task_logits"], task_indices
-        )
-        output_grid_mask_input_loss = criterion(
-            predictions["output_grid_mask_input_logits"].view(
-                -1, predictions["output_grid_mask_input_logits"].shape[-1]
-            ),
+        # Compute 3 losses
+        task_loss = criterion(predictions["task_logits"], task_indices)
+        input_loss = criterion(
+            predictions["input_logits"].view(-1, predictions["input_logits"].shape[-1]),
             input_targets.view(-1),
         )
-        output_grid_mask_output_loss = criterion(
-            predictions["output_grid_mask_output_logits"].view(
-                -1, predictions["output_grid_mask_output_logits"].shape[-1]
+        output_loss = criterion(
+            predictions["output_logits"].view(
+                -1, predictions["output_logits"].shape[-1]
             ),
             output_targets.view(-1),
         )
 
-        # Input grid mask losses
-        input_grid_mask_task_loss = criterion(
-            predictions["input_grid_mask_task_logits"], task_indices
-        )
-        input_grid_mask_input_loss = criterion(
-            predictions["input_grid_mask_input_logits"].view(
-                -1, predictions["input_grid_mask_input_logits"].shape[-1]
-            ),
-            input_targets.view(-1),
-        )
-        input_grid_mask_output_loss = criterion(
-            predictions["input_grid_mask_output_logits"].view(
-                -1, predictions["input_grid_mask_output_logits"].shape[-1]
-            ),
-            output_targets.view(-1),
-        )
-
-        # Task mask losses
-        task_mask_task_loss = criterion(
-            predictions["task_mask_task_logits"], task_indices
-        )
-        task_mask_input_loss = criterion(
-            predictions["task_mask_input_logits"].view(
-                -1, predictions["task_mask_input_logits"].shape[-1]
-            ),
-            input_targets.view(-1),
-        )
-        task_mask_output_loss = criterion(
-            predictions["task_mask_output_logits"].view(
-                -1, predictions["task_mask_output_logits"].shape[-1]
-            ),
-            output_targets.view(-1),
-        )
-
-        # Total loss is sum of all 9 losses (with task_mask losses weighted)
-        loss = (
-            output_grid_mask_task_loss
-            + output_grid_mask_input_loss
-            + output_grid_mask_output_loss
-            + input_grid_mask_task_loss
-            + input_grid_mask_input_loss
-            + input_grid_mask_output_loss
-            + task_mask_weight * task_mask_task_loss
-            + task_mask_weight * task_mask_input_loss
-            + task_mask_weight * task_mask_output_loss
-        )
+        # Total loss is sum of all 3 losses
+        loss = task_loss + input_loss + output_loss
 
         # Backward pass
         optimizer.zero_grad()
@@ -496,31 +370,16 @@ def train_epoch(
         optimizer.step()
 
         # Accumulate losses
-        total_output_grid_mask_task_loss += output_grid_mask_task_loss.item()
-        total_output_grid_mask_input_loss += output_grid_mask_input_loss.item()
-        total_output_grid_mask_output_loss += output_grid_mask_output_loss.item()
-        total_input_grid_mask_task_loss += input_grid_mask_task_loss.item()
-        total_input_grid_mask_input_loss += input_grid_mask_input_loss.item()
-        total_input_grid_mask_output_loss += input_grid_mask_output_loss.item()
-        total_task_mask_task_loss += task_mask_task_loss.item()
-        total_task_mask_input_loss += task_mask_input_loss.item()
-        total_task_mask_output_loss += task_mask_output_loss.item()
+        total_task_loss += task_loss.item()
+        total_input_loss += input_loss.item()
+        total_output_loss += output_loss.item()
         total_loss += loss.item()
         num_batches += 1
 
-        # # Debug: print batch progress
-        # print(f"  Batch {batch_idx + 1}/{len(dataloader)} - Loss: {loss.item():.4f}")
-
     return LossComponents(
-        output_grid_mask_task_loss=total_output_grid_mask_task_loss / num_batches,
-        output_grid_mask_input_loss=total_output_grid_mask_input_loss / num_batches,
-        output_grid_mask_output_loss=total_output_grid_mask_output_loss / num_batches,
-        input_grid_mask_task_loss=total_input_grid_mask_task_loss / num_batches,
-        input_grid_mask_input_loss=total_input_grid_mask_input_loss / num_batches,
-        input_grid_mask_output_loss=total_input_grid_mask_output_loss / num_batches,
-        task_mask_task_loss=total_task_mask_task_loss / num_batches,
-        task_mask_input_loss=total_task_mask_input_loss / num_batches,
-        task_mask_output_loss=total_task_mask_output_loss / num_batches,
+        task_loss=total_task_loss / num_batches,
+        input_loss=total_input_loss / num_batches,
+        output_loss=total_output_loss / num_batches,
         total_loss=total_loss / num_batches,
     )
 
@@ -530,7 +389,6 @@ def test_epoch(
     dataloader: DataLoader,
     criterion,
     device,
-    task_mask_weight: float,
 ) -> LossComponents:
     """Evaluate on test set.
 
@@ -539,23 +397,16 @@ def test_epoch(
         dataloader: DataLoader for test data
         criterion: Loss criterion
         device: Device to evaluate on
-        task_mask_weight: Extra weight for task_mask losses
 
     Returns:
         LossComponents containing average losses for the epoch
     """
     model.eval()
 
-    # Initialize accumulators for all 9 losses
-    total_output_grid_mask_task_loss = 0
-    total_output_grid_mask_input_loss = 0
-    total_output_grid_mask_output_loss = 0
-    total_input_grid_mask_task_loss = 0
-    total_input_grid_mask_input_loss = 0
-    total_input_grid_mask_output_loss = 0
-    total_task_mask_task_loss = 0
-    total_task_mask_input_loss = 0
-    total_task_mask_output_loss = 0
+    # Initialize accumulators for 3 losses
+    total_task_loss = 0
+    total_input_loss = 0
+    total_output_loss = 0
     total_loss = 0
     num_batches = 0
 
@@ -573,94 +424,35 @@ def test_epoch(
             input_targets = input_grids.view(input_grids.shape[0], -1)
             output_targets = output_grids.view(output_grids.shape[0], -1)
 
-            # Compute all 9 losses
-            # Output grid mask losses
-            output_grid_mask_task_loss = criterion(
-                predictions["output_grid_mask_task_logits"], task_indices
-            )
-            output_grid_mask_input_loss = criterion(
-                predictions["output_grid_mask_input_logits"].view(
-                    -1, predictions["output_grid_mask_input_logits"].shape[-1]
+            # Compute 3 losses
+            task_loss = criterion(predictions["task_logits"], task_indices)
+            input_loss = criterion(
+                predictions["input_logits"].view(
+                    -1, predictions["input_logits"].shape[-1]
                 ),
                 input_targets.view(-1),
             )
-            output_grid_mask_output_loss = criterion(
-                predictions["output_grid_mask_output_logits"].view(
-                    -1, predictions["output_grid_mask_output_logits"].shape[-1]
+            output_loss = criterion(
+                predictions["output_logits"].view(
+                    -1, predictions["output_logits"].shape[-1]
                 ),
                 output_targets.view(-1),
             )
 
-            # Input grid mask losses
-            input_grid_mask_task_loss = criterion(
-                predictions["input_grid_mask_task_logits"], task_indices
-            )
-            input_grid_mask_input_loss = criterion(
-                predictions["input_grid_mask_input_logits"].view(
-                    -1, predictions["input_grid_mask_input_logits"].shape[-1]
-                ),
-                input_targets.view(-1),
-            )
-            input_grid_mask_output_loss = criterion(
-                predictions["input_grid_mask_output_logits"].view(
-                    -1, predictions["input_grid_mask_output_logits"].shape[-1]
-                ),
-                output_targets.view(-1),
-            )
-
-            # Task mask losses
-            task_mask_task_loss = criterion(
-                predictions["task_mask_task_logits"], task_indices
-            )
-            task_mask_input_loss = criterion(
-                predictions["task_mask_input_logits"].view(
-                    -1, predictions["task_mask_input_logits"].shape[-1]
-                ),
-                input_targets.view(-1),
-            )
-            task_mask_output_loss = criterion(
-                predictions["task_mask_output_logits"].view(
-                    -1, predictions["task_mask_output_logits"].shape[-1]
-                ),
-                output_targets.view(-1),
-            )
-
-            # Total loss is sum of all 9 losses (with task_mask losses weighted)
-            loss = (
-                output_grid_mask_task_loss
-                + output_grid_mask_input_loss
-                + output_grid_mask_output_loss
-                + input_grid_mask_task_loss
-                + input_grid_mask_input_loss
-                + input_grid_mask_output_loss
-                + task_mask_weight * task_mask_task_loss
-                + task_mask_weight * task_mask_input_loss
-                + task_mask_weight * task_mask_output_loss
-            )
+            # Total loss is sum of all 3 losses
+            loss = task_loss + input_loss + output_loss
 
             # Accumulate losses
-            total_output_grid_mask_task_loss += output_grid_mask_task_loss.item()
-            total_output_grid_mask_input_loss += output_grid_mask_input_loss.item()
-            total_output_grid_mask_output_loss += output_grid_mask_output_loss.item()
-            total_input_grid_mask_task_loss += input_grid_mask_task_loss.item()
-            total_input_grid_mask_input_loss += input_grid_mask_input_loss.item()
-            total_input_grid_mask_output_loss += input_grid_mask_output_loss.item()
-            total_task_mask_task_loss += task_mask_task_loss.item()
-            total_task_mask_input_loss += task_mask_input_loss.item()
-            total_task_mask_output_loss += task_mask_output_loss.item()
+            total_task_loss += task_loss.item()
+            total_input_loss += input_loss.item()
+            total_output_loss += output_loss.item()
             total_loss += loss.item()
             num_batches += 1
 
     return LossComponents(
-        output_grid_mask_task_loss=total_output_grid_mask_task_loss / num_batches,
-        output_grid_mask_input_loss=total_output_grid_mask_input_loss / num_batches,
-        output_grid_mask_output_loss=total_output_grid_mask_output_loss / num_batches,
-        input_grid_mask_task_loss=total_input_grid_mask_task_loss / num_batches,
-        input_grid_mask_input_loss=total_input_grid_mask_input_loss / num_batches,
-        input_grid_mask_output_loss=total_input_grid_mask_output_loss / num_batches,
-        task_mask_task_loss=total_task_mask_task_loss / num_batches,
-        task_mask_input_loss=total_task_mask_input_loss / num_batches,
-        task_mask_output_loss=total_task_mask_output_loss / num_batches,
+        task_loss=total_task_loss / num_batches,
+        input_loss=total_input_loss / num_batches,
+        output_loss=total_output_loss / num_batches,
         total_loss=total_loss / num_batches,
     )
 
@@ -683,7 +475,6 @@ def main():
     num_epochs = 100
     learning_rate = 1e-4
     task_embedding_learning_rate = 1e-2
-    task_mask_weight = 100
     num_training_tasks = (
         4000  # Number of tasks to use for training (subset of full dataset)
     )
@@ -801,7 +592,6 @@ def main():
     print(f"Non-embedding parameters: {non_embedding_params:,}")
     print(f"Learning rate (default): {learning_rate}")
     print(f"Learning rate (task encoder): {task_embedding_learning_rate}")
-    print(f"Task mask weight: {task_mask_weight}")
     print(f"TensorBoard logs: {log_dir}")
 
     # Create checkpoint directory
@@ -824,11 +614,8 @@ def main():
             optimizer,
             criterion,
             device,
-            task_mask_weight,
         )
-        test_losses = test_epoch(
-            model, test_loader, criterion, device, task_mask_weight
-        )
+        test_losses = test_epoch(model, test_loader, criterion, device)
 
         epoch_time = time.time() - epoch_start_time
 
@@ -836,35 +623,14 @@ def main():
         print(
             f"Total Loss - Train: {train_losses.total_loss:.4f} | Test: {test_losses.total_loss:.4f}"
         )
-        print("Output Grid Mask:")
         print(
-            f"  Task:   Train: {train_losses.output_grid_mask_task_loss:.4f} | Test: {test_losses.output_grid_mask_task_loss:.4f}"
+            f"  Task:   Train: {train_losses.task_loss:.4f} | Test: {test_losses.task_loss:.4f}"
         )
         print(
-            f"  Input:  Train: {train_losses.output_grid_mask_input_loss:.4f} | Test: {test_losses.output_grid_mask_input_loss:.4f}"
+            f"  Input:  Train: {train_losses.input_loss:.4f} | Test: {test_losses.input_loss:.4f}"
         )
         print(
-            f"  Output: Train: {train_losses.output_grid_mask_output_loss:.4f} | Test: {test_losses.output_grid_mask_output_loss:.4f}"
-        )
-        print("Input Grid Mask:")
-        print(
-            f"  Task:   Train: {train_losses.input_grid_mask_task_loss:.4f} | Test: {test_losses.input_grid_mask_task_loss:.4f}"
-        )
-        print(
-            f"  Input:  Train: {train_losses.input_grid_mask_input_loss:.4f} | Test: {test_losses.input_grid_mask_input_loss:.4f}"
-        )
-        print(
-            f"  Output: Train: {train_losses.input_grid_mask_output_loss:.4f} | Test: {test_losses.input_grid_mask_output_loss:.4f}"
-        )
-        print("Task Mask:")
-        print(
-            f"  Task:   Train: {train_losses.task_mask_task_loss:.4f} | Test: {test_losses.task_mask_task_loss:.4f}"
-        )
-        print(
-            f"  Input:  Train: {train_losses.task_mask_input_loss:.4f} | Test: {test_losses.task_mask_input_loss:.4f}"
-        )
-        print(
-            f"  Output: Train: {train_losses.task_mask_output_loss:.4f} | Test: {test_losses.task_mask_output_loss:.4f}"
+            f"  Output: Train: {train_losses.output_loss:.4f} | Test: {test_losses.output_loss:.4f}"
         )
 
         # Log to TensorBoard
@@ -875,81 +641,20 @@ def main():
             epoch,
         )
 
-        # Output grid mask losses
+        # Component losses
         writer.add_scalars(
-            "Loss/OutputGridMask/Task",
-            {
-                "Train": train_losses.output_grid_mask_task_loss,
-                "Test": test_losses.output_grid_mask_task_loss,
-            },
+            "Loss/Task",
+            {"Train": train_losses.task_loss, "Test": test_losses.task_loss},
             epoch,
         )
         writer.add_scalars(
-            "Loss/OutputGridMask/Input",
-            {
-                "Train": train_losses.output_grid_mask_input_loss,
-                "Test": test_losses.output_grid_mask_input_loss,
-            },
+            "Loss/Input",
+            {"Train": train_losses.input_loss, "Test": test_losses.input_loss},
             epoch,
         )
         writer.add_scalars(
-            "Loss/OutputGridMask/Output",
-            {
-                "Train": train_losses.output_grid_mask_output_loss,
-                "Test": test_losses.output_grid_mask_output_loss,
-            },
-            epoch,
-        )
-
-        # Input grid mask losses
-        writer.add_scalars(
-            "Loss/InputGridMask/Task",
-            {
-                "Train": train_losses.input_grid_mask_task_loss,
-                "Test": test_losses.input_grid_mask_task_loss,
-            },
-            epoch,
-        )
-        writer.add_scalars(
-            "Loss/InputGridMask/Input",
-            {
-                "Train": train_losses.input_grid_mask_input_loss,
-                "Test": test_losses.input_grid_mask_input_loss,
-            },
-            epoch,
-        )
-        writer.add_scalars(
-            "Loss/InputGridMask/Output",
-            {
-                "Train": train_losses.input_grid_mask_output_loss,
-                "Test": test_losses.input_grid_mask_output_loss,
-            },
-            epoch,
-        )
-
-        # Task mask losses
-        writer.add_scalars(
-            "Loss/TaskMask/Task",
-            {
-                "Train": train_losses.task_mask_task_loss,
-                "Test": test_losses.task_mask_task_loss,
-            },
-            epoch,
-        )
-        writer.add_scalars(
-            "Loss/TaskMask/Input",
-            {
-                "Train": train_losses.task_mask_input_loss,
-                "Test": test_losses.task_mask_input_loss,
-            },
-            epoch,
-        )
-        writer.add_scalars(
-            "Loss/TaskMask/Output",
-            {
-                "Train": train_losses.task_mask_output_loss,
-                "Test": test_losses.task_mask_output_loss,
-            },
+            "Loss/Output",
+            {"Train": train_losses.output_loss, "Test": test_losses.output_loss},
             epoch,
         )
 
