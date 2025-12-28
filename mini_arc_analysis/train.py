@@ -22,11 +22,13 @@ class LossComponents:
         output_loss: Output grid prediction loss when output grid is masked
         vq_loss: Vector quantization loss (commitment + codebook)
         l1_loss: L1 regularization loss on task embeddings
+        fixed_point_loss: Fixed point loss (MSE between final and second-to-last sequence)
     """
 
     output_loss: float
     vq_loss: float
     l1_loss: float
+    fixed_point_loss: float
 
 
 class GridDict(TypedDict):
@@ -278,7 +280,7 @@ class ARCTransformer(nn.Module):
         task_idx: torch.Tensor,
         input_grid: torch.Tensor,
         num_passes: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass predicting the output grid with variable number of passes.
 
         Applies a transformer block (num_layers_in_block encoder layers) multiple times (weight-tied)
@@ -290,10 +292,11 @@ class ARCTransformer(nn.Module):
             num_passes: Number of times to apply the transformer block (1-MAX_PASSES for training, MAX_PASSES for eval)
 
         Returns:
-            Tuple of (output_logits, vq_loss, l1_loss)
+            Tuple of (output_logits, vq_loss, l1_loss, fixed_point_loss)
             - output_logits: Output logits tensor of shape (batch_size, H*W, num_colors)
             - vq_loss: Vector quantization loss
             - l1_loss: L1 regularization loss on task embeddings
+            - fixed_point_loss: MSE between final and second-to-last sequence (0 if num_passes < 2)
         """
         batch_size = task_idx.shape[0]
         H, W = input_grid.shape[1], input_grid.shape[2]
@@ -343,10 +346,22 @@ class ARCTransformer(nn.Module):
         initial_seq = seq
 
         # Apply the same transformer block multiple times with input injection
-        for _ in range(num_passes):
+        # Store the second-to-last sequence for fixed point loss
+        prev_seq = None
+        for i in range(num_passes):
             seq = self.transformer_block(seq)
             # Input injection: add the initial sequence to the output
             seq = seq + initial_seq
+            # Store the second-to-last sequence (when i == num_passes - 2)
+            if i == num_passes - 2:
+                prev_seq = seq
+
+        # Compute fixed point loss (MSE between final and second-to-last sequence)
+        if num_passes >= 2 and prev_seq is not None:
+            fixed_point_loss = torch.mean((seq - prev_seq) ** 2)
+        else:
+            # No fixed point loss if we have less than 2 passes
+            fixed_point_loss = torch.tensor(0.0, device=seq.device)
 
         # Extract output portion of encoded sequence
         input_start = self.task_embedding_num_tokens
@@ -356,7 +371,7 @@ class ARCTransformer(nn.Module):
         # Calculate output logits using separate projection layer
         output_logits = self.output_projection(output_encoded)
 
-        return output_logits, vq_loss, l1_loss
+        return output_logits, vq_loss, l1_loss, fixed_point_loss
 
 
 def train_epoch(
@@ -367,6 +382,7 @@ def train_epoch(
     device,
     max_passes: int,
     l1_weight: float,
+    fixed_point_weight: float,
 ) -> LossComponents:
     """Train for one epoch with random number of passes per batch.
 
@@ -381,6 +397,7 @@ def train_epoch(
         device: Device to train on
         max_passes: Maximum number of passes (blocks) to apply
         l1_weight: Weight for L1 regularization loss
+        fixed_point_weight: Weight for fixed point loss
 
     Returns:
         LossComponents containing average loss for the epoch
@@ -391,6 +408,7 @@ def train_epoch(
     total_output_loss = 0
     total_vq_loss = 0
     total_l1_loss = 0
+    total_fixed_point_loss = 0
     num_batches = 0
 
     for batch in dataloader:
@@ -403,7 +421,9 @@ def train_epoch(
         num_passes = torch.randint(1, max_passes + 1, (1,)).item()
 
         # Forward pass with random number of passes
-        output_logits, vq_loss, l1_loss = model(task_indices, input_grids, num_passes)
+        output_logits, vq_loss, l1_loss, fixed_point_loss = model(
+            task_indices, input_grids, num_passes
+        )
 
         # Prepare targets
         output_targets = output_grids.view(output_grids.shape[0], -1)
@@ -414,8 +434,13 @@ def train_epoch(
             output_targets.view(-1),
         )
 
-        # Total loss combines output loss, VQ loss, and L1 loss
-        loss = output_loss + vq_loss + l1_weight * l1_loss
+        # Total loss combines output loss, VQ loss, L1 loss, and fixed point loss
+        loss = (
+            output_loss
+            + vq_loss
+            + l1_weight * l1_loss
+            + fixed_point_weight * fixed_point_loss
+        )
 
         # Backward pass
         optimizer.zero_grad()
@@ -426,12 +451,14 @@ def train_epoch(
         total_output_loss += output_loss.item()
         total_vq_loss += vq_loss.item()
         total_l1_loss += l1_loss.item()
+        total_fixed_point_loss += fixed_point_loss.item()
         num_batches += 1
 
     return LossComponents(
         output_loss=total_output_loss / num_batches,
         vq_loss=total_vq_loss / num_batches,
         l1_loss=total_l1_loss / num_batches,
+        fixed_point_loss=total_fixed_point_loss / num_batches,
     )
 
 
@@ -442,6 +469,7 @@ def test_epoch(
     device,
     max_passes: int,
     l1_weight: float,
+    fixed_point_weight: float,
 ) -> LossComponents:
     """Evaluate on test set with fixed number of passes.
 
@@ -455,6 +483,7 @@ def test_epoch(
         device: Device to evaluate on
         max_passes: Number of passes (blocks) to apply during evaluation
         l1_weight: Weight for L1 regularization loss
+        fixed_point_weight: Weight for fixed point loss
 
     Returns:
         LossComponents containing average loss for the epoch
@@ -465,6 +494,7 @@ def test_epoch(
     total_output_loss = 0
     total_vq_loss = 0
     total_l1_loss = 0
+    total_fixed_point_loss = 0
     num_batches = 0
 
     with torch.no_grad():
@@ -475,7 +505,7 @@ def test_epoch(
             output_grids = torch.stack([item["output"] for item in batch]).to(device)
 
             # Forward pass with fixed number of passes for evaluation
-            output_logits, vq_loss, l1_loss = model(
+            output_logits, vq_loss, l1_loss, fixed_point_loss = model(
                 task_indices, input_grids, num_passes=max_passes
             )
 
@@ -492,12 +522,14 @@ def test_epoch(
             total_output_loss += output_loss.item()
             total_vq_loss += vq_loss.item()
             total_l1_loss += l1_loss.item()
+            total_fixed_point_loss += fixed_point_loss.item()
             num_batches += 1
 
     return LossComponents(
         output_loss=total_output_loss / num_batches,
         vq_loss=total_vq_loss / num_batches,
         l1_loss=total_l1_loss / num_batches,
+        fixed_point_loss=total_fixed_point_loss / num_batches,
     )
 
 
@@ -543,6 +575,11 @@ def main():
     # L1 Regularization hyperparameter
     L1_WEIGHT = (
         1.0  # Weight for L1 regularization on task embeddings (encourages sparsity)
+    )
+
+    # Fixed Point Loss hyperparameter
+    FIXED_POINT_WEIGHT = (
+        1.0  # Weight for fixed point loss (encourages convergence to a fixed point)
     )
 
     # Select device
@@ -681,9 +718,16 @@ def main():
             device,
             MAX_PASSES,
             L1_WEIGHT,
+            FIXED_POINT_WEIGHT,
         )
         test_losses = test_epoch(
-            model, test_loader, criterion, device, MAX_PASSES, L1_WEIGHT
+            model,
+            test_loader,
+            criterion,
+            device,
+            MAX_PASSES,
+            L1_WEIGHT,
+            FIXED_POINT_WEIGHT,
         )
 
         epoch_time = time.time() - epoch_start_time
@@ -697,6 +741,9 @@ def main():
         )
         print(
             f"L1 Loss - Train: {train_losses.l1_loss:.4f} | Test: {test_losses.l1_loss:.4f}"
+        )
+        print(
+            f"Fixed Point Loss - Train: {train_losses.fixed_point_loss:.4f} | Test: {test_losses.fixed_point_loss:.4f}"
         )
 
         # Log to TensorBoard
@@ -713,6 +760,14 @@ def main():
         writer.add_scalars(
             "Loss/L1",
             {"Train": train_losses.l1_loss, "Test": test_losses.l1_loss},
+            epoch,
+        )
+        writer.add_scalars(
+            "Loss/FixedPoint",
+            {
+                "Train": train_losses.fixed_point_loss,
+                "Test": test_losses.fixed_point_loss,
+            },
             epoch,
         )
 
@@ -732,6 +787,8 @@ def main():
                     "test_vq_loss": test_losses.vq_loss,
                     "train_l1_loss": train_losses.l1_loss,
                     "test_l1_loss": test_losses.l1_loss,
+                    "train_fixed_point_loss": train_losses.fixed_point_loss,
+                    "test_fixed_point_loss": test_losses.fixed_point_loss,
                     "vocab_size": actual_num_tasks,
                     "model_config": {
                         "task_embedding_num_tokens": TASK_EMBEDDING_NUM_TOKENS,
@@ -744,6 +801,7 @@ def main():
                         "vq_num_embeddings": VQ_NUM_EMBEDDINGS,
                         "vq_commitment_cost": VQ_COMMITMENT_COST,
                         "l1_weight": L1_WEIGHT,
+                        "fixed_point_weight": FIXED_POINT_WEIGHT,
                     },
                 },
                 checkpoint_path,
@@ -770,6 +828,8 @@ def main():
             "test_vq_loss": test_losses.vq_loss,
             "train_l1_loss": train_losses.l1_loss,
             "test_l1_loss": test_losses.l1_loss,
+            "train_fixed_point_loss": train_losses.fixed_point_loss,
+            "test_fixed_point_loss": test_losses.fixed_point_loss,
             "vocab_size": actual_num_tasks,
             "model_config": {
                 "task_embedding_num_tokens": TASK_EMBEDDING_NUM_TOKENS,
@@ -782,6 +842,7 @@ def main():
                 "vq_num_embeddings": VQ_NUM_EMBEDDINGS,
                 "vq_commitment_cost": VQ_COMMITMENT_COST,
                 "l1_weight": L1_WEIGHT,
+                "fixed_point_weight": FIXED_POINT_WEIGHT,
             },
         },
         model_path,

@@ -27,7 +27,8 @@ def load_model(model_path: str, device: torch.device):
     # Create model with saved config (filter out training-only params for backward compatibility)
     # num_layers: old parameter that was removed
     # l1_weight: training hyperparameter, not a model architecture parameter
-    training_only_params = {"num_layers", "l1_weight"}
+    # fixed_point_weight: training hyperparameter, not a model architecture parameter
+    training_only_params = {"num_layers", "l1_weight", "fixed_point_weight"}
     model_config = {
         k: v
         for k, v in checkpoint["model_config"].items()
@@ -72,7 +73,7 @@ def predict_output(
         input_grid = input_grid.unsqueeze(0).to(device)
 
         # Get predictions with specified number of passes
-        output_logits, _, _ = model(
+        output_logits, _, _, _ = model(
             task_idx, input_grid, num_passes
         )  # (1, H*W, num_colors)
 
@@ -130,7 +131,7 @@ def calculate_test_loss(
             output_grids = torch.stack([item["output"] for item in batch]).to(device)
 
             # Forward pass with specified number of passes
-            output_logits, _, _ = model(task_indices, input_grids, num_passes)
+            output_logits, _, _, _ = model(task_indices, input_grids, num_passes)
 
             # Compute output loss
             output_targets = output_grids.view(output_logits.shape[0], -1)
