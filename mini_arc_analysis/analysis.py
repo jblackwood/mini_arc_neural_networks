@@ -60,14 +60,9 @@ def predict_output(
         # Add batch dimension
         task_idx = task_idx.unsqueeze(0).to(device)
         input_grid = input_grid.unsqueeze(0).to(device)
-        # Create dummy output grid (not used in forward pass)
-        output_grid = torch.zeros_like(input_grid)
 
         # Get predictions
-        predictions = model(task_idx, input_grid, output_grid)
-        output_logits = predictions[
-            "output_grid_mask_output_logits"
-        ]  # (1, H*W, num_colors)
+        output_logits = model(task_idx, input_grid)  # (1, H*W, num_colors)
 
         # Get most probable predictions
         predicted = torch.argmax(output_logits, dim=-1)  # (1, H*W)
@@ -121,31 +116,13 @@ def calculate_test_loss(
             output_grids = torch.stack([item["output"] for item in batch]).to(device)
 
             # Forward pass
-            predictions = model(task_indices, input_grids, output_grids)
+            output_logits = model(task_indices, input_grids)
 
-            # Compute loss for each part of the sequence using output_grid_mask predictions
-            # Task loss
-            task_logits = predictions[
-                "output_grid_mask_task_logits"
-            ]  # (batch_size, num_tasks)
-            task_loss = criterion(task_logits, task_indices)
-
-            # Input loss
-            input_logits = predictions["output_grid_mask_input_logits"]
-            input_targets = input_grids.view(input_logits.shape[0], -1)
-            input_loss = criterion(
-                input_logits.view(-1, input_logits.shape[-1]), input_targets.view(-1)
-            )
-
-            # Output loss
-            output_logits = predictions["output_grid_mask_output_logits"]
+            # Compute output loss
             output_targets = output_grids.view(output_logits.shape[0], -1)
-            output_loss = criterion(
+            loss = criterion(
                 output_logits.view(-1, output_logits.shape[-1]), output_targets.view(-1)
             )
-
-            # Total loss
-            loss = task_loss + input_loss + output_loss
 
             total_loss += loss.item()
             num_batches += 1

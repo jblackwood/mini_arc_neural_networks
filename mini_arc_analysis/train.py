@@ -19,16 +19,10 @@ class LossComponents:
     """Container for loss components from output grid masking.
 
     Attributes:
-        task_loss: Task prediction loss when output grid is masked
-        input_loss: Input grid prediction loss when output grid is masked
         output_loss: Output grid prediction loss when output grid is masked
-        total_loss: Sum of all 3 losses
     """
 
-    task_loss: float
-    input_loss: float
     output_loss: float
-    total_loss: float
 
 
 class GridDict(TypedDict):
@@ -181,78 +175,24 @@ class ARCTransformer(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-    def extract_logits(self, encoded: torch.Tensor, batch_size: int, H: int, W: int):
-        """Extract task, input, and output logits from encoded sequence.
-
-        Args:
-            encoded: (batch_size, seq_len, d_model) encoded sequence from transformer
-            batch_size: Batch size
-            H: Height of grids
-            W: Width of grids
-
-        Returns:
-            Tuple of (task_logits, input_logits, output_logits)
-        """
-        # Split encoded sequence into task, input, and output portions
-        task_encoded = encoded[:, : self.task_embedding_num_tokens, :]
-        input_start = self.task_embedding_num_tokens
-        input_end = input_start + H * W
-        input_encoded = encoded[:, input_start:input_end, :]
-        output_encoded = encoded[:, input_end:, :]
-
-        # Task logits using symmetric encoding/decoding
-        # Compute distances from predicted task embeddings to all task encoder embeddings
-        # task_encoded: (batch_size, num_tokens, d_model)
-
-        # Flatten predicted task embedding: (batch_size, num_tokens * d_model)
-        task_encoded_flat = task_encoded.reshape(
-            batch_size, self.task_embedding_num_tokens * self.d_model
-        )
-
-        # Get all task encoder embeddings: (num_tasks, num_tokens * d_model)
-        task_encoder_emb = self.task_encoder.weight  # (num_tasks, d_model * num_tokens)
-
-        # Compute L2 distances: (batch_size, num_tasks)
-        # ||a - b||^2 = ||a||^2 + ||b||^2 - 2*a*b
-        distances = (
-            torch.sum(task_encoded_flat**2, dim=1, keepdim=True)  # (batch_size, 1)
-            + torch.sum(task_encoder_emb**2, dim=1)  # (num_tasks,)
-            - 2
-            * torch.matmul(
-                task_encoded_flat, task_encoder_emb.t()
-            )  # (batch_size, num_tasks)
-        )
-
-        # Use negative distances as logits (closer = higher logit)
-        task_logits = -distances
-
-        # Grid logits
-        grid_weight = self.grid_embedding.weight[: self.num_colors]
-        input_logits = torch.matmul(input_encoded, grid_weight.t())
-        output_logits = torch.matmul(output_encoded, grid_weight.t())
-
-        return task_logits, input_logits, output_logits
+        # Output projection layer for predicting colors
+        self.output_projection = nn.Linear(d_model, num_colors)
 
     def forward(
         self,
         task_idx: torch.Tensor,
         input_grid: torch.Tensor,
-        output_grid: torch.Tensor,
     ):
-        """Forward pass predicting the entire sequence.
+        """Forward pass predicting the output grid.
 
-        Masks the output grid and predicts task, input, and output.
+        Masks the output grid and predicts it.
 
         Args:
             task_idx: (batch_size,) task indices
             input_grid: (batch_size, H, W) input grids
-            output_grid: (batch_size, H, W) output grids (not used in forward, only for loss)
 
         Returns:
-            Dictionary containing 3 logits:
-                - task_logits: (batch_size, num_tasks)
-                - input_logits: (batch_size, H*W, num_colors)
-                - output_logits: (batch_size, H*W, num_colors)
+            Output logits tensor of shape (batch_size, H*W, num_colors)
         """
         batch_size = task_idx.shape[0]
         H, W = input_grid.shape[1], input_grid.shape[2]
@@ -295,16 +235,15 @@ class ARCTransformer(nn.Module):
         # Pass through transformer
         encoded = self.transformer(seq)
 
-        # Extract logits
-        task_logits, input_logits, output_logits = self.extract_logits(
-            encoded, batch_size, H, W
-        )
+        # Extract output portion of encoded sequence
+        input_start = self.task_embedding_num_tokens
+        input_end = input_start + H * W
+        output_encoded = encoded[:, input_end:, :]
 
-        return {
-            "task_logits": task_logits,
-            "input_logits": input_logits,
-            "output_logits": output_logits,
-        }
+        # Calculate output logits using separate projection layer
+        output_logits = self.output_projection(output_encoded)
+
+        return output_logits
 
 
 def train_epoch(
@@ -324,15 +263,12 @@ def train_epoch(
         device: Device to train on
 
     Returns:
-        LossComponents containing average losses for the epoch
+        LossComponents containing average loss for the epoch
     """
     model.train()
 
-    # Initialize accumulators for 3 losses
-    total_task_loss = 0
-    total_input_loss = 0
+    # Initialize accumulator for output loss
     total_output_loss = 0
-    total_loss = 0
     num_batches = 0
 
     for batch in dataloader:
@@ -342,45 +278,28 @@ def train_epoch(
         output_grids = torch.stack([item["output"] for item in batch]).to(device)
 
         # Forward pass
-        predictions = model(task_indices, input_grids, output_grids)
+        output_logits = model(task_indices, input_grids)
 
         # Prepare targets
-        input_targets = input_grids.view(input_grids.shape[0], -1)
         output_targets = output_grids.view(output_grids.shape[0], -1)
 
-        # Compute 3 losses
-        task_loss = criterion(predictions["task_logits"], task_indices)
-        input_loss = criterion(
-            predictions["input_logits"].view(-1, predictions["input_logits"].shape[-1]),
-            input_targets.view(-1),
-        )
-        output_loss = criterion(
-            predictions["output_logits"].view(
-                -1, predictions["output_logits"].shape[-1]
-            ),
+        # Compute output loss
+        loss = criterion(
+            output_logits.view(-1, output_logits.shape[-1]),
             output_targets.view(-1),
         )
-
-        # Total loss is sum of all 3 losses
-        loss = task_loss + input_loss + output_loss
 
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        # Accumulate losses
-        total_task_loss += task_loss.item()
-        total_input_loss += input_loss.item()
-        total_output_loss += output_loss.item()
-        total_loss += loss.item()
+        # Accumulate loss
+        total_output_loss += loss.item()
         num_batches += 1
 
     return LossComponents(
-        task_loss=total_task_loss / num_batches,
-        input_loss=total_input_loss / num_batches,
         output_loss=total_output_loss / num_batches,
-        total_loss=total_loss / num_batches,
     )
 
 
@@ -399,15 +318,12 @@ def test_epoch(
         device: Device to evaluate on
 
     Returns:
-        LossComponents containing average losses for the epoch
+        LossComponents containing average loss for the epoch
     """
     model.eval()
 
-    # Initialize accumulators for 3 losses
-    total_task_loss = 0
-    total_input_loss = 0
+    # Initialize accumulator for output loss
     total_output_loss = 0
-    total_loss = 0
     num_batches = 0
 
     with torch.no_grad():
@@ -418,42 +334,23 @@ def test_epoch(
             output_grids = torch.stack([item["output"] for item in batch]).to(device)
 
             # Forward pass
-            predictions = model(task_indices, input_grids, output_grids)
+            output_logits = model(task_indices, input_grids)
 
             # Prepare targets
-            input_targets = input_grids.view(input_grids.shape[0], -1)
             output_targets = output_grids.view(output_grids.shape[0], -1)
 
-            # Compute 3 losses
-            task_loss = criterion(predictions["task_logits"], task_indices)
-            input_loss = criterion(
-                predictions["input_logits"].view(
-                    -1, predictions["input_logits"].shape[-1]
-                ),
-                input_targets.view(-1),
-            )
-            output_loss = criterion(
-                predictions["output_logits"].view(
-                    -1, predictions["output_logits"].shape[-1]
-                ),
+            # Compute output loss
+            loss = criterion(
+                output_logits.view(-1, output_logits.shape[-1]),
                 output_targets.view(-1),
             )
 
-            # Total loss is sum of all 3 losses
-            loss = task_loss + input_loss + output_loss
-
-            # Accumulate losses
-            total_task_loss += task_loss.item()
-            total_input_loss += input_loss.item()
-            total_output_loss += output_loss.item()
-            total_loss += loss.item()
+            # Accumulate loss
+            total_output_loss += loss.item()
             num_batches += 1
 
     return LossComponents(
-        task_loss=total_task_loss / num_batches,
-        input_loss=total_input_loss / num_batches,
         output_loss=total_output_loss / num_batches,
-        total_loss=total_loss / num_batches,
     )
 
 
@@ -621,37 +518,10 @@ def main():
 
         print(f"\nEpoch {epoch+1}/{num_epochs} - Time: {epoch_time:.2f}s")
         print(
-            f"Total Loss - Train: {train_losses.total_loss:.4f} | Test: {test_losses.total_loss:.4f}"
-        )
-        print(
-            f"  Task:   Train: {train_losses.task_loss:.4f} | Test: {test_losses.task_loss:.4f}"
-        )
-        print(
-            f"  Input:  Train: {train_losses.input_loss:.4f} | Test: {test_losses.input_loss:.4f}"
-        )
-        print(
-            f"  Output: Train: {train_losses.output_loss:.4f} | Test: {test_losses.output_loss:.4f}"
+            f"Loss - Train: {train_losses.output_loss:.4f} | Test: {test_losses.output_loss:.4f}"
         )
 
         # Log to TensorBoard
-        # Total loss
-        writer.add_scalars(
-            "Loss/Total",
-            {"Train": train_losses.total_loss, "Test": test_losses.total_loss},
-            epoch,
-        )
-
-        # Component losses
-        writer.add_scalars(
-            "Loss/Task",
-            {"Train": train_losses.task_loss, "Test": test_losses.task_loss},
-            epoch,
-        )
-        writer.add_scalars(
-            "Loss/Input",
-            {"Train": train_losses.input_loss, "Test": test_losses.input_loss},
-            epoch,
-        )
         writer.add_scalars(
             "Loss/Output",
             {"Train": train_losses.output_loss, "Test": test_losses.output_loss},
@@ -668,8 +538,8 @@ def main():
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "epoch": epoch + 1,
-                    "train_loss": train_losses.total_loss,
-                    "test_loss": test_losses.total_loss,
+                    "train_loss": train_losses.output_loss,
+                    "test_loss": test_losses.output_loss,
                     "vocab_size": num_training_tasks,
                     "model_config": {
                         "task_embedding_num_tokens": TASK_EMBEDDING_NUM_TOKENS,
@@ -699,8 +569,8 @@ def main():
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "epoch": num_epochs,
-            "train_loss": train_losses.total_loss,
-            "test_loss": test_losses.total_loss,
+            "train_loss": train_losses.output_loss,
+            "test_loss": test_losses.output_loss,
             "vocab_size": num_training_tasks,
             "model_config": {
                 "task_embedding_num_tokens": TASK_EMBEDDING_NUM_TOKENS,
