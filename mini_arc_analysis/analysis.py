@@ -67,7 +67,9 @@ def predict_output(
         input_grid = input_grid.unsqueeze(0).to(device)
 
         # Get predictions with specified number of passes
-        output_logits = model(task_idx, input_grid, num_passes)  # (1, H*W, num_colors)
+        output_logits, _ = model(
+            task_idx, input_grid, num_passes
+        )  # (1, H*W, num_colors)
 
         # Get most probable predictions
         predicted = torch.argmax(output_logits, dim=-1)  # (1, H*W)
@@ -123,7 +125,7 @@ def calculate_test_loss(
             output_grids = torch.stack([item["output"] for item in batch]).to(device)
 
             # Forward pass with specified number of passes
-            output_logits = model(task_indices, input_grids, num_passes)
+            output_logits, _ = model(task_indices, input_grids, num_passes)
 
             # Compute output loss
             output_targets = output_grids.view(output_logits.shape[0], -1)
@@ -246,7 +248,10 @@ def main():
 
     # Calculate test loss and get prediction statistics
     print("\nCalculating test loss and analyzing predictions...")
-    test_loss, stats = calculate_test_loss(model, test_dataset, device, batch_size=512)
+    num_passes = 30  # Use same max passes as training
+    test_loss, stats = calculate_test_loss(
+        model, test_dataset, device, batch_size=512, num_passes=num_passes
+    )
     print(f"Test Loss: {test_loss:.4f}")
     print(f"\n=== Prediction Statistics ===")
     print(f"Total predictions: {stats['total_predictions']}")
@@ -292,7 +297,9 @@ def main():
         print(f"  Output shape: {true_output.shape}")
 
         # Generate prediction
-        predicted_output = predict_output(model, task_id_tensor, input_grid, device)
+        predicted_output = predict_output(
+            model, task_id_tensor, input_grid, device, num_passes
+        )
 
         # Plot comparison
         plot_comparison(

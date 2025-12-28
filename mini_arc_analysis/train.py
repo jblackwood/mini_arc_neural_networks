@@ -20,9 +20,11 @@ class LossComponents:
 
     Attributes:
         output_loss: Output grid prediction loss when output grid is masked
+        vq_loss: Vector quantization loss (commitment + codebook)
     """
 
     output_loss: float
+    vq_loss: float
 
 
 class GridDict(TypedDict):
@@ -124,6 +126,81 @@ def flatten_collate(batch: List[List[GridDict]]) -> List[GridDict]:
     return flattened
 
 
+class VectorQuantizer(nn.Module):
+    """Vector Quantizer layer inspired by VQ-VAE.
+
+    Quantizes continuous embeddings to discrete codebook entries.
+
+    Args:
+        num_embeddings: Size of the codebook
+        embedding_dim: Dimension of each codebook entry
+        commitment_cost: Weight for the commitment loss (beta in VQ-VAE paper)
+    """
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        commitment_cost: float,
+    ):
+        super().__init__()
+
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.commitment_cost = commitment_cost
+
+        # Initialize codebook embeddings
+        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
+        self.embedding.weight.data.uniform_(-1.0 / num_embeddings, 1.0 / num_embeddings)
+
+    def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize the input embeddings.
+
+        Args:
+            z: Input embeddings of shape (batch_size, num_tokens, embedding_dim)
+
+        Returns:
+            Tuple of (quantized embeddings, vq_loss)
+            - quantized: Quantized embeddings with same shape as input
+            - vq_loss: Combined commitment and codebook loss
+        """
+        # Flatten input for distance computation
+        z_flattened = z.view(
+            -1, self.embedding_dim
+        )  # (batch_size * num_tokens, embedding_dim)
+
+        # Calculate distances to codebook entries
+        # ||z - e||^2 = ||z||^2 + ||e||^2 - 2 * z^T * e
+        distances = (
+            torch.sum(z_flattened**2, dim=1, keepdim=True)
+            + torch.sum(self.embedding.weight**2, dim=1)
+            - 2 * torch.matmul(z_flattened, self.embedding.weight.t())
+        )  # (batch_size * num_tokens, num_embeddings)
+
+        # Find nearest codebook entry
+        encoding_indices = torch.argmin(distances, dim=1)  # (batch_size * num_tokens,)
+
+        # Quantize
+        quantized = self.embedding(encoding_indices).view(
+            z.shape
+        )  # (batch_size, num_tokens, embedding_dim)
+
+        # Compute VQ losses
+        # Codebook loss: move codebook entries towards encoder outputs
+        codebook_loss = torch.mean((quantized.detach() - z) ** 2)
+
+        # Commitment loss: encourage encoder outputs to stay close to chosen codebook entries
+        commitment_loss = torch.mean((quantized - z.detach()) ** 2)
+
+        # Combined VQ loss
+        vq_loss = codebook_loss + self.commitment_cost * commitment_loss
+
+        # Straight-through estimator: copy gradients from quantized to z
+        quantized = z + (quantized - z).detach()
+
+        return quantized, vq_loss
+
+
 class ARCTransformer(nn.Module):
     """Transformer model for ARC tasks using BERT-style masking with weight-tied blocks.
 
@@ -139,6 +216,8 @@ class ARCTransformer(nn.Module):
         dim_feedforward: Dimension of feedforward network
         max_seq_len: Maximum sequence length for positional embeddings
         num_colors: Number of unique colors (0-9, so 10)
+        vq_num_embeddings: Size of the VQ codebook (number of discrete codes)
+        vq_commitment_cost: Weight for VQ commitment loss
     """
 
     def __init__(
@@ -151,6 +230,8 @@ class ARCTransformer(nn.Module):
         dim_feedforward: int,
         max_seq_len: int,
         num_colors: int,
+        vq_num_embeddings: int,
+        vq_commitment_cost: float,
     ):
         super().__init__()
 
@@ -164,6 +245,13 @@ class ARCTransformer(nn.Module):
 
         # Task encoder: maps task indices to continuous embeddings
         self.task_encoder = nn.Embedding(num_tasks, d_model * task_embedding_num_tokens)
+
+        # Vector Quantizer for task embeddings
+        self.vector_quantizer = VectorQuantizer(
+            num_embeddings=vq_num_embeddings,
+            embedding_dim=d_model,
+            commitment_cost=vq_commitment_cost,
+        )
 
         # Grid embedding now includes the MASK token (num_colors + 1 total)
         self.grid_embedding = nn.Embedding(num_colors + 1, d_model)
@@ -188,7 +276,7 @@ class ARCTransformer(nn.Module):
         task_idx: torch.Tensor,
         input_grid: torch.Tensor,
         num_passes: int,
-    ):
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass predicting the output grid with variable number of passes.
 
         Applies a transformer block (num_layers_in_block encoder layers) multiple times (weight-tied)
@@ -200,7 +288,9 @@ class ARCTransformer(nn.Module):
             num_passes: Number of times to apply the transformer block (1-MAX_PASSES for training, MAX_PASSES for eval)
 
         Returns:
-            Output logits tensor of shape (batch_size, H*W, num_colors)
+            Tuple of (output_logits, vq_loss)
+            - output_logits: Output logits tensor of shape (batch_size, H*W, num_colors)
+            - vq_loss: Vector quantization loss
         """
         batch_size = task_idx.shape[0]
         H, W = input_grid.shape[1], input_grid.shape[2]
@@ -213,6 +303,9 @@ class ARCTransformer(nn.Module):
         task_emb = task_emb.view(
             batch_size, self.task_embedding_num_tokens, self.d_model
         )  # (batch_size, num_tokens, d_model)
+
+        # Apply vector quantization to task embeddings
+        task_emb, vq_loss = self.vector_quantizer(task_emb)
 
         # Get grid embeddings
         input_emb = self.grid_embedding(input_flat)  # (batch_size, H*W, d_model)
@@ -257,7 +350,7 @@ class ARCTransformer(nn.Module):
         # Calculate output logits using separate projection layer
         output_logits = self.output_projection(output_encoded)
 
-        return output_logits
+        return output_logits, vq_loss
 
 
 def train_epoch(
@@ -286,8 +379,9 @@ def train_epoch(
     """
     model.train()
 
-    # Initialize accumulator for output loss
+    # Initialize accumulators for losses
     total_output_loss = 0
+    total_vq_loss = 0
     num_batches = 0
 
     for batch in dataloader:
@@ -300,28 +394,33 @@ def train_epoch(
         num_passes = torch.randint(1, max_passes + 1, (1,)).item()
 
         # Forward pass with random number of passes
-        output_logits = model(task_indices, input_grids, num_passes)
+        output_logits, vq_loss = model(task_indices, input_grids, num_passes)
 
         # Prepare targets
         output_targets = output_grids.view(output_grids.shape[0], -1)
 
         # Compute output loss
-        loss = criterion(
+        output_loss = criterion(
             output_logits.view(-1, output_logits.shape[-1]),
             output_targets.view(-1),
         )
+
+        # Total loss combines output loss and VQ loss
+        loss = output_loss + vq_loss
 
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        # Accumulate loss
-        total_output_loss += loss.item()
+        # Accumulate losses
+        total_output_loss += output_loss.item()
+        total_vq_loss += vq_loss.item()
         num_batches += 1
 
     return LossComponents(
         output_loss=total_output_loss / num_batches,
+        vq_loss=total_vq_loss / num_batches,
     )
 
 
@@ -349,8 +448,9 @@ def test_epoch(
     """
     model.eval()
 
-    # Initialize accumulator for output loss
+    # Initialize accumulators for losses
     total_output_loss = 0
+    total_vq_loss = 0
     num_batches = 0
 
     with torch.no_grad():
@@ -361,23 +461,27 @@ def test_epoch(
             output_grids = torch.stack([item["output"] for item in batch]).to(device)
 
             # Forward pass with fixed number of passes for evaluation
-            output_logits = model(task_indices, input_grids, num_passes=max_passes)
+            output_logits, vq_loss = model(
+                task_indices, input_grids, num_passes=max_passes
+            )
 
             # Prepare targets
             output_targets = output_grids.view(output_grids.shape[0], -1)
 
             # Compute output loss
-            loss = criterion(
+            output_loss = criterion(
                 output_logits.view(-1, output_logits.shape[-1]),
                 output_targets.view(-1),
             )
 
-            # Accumulate loss
-            total_output_loss += loss.item()
+            # Accumulate losses
+            total_output_loss += output_loss.item()
+            total_vq_loss += vq_loss.item()
             num_batches += 1
 
     return LossComponents(
         output_loss=total_output_loss / num_batches,
+        vq_loss=total_vq_loss / num_batches,
     )
 
 
@@ -412,6 +516,10 @@ def main():
     MAX_SEQ_LEN = 55
     NUM_COLORS = 10
     MAX_PASSES = 30  # Maximum number of transformer block passes
+
+    # Vector Quantizer hyperparameters
+    VQ_NUM_EMBEDDINGS = 10  # Size of the VQ codebook
+    VQ_COMMITMENT_COST = 0.25  # Weight for commitment loss
 
     # Select device
     if torch.cuda.is_available():
@@ -466,6 +574,8 @@ def main():
         dim_feedforward=DIM_FEEDFORWARD,
         max_seq_len=MAX_SEQ_LEN,
         num_colors=NUM_COLORS,
+        vq_num_embeddings=VQ_NUM_EMBEDDINGS,
+        vq_commitment_cost=VQ_COMMITMENT_COST,
     ).to(device)
 
     # Optimizer and loss
@@ -547,13 +657,21 @@ def main():
 
         print(f"\nEpoch {epoch+1}/{num_epochs} - Time: {epoch_time:.2f}s")
         print(
-            f"Loss - Train: {train_losses.output_loss:.4f} | Test: {test_losses.output_loss:.4f}"
+            f"Output Loss - Train: {train_losses.output_loss:.4f} | Test: {test_losses.output_loss:.4f}"
+        )
+        print(
+            f"VQ Loss - Train: {train_losses.vq_loss:.4f} | Test: {test_losses.vq_loss:.4f}"
         )
 
         # Log to TensorBoard
         writer.add_scalars(
             "Loss/Output",
             {"Train": train_losses.output_loss, "Test": test_losses.output_loss},
+            epoch,
+        )
+        writer.add_scalars(
+            "Loss/VQ",
+            {"Train": train_losses.vq_loss, "Test": test_losses.vq_loss},
             epoch,
         )
 
@@ -569,6 +687,8 @@ def main():
                     "epoch": epoch + 1,
                     "train_loss": train_losses.output_loss,
                     "test_loss": test_losses.output_loss,
+                    "train_vq_loss": train_losses.vq_loss,
+                    "test_vq_loss": test_losses.vq_loss,
                     "vocab_size": num_training_tasks,
                     "model_config": {
                         "task_embedding_num_tokens": TASK_EMBEDDING_NUM_TOKENS,
@@ -578,6 +698,8 @@ def main():
                         "dim_feedforward": DIM_FEEDFORWARD,
                         "max_seq_len": MAX_SEQ_LEN,
                         "num_colors": NUM_COLORS,
+                        "vq_num_embeddings": VQ_NUM_EMBEDDINGS,
+                        "vq_commitment_cost": VQ_COMMITMENT_COST,
                     },
                 },
                 checkpoint_path,
@@ -600,6 +722,8 @@ def main():
             "epoch": num_epochs,
             "train_loss": train_losses.output_loss,
             "test_loss": test_losses.output_loss,
+            "train_vq_loss": train_losses.vq_loss,
+            "test_vq_loss": test_losses.vq_loss,
             "vocab_size": num_training_tasks,
             "model_config": {
                 "task_embedding_num_tokens": TASK_EMBEDDING_NUM_TOKENS,
@@ -609,6 +733,8 @@ def main():
                 "dim_feedforward": DIM_FEEDFORWARD,
                 "max_seq_len": MAX_SEQ_LEN,
                 "num_colors": NUM_COLORS,
+                "vq_num_embeddings": VQ_NUM_EMBEDDINGS,
+                "vq_commitment_cost": VQ_COMMITMENT_COST,
             },
         },
         model_path,
