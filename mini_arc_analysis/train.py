@@ -16,7 +16,7 @@ from arc_shared import parse_arc_json
 
 @dataclass
 class LossComponents:
-    """Container for all 9 loss components from 3 masking patterns plus KL loss.
+    """Container for all 9 loss components from 3 masking patterns.
 
     Attributes:
         output_grid_mask_task_loss: Task loss when output grid is masked
@@ -28,8 +28,7 @@ class LossComponents:
         task_mask_task_loss: Task loss when task is masked
         task_mask_input_loss: Input loss when task is masked
         task_mask_output_loss: Output loss when task is masked
-        kl_loss: KL divergence loss encouraging task embeddings to follow N(0,1)
-        total_loss: Sum of all 9 losses plus KL loss
+        total_loss: Sum of all 9 losses
     """
 
     output_grid_mask_task_loss: float
@@ -41,7 +40,6 @@ class LossComponents:
     task_mask_task_loss: float
     task_mask_input_loss: float
     task_mask_output_loss: float
-    kl_loss: float
     total_loss: float
 
 
@@ -174,19 +172,13 @@ class ARCTransformer(nn.Module):
         self.d_model = d_model
         self.num_colors = num_colors
         self.task_embedding_num_tokens = task_embedding_num_tokens
+        self.num_tasks = num_tasks
 
         # MASK token is added as an extra embedding (index = num_colors)
         self.mask_token_idx = num_colors
 
-        # Embedding layers
-        # Task embedding is larger: num_tokens * d_model
-        self.task_embedding = nn.Embedding(
-            num_tasks, d_model * task_embedding_num_tokens
-        )
-        # Initialize task embedding weights to small values near 0
-        # Scale down the default initialization to encourage N(0,1) distribution
-        with torch.no_grad():
-            self.task_embedding.weight.data *= 0.01
+        # Task encoder: maps task indices to continuous embeddings
+        self.task_encoder = nn.Embedding(num_tasks, d_model * task_embedding_num_tokens)
 
         # Grid embedding now includes the MASK token (num_colors + 1 total)
         self.grid_embedding = nn.Embedding(num_colors + 1, d_model)
@@ -200,11 +192,6 @@ class ARCTransformer(nn.Module):
             batch_first=True,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
-        # Store num_tasks for weight tying
-        self.num_tasks = num_tasks
-
-        # No separate output projection layers - we'll use weight tying with embeddings
 
     def extract_logits(self, encoded: torch.Tensor, batch_size: int, H: int, W: int):
         """Extract task, input, and output logits from encoded sequence.
@@ -225,11 +212,31 @@ class ARCTransformer(nn.Module):
         input_encoded = encoded[:, input_start:input_end, :]
         output_encoded = encoded[:, input_end:, :]
 
-        # Task logits
-        task_encoded_flat = task_encoded.view(
+        # Task logits using symmetric encoding/decoding
+        # Compute distances from predicted task embeddings to all task encoder embeddings
+        # task_encoded: (batch_size, num_tokens, d_model)
+
+        # Flatten predicted task embedding: (batch_size, num_tokens * d_model)
+        task_encoded_flat = task_encoded.reshape(
             batch_size, self.task_embedding_num_tokens * self.d_model
         )
-        task_logits = torch.matmul(task_encoded_flat, self.task_embedding.weight.t())
+
+        # Get all task encoder embeddings: (num_tasks, num_tokens * d_model)
+        task_encoder_emb = self.task_encoder.weight  # (num_tasks, d_model * num_tokens)
+
+        # Compute L2 distances: (batch_size, num_tasks)
+        # ||a - b||^2 = ||a||^2 + ||b||^2 - 2*a*b
+        distances = (
+            torch.sum(task_encoded_flat**2, dim=1, keepdim=True)  # (batch_size, 1)
+            + torch.sum(task_encoder_emb**2, dim=1)  # (num_tasks,)
+            - 2
+            * torch.matmul(
+                task_encoded_flat, task_encoder_emb.t()
+            )  # (batch_size, num_tasks)
+        )
+
+        # Use negative distances as logits (closer = higher logit)
+        task_logits = -distances
 
         # Grid logits
         grid_weight = self.grid_embedding.weight[: self.num_colors]
@@ -244,7 +251,7 @@ class ARCTransformer(nn.Module):
         input_grid: torch.Tensor,
         output_grid: torch.Tensor,
     ):
-        """Forward pass predicting the entire sequence using weight tying.
+        """Forward pass predicting the entire sequence.
 
         Creates three different masked sequences and returns predictions for each:
         1. output_grid_mask: Mask output grid (current behavior)
@@ -275,11 +282,9 @@ class ARCTransformer(nn.Module):
         input_flat = input_grid.view(batch_size, -1)  # (batch_size, H*W)
         output_flat = output_grid.view(batch_size, -1)  # (batch_size, H*W)
 
-        # Get task embedding and reshape into multiple tokens
-        task_emb_flat = self.task_embedding(
-            task_idx
-        )  # (batch_size, d_model * num_tokens)
-        task_emb = task_emb_flat.view(
+        # Get task embedding from encoder
+        task_emb = self.task_encoder(task_idx)  # (batch_size, d_model * num_tokens)
+        task_emb = task_emb.view(
             batch_size, self.task_embedding_num_tokens, self.d_model
         )  # (batch_size, num_tokens, d_model)
 
@@ -377,7 +382,6 @@ def train_epoch(
     optimizer,
     criterion,
     device,
-    kl_weight: float,
     task_mask_weight: float,
 ) -> LossComponents:
     """Train for one epoch.
@@ -388,7 +392,6 @@ def train_epoch(
         optimizer: Optimizer for training
         criterion: Loss criterion
         device: Device to train on
-        kl_weight: Weight for KL divergence loss encouraging task embeddings to follow N(0,1)
         task_mask_weight: Extra weight for task_mask losses
 
     Returns:
@@ -396,7 +399,7 @@ def train_epoch(
     """
     model.train()
 
-    # Initialize accumulators for all 9 losses plus KL loss
+    # Initialize accumulators for all 9 losses
     total_output_grid_mask_task_loss = 0
     total_output_grid_mask_input_loss = 0
     total_output_grid_mask_output_loss = 0
@@ -406,11 +409,10 @@ def train_epoch(
     total_task_mask_task_loss = 0
     total_task_mask_input_loss = 0
     total_task_mask_output_loss = 0
-    total_kl_loss = 0
     total_loss = 0
     num_batches = 0
 
-    for batch_idx, batch in enumerate(dataloader):
+    for batch in dataloader:
         # Stack batch items
         task_indices = torch.stack([item["task_idx"] for item in batch]).to(device)
         input_grids = torch.stack([item["input"] for item in batch]).to(device)
@@ -475,23 +477,7 @@ def train_epoch(
             output_targets.view(-1),
         )
 
-        # Compute KL divergence loss to encourage task embeddings to follow N(0,1)
-        # Task embeddings shape: (num_tasks, d_model * task_embedding_num_tokens)
-        # Reshape to: (num_tasks, task_embedding_num_tokens, d_model)
-        task_emb_reshaped = model.task_embedding.weight.view(
-            -1, model.task_embedding_num_tokens, model.d_model
-        )
-        # Flatten to (num_tasks * task_embedding_num_tokens, d_model)
-        # All task tokens share the same latent space
-        task_emb_flat = task_emb_reshaped.view(-1, model.d_model)
-        # Compute mean and variance across ALL tasks and ALL token positions
-        # This ensures all tokens are part of the same N(0,1) latent space
-        mean = task_emb_flat.mean(dim=0, keepdim=True)  # (1, d_model)
-        var = task_emb_flat.var(dim=0, unbiased=False, keepdim=True)  # (1, d_model)
-        # KL(N(μ, σ²) || N(0, 1)) = 0.5 * (σ² + μ² - 1 - log(σ²))
-        kl_loss = kl_weight * 0.5 * torch.sum(var + mean**2 - 1 - torch.log(var + 1e-8))
-
-        # Total loss is sum of all 9 losses (with task_mask losses weighted) plus KL loss
+        # Total loss is sum of all 9 losses (with task_mask losses weighted)
         loss = (
             output_grid_mask_task_loss
             + output_grid_mask_input_loss
@@ -502,7 +488,6 @@ def train_epoch(
             + task_mask_weight * task_mask_task_loss
             + task_mask_weight * task_mask_input_loss
             + task_mask_weight * task_mask_output_loss
-            + kl_loss
         )
 
         # Backward pass
@@ -520,7 +505,6 @@ def train_epoch(
         total_task_mask_task_loss += task_mask_task_loss.item()
         total_task_mask_input_loss += task_mask_input_loss.item()
         total_task_mask_output_loss += task_mask_output_loss.item()
-        total_kl_loss += kl_loss.item()
         total_loss += loss.item()
         num_batches += 1
 
@@ -537,7 +521,6 @@ def train_epoch(
         task_mask_task_loss=total_task_mask_task_loss / num_batches,
         task_mask_input_loss=total_task_mask_input_loss / num_batches,
         task_mask_output_loss=total_task_mask_output_loss / num_batches,
-        kl_loss=total_kl_loss / num_batches,
         total_loss=total_loss / num_batches,
     )
 
@@ -547,7 +530,6 @@ def test_epoch(
     dataloader: DataLoader,
     criterion,
     device,
-    kl_weight: float,
     task_mask_weight: float,
 ) -> LossComponents:
     """Evaluate on test set.
@@ -557,7 +539,6 @@ def test_epoch(
         dataloader: DataLoader for test data
         criterion: Loss criterion
         device: Device to evaluate on
-        kl_weight: Weight for KL divergence loss encouraging task embeddings to follow N(0,1)
         task_mask_weight: Extra weight for task_mask losses
 
     Returns:
@@ -565,7 +546,7 @@ def test_epoch(
     """
     model.eval()
 
-    # Initialize accumulators for all 9 losses plus KL loss
+    # Initialize accumulators for all 9 losses
     total_output_grid_mask_task_loss = 0
     total_output_grid_mask_input_loss = 0
     total_output_grid_mask_output_loss = 0
@@ -575,12 +556,11 @@ def test_epoch(
     total_task_mask_task_loss = 0
     total_task_mask_input_loss = 0
     total_task_mask_output_loss = 0
-    total_kl_loss = 0
     total_loss = 0
     num_batches = 0
 
     with torch.no_grad():
-        for batch_idx, batch in enumerate(dataloader):
+        for batch in dataloader:
             # Stack batch items
             task_indices = torch.stack([item["task_idx"] for item in batch]).to(device)
             input_grids = torch.stack([item["input"] for item in batch]).to(device)
@@ -645,25 +625,7 @@ def test_epoch(
                 output_targets.view(-1),
             )
 
-            # Compute KL divergence loss to encourage task embeddings to follow N(0,1)
-            # Task embeddings shape: (num_tasks, d_model * task_embedding_num_tokens)
-            # Reshape to: (num_tasks, task_embedding_num_tokens, d_model)
-            task_emb_reshaped = model.task_embedding.weight.view(
-                -1, model.task_embedding_num_tokens, model.d_model
-            )
-            # Flatten to (num_tasks * task_embedding_num_tokens, d_model)
-            # All task tokens share the same latent space
-            task_emb_flat = task_emb_reshaped.view(-1, model.d_model)
-            # Compute mean and variance across ALL tasks and ALL token positions
-            # This ensures all tokens are part of the same N(0,1) latent space
-            mean = task_emb_flat.mean(dim=0, keepdim=True)  # (1, d_model)
-            var = task_emb_flat.var(dim=0, unbiased=False, keepdim=True)  # (1, d_model)
-            # KL(N(μ, σ²) || N(0, 1)) = 0.5 * (σ² + μ² - 1 - log(σ²))
-            kl_loss = (
-                kl_weight * 0.5 * torch.sum(var + mean**2 - 1 - torch.log(var + 1e-8))
-            )
-
-            # Total loss is sum of all 9 losses (with task_mask losses weighted) plus KL loss
+            # Total loss is sum of all 9 losses (with task_mask losses weighted)
             loss = (
                 output_grid_mask_task_loss
                 + output_grid_mask_input_loss
@@ -674,7 +636,6 @@ def test_epoch(
                 + task_mask_weight * task_mask_task_loss
                 + task_mask_weight * task_mask_input_loss
                 + task_mask_weight * task_mask_output_loss
-                + kl_loss
             )
 
             # Accumulate losses
@@ -687,7 +648,6 @@ def test_epoch(
             total_task_mask_task_loss += task_mask_task_loss.item()
             total_task_mask_input_loss += task_mask_input_loss.item()
             total_task_mask_output_loss += task_mask_output_loss.item()
-            total_kl_loss += kl_loss.item()
             total_loss += loss.item()
             num_batches += 1
 
@@ -701,7 +661,6 @@ def test_epoch(
         task_mask_task_loss=total_task_mask_task_loss / num_batches,
         task_mask_input_loss=total_task_mask_input_loss / num_batches,
         task_mask_output_loss=total_task_mask_output_loss / num_batches,
-        kl_loss=total_kl_loss / num_batches,
         total_loss=total_loss / num_batches,
     )
 
@@ -724,7 +683,6 @@ def main():
     num_epochs = 100
     learning_rate = 1e-4
     task_embedding_learning_rate = 1e-2
-    kl_weight = 1
     task_mask_weight = 100
     num_training_tasks = (
         4000  # Number of tasks to use for training (subset of full dataset)
@@ -795,17 +753,17 @@ def main():
     ).to(device)
 
     # Optimizer and loss
-    # Separate task embedding parameters from other parameters
-    task_embedding_params = list(model.task_embedding.parameters())
-    task_embedding_param_ids = {id(p) for p in task_embedding_params}
+    # Separate task encoder parameters from other parameters for different learning rates
+    task_encoder_params = list(model.task_encoder.parameters())
+    task_encoder_param_ids = {id(p) for p in task_encoder_params}
     other_params = [
-        p for p in model.parameters() if id(p) not in task_embedding_param_ids
+        p for p in model.parameters() if id(p) not in task_encoder_param_ids
     ]
 
     # Create optimizer with different learning rates for different parameter groups
     optimizer = torch.optim.Adam(
         [
-            {"params": task_embedding_params, "lr": task_embedding_learning_rate},
+            {"params": task_encoder_params, "lr": task_embedding_learning_rate},
             {"params": other_params, "lr": learning_rate},
         ]
     )
@@ -824,7 +782,7 @@ def main():
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     embedding_params = (
-        sum(p.numel() for p in model.task_embedding.parameters())
+        sum(p.numel() for p in model.task_encoder.parameters())
         + sum(p.numel() for p in model.grid_embedding.parameters())
         + sum(p.numel() for p in model.pos_embedding.parameters())
     )
@@ -842,8 +800,7 @@ def main():
     print(f"Total model parameters: {total_params:,}")
     print(f"Non-embedding parameters: {non_embedding_params:,}")
     print(f"Learning rate (default): {learning_rate}")
-    print(f"Learning rate (task embedding): {task_embedding_learning_rate}")
-    print(f"KL weight: {kl_weight}")
+    print(f"Learning rate (task encoder): {task_embedding_learning_rate}")
     print(f"Task mask weight: {task_mask_weight}")
     print(f"TensorBoard logs: {log_dir}")
 
@@ -867,11 +824,10 @@ def main():
             optimizer,
             criterion,
             device,
-            kl_weight,
             task_mask_weight,
         )
         test_losses = test_epoch(
-            model, test_loader, criterion, device, kl_weight, task_mask_weight
+            model, test_loader, criterion, device, task_mask_weight
         )
 
         epoch_time = time.time() - epoch_start_time
@@ -879,9 +835,6 @@ def main():
         print(f"\nEpoch {epoch+1}/{num_epochs} - Time: {epoch_time:.2f}s")
         print(
             f"Total Loss - Train: {train_losses.total_loss:.4f} | Test: {test_losses.total_loss:.4f}"
-        )
-        print(
-            f"KL Loss - Train: {train_losses.kl_loss:.4f} | Test: {test_losses.kl_loss:.4f}"
         )
         print("Output Grid Mask:")
         print(
@@ -919,13 +872,6 @@ def main():
         writer.add_scalars(
             "Loss/Total",
             {"Train": train_losses.total_loss, "Test": test_losses.total_loss},
-            epoch,
-        )
-
-        # KL divergence loss
-        writer.add_scalars(
-            "Loss/KL",
-            {"Train": train_losses.kl_loss, "Test": test_losses.kl_loss},
             epoch,
         )
 
