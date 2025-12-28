@@ -512,10 +512,10 @@ def main():
 
     # Model architecture hyperparameters
     TASK_EMBEDDING_NUM_TOKENS = 2
-    D_MODEL = 8
+    D_MODEL = 32
     NHEAD = 4
     NUM_LAYERS_IN_BLOCK = 3  # Number of transformer encoder layers in each block
-    DIM_FEEDFORWARD = 32
+    DIM_FEEDFORWARD = 128
     MAX_SEQ_LEN = 55
     NUM_COLORS = 10
     MAX_PASSES = 30  # Maximum number of transformer block passes
