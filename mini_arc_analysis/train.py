@@ -503,16 +503,19 @@ def main():
     num_epochs = 1000
     learning_rate = 1e-4
     task_embedding_learning_rate = 1e-2
-    num_training_tasks = (
-        1000  # Number of tasks to use for training (subset of full dataset)
-    )
+    # Number of tasks to use for training (subset of full dataset)
+    # Set to None to use all tasks, or an integer to use a subset
+    use_subset_of_training_tasks: int | None = 1000
+    assert use_subset_of_training_tasks is None or isinstance(
+        use_subset_of_training_tasks, int
+    ), "use_subset_of_training_tasks must be explicitly set to None or an integer"
 
     # Model architecture hyperparameters
     TASK_EMBEDDING_NUM_TOKENS = 2
-    D_MODEL = 32
+    D_MODEL = 16
     NHEAD = 4
     NUM_LAYERS_IN_BLOCK = 3  # Number of transformer encoder layers in each block
-    DIM_FEEDFORWARD = 128
+    DIM_FEEDFORWARD = 32
     MAX_SEQ_LEN = 55
     NUM_COLORS = 10
     MAX_PASSES = 30  # Maximum number of transformer block passes
@@ -535,16 +538,22 @@ def main():
     train_dataset_full = ARCTaskDataset(folder_path=folder_path, grid_type="train")
     test_dataset_full = ARCTaskDataset(folder_path=folder_path, grid_type="test")
 
-    # Create subset of both datasets with first num_training_tasks tasks
-    train_dataset = Subset(train_dataset_full, range(num_training_tasks))
-    test_dataset = Subset(test_dataset_full, range(num_training_tasks))
-
-    print(
-        f"Using {num_training_tasks} tasks for training (out of {len(train_dataset_full)} total)"
-    )
-    print(
-        f"Using {num_training_tasks} tasks for testing (out of {len(test_dataset_full)} total)"
-    )
+    # Create subset of both datasets with first num_training_tasks tasks, or use full datasets if None
+    if num_training_tasks is None:
+        train_dataset = train_dataset_full
+        test_dataset = test_dataset_full
+        actual_num_tasks = len(train_dataset_full)
+        print(f"Using all {actual_num_tasks} tasks for training and testing")
+    else:
+        train_dataset = Subset(train_dataset_full, range(num_training_tasks))
+        test_dataset = Subset(test_dataset_full, range(num_training_tasks))
+        actual_num_tasks = num_training_tasks
+        print(
+            f"Using {num_training_tasks} tasks for training (out of {len(train_dataset_full)} total)"
+        )
+        print(
+            f"Using {num_training_tasks} tasks for testing (out of {len(test_dataset_full)} total)"
+        )
 
     # Create dataloaders
     train_loader = DataLoader(
@@ -564,9 +573,9 @@ def main():
     )
 
     # Create model
-    # Use num_training_tasks for the embedding size since we're only training on a subset
+    # Use actual_num_tasks for the embedding size
     model = ARCTransformer(
-        num_tasks=num_training_tasks,
+        num_tasks=actual_num_tasks,
         task_embedding_num_tokens=TASK_EMBEDDING_NUM_TOKENS,
         d_model=D_MODEL,
         nhead=NHEAD,
@@ -689,7 +698,7 @@ def main():
                     "test_loss": test_losses.output_loss,
                     "train_vq_loss": train_losses.vq_loss,
                     "test_vq_loss": test_losses.vq_loss,
-                    "vocab_size": num_training_tasks,
+                    "vocab_size": actual_num_tasks,
                     "model_config": {
                         "task_embedding_num_tokens": TASK_EMBEDDING_NUM_TOKENS,
                         "d_model": D_MODEL,
@@ -724,7 +733,7 @@ def main():
             "test_loss": test_losses.output_loss,
             "train_vq_loss": train_losses.vq_loss,
             "test_vq_loss": test_losses.vq_loss,
-            "vocab_size": num_training_tasks,
+            "vocab_size": actual_num_tasks,
             "model_config": {
                 "task_embedding_num_tokens": TASK_EMBEDDING_NUM_TOKENS,
                 "d_model": D_MODEL,
