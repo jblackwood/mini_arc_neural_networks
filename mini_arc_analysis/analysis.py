@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from .train import ARCTaskDataset, ARCTransformer, flatten_collate
 
@@ -24,9 +24,14 @@ def load_model(model_path: str, device: torch.device):
     """
     checkpoint = torch.load(model_path, map_location=device)
 
-    # Create model with saved config (filter out num_layers for backward compatibility)
+    # Create model with saved config (filter out training-only params for backward compatibility)
+    # num_layers: old parameter that was removed
+    # l1_weight: training hyperparameter, not a model architecture parameter
+    training_only_params = {"num_layers", "l1_weight"}
     model_config = {
-        k: v for k, v in checkpoint["model_config"].items() if k != "num_layers"
+        k: v
+        for k, v in checkpoint["model_config"].items()
+        if k not in training_only_params
     }
     model = ARCTransformer(num_tasks=checkpoint["vocab_size"], **model_config).to(
         device
@@ -67,7 +72,7 @@ def predict_output(
         input_grid = input_grid.unsqueeze(0).to(device)
 
         # Get predictions with specified number of passes
-        output_logits, _ = model(
+        output_logits, _, _ = model(
             task_idx, input_grid, num_passes
         )  # (1, H*W, num_colors)
 
@@ -125,7 +130,7 @@ def calculate_test_loss(
             output_grids = torch.stack([item["output"] for item in batch]).to(device)
 
             # Forward pass with specified number of passes
-            output_logits, _ = model(task_indices, input_grids, num_passes)
+            output_logits, _, _ = model(task_indices, input_grids, num_passes)
 
             # Compute output loss
             output_targets = output_grids.view(output_logits.shape[0], -1)
@@ -219,7 +224,9 @@ def main():
     torch.manual_seed(42)
 
     # Paths
-    model_path = "output/mini_arc_analysis/model_20251226_181029.pt"
+    model_path = (
+        "output/mini_arc_analysis/checkpoints/model_20251227_223422_checkpoint.pt"
+    )
     data_path = "output/mini_arc_analysis/train"
     output_path = "output/mini_arc_analysis/analysis/5_random_tasks.png"
 
@@ -241,10 +248,18 @@ def main():
     model = load_model(model_path, device)
     print("Model loaded successfully!")
 
-    # Load test dataset
+    # Get vocab size from the model's task encoder embedding
+    vocab_size = model.num_tasks
+    print(f"Model vocabulary size: {vocab_size}")
+
+    # Load test dataset (full dataset first)
     print(f"Loading test dataset from {data_path}...")
-    test_dataset = ARCTaskDataset(folder_path=data_path, grid_type="test")
-    print(f"Test dataset loaded with {len(test_dataset)} tasks")
+    test_dataset_full = ARCTaskDataset(folder_path=data_path, grid_type="test")
+    print(f"Full test dataset loaded with {len(test_dataset_full)} tasks")
+
+    # Create subset using only the tasks in the model's vocabulary
+    test_dataset = Subset(test_dataset_full, range(vocab_size))
+    print(f"Using subset of {vocab_size} tasks (matching model's vocabulary)")
 
     # Calculate test loss and get prediction statistics
     print("\nCalculating test loss and analyzing predictions...")
@@ -288,8 +303,13 @@ def main():
         input_grid = example["input"]
         true_output = example["output"]
 
-        # Get task name
-        task_file = test_dataset.task_files[task_idx]
+        # Get task name (handle Subset wrapper)
+        if isinstance(test_dataset, Subset):
+            # For Subset, access the underlying dataset
+            actual_idx = test_dataset.indices[task_idx]
+            task_file = test_dataset.dataset.task_files[actual_idx]
+        else:
+            task_file = test_dataset.task_files[task_idx]
         task_name = task_file.stem
 
         print(f"  Task: {task_name}")

@@ -21,10 +21,12 @@ class LossComponents:
     Attributes:
         output_loss: Output grid prediction loss when output grid is masked
         vq_loss: Vector quantization loss (commitment + codebook)
+        l1_loss: L1 regularization loss on task embeddings
     """
 
     output_loss: float
     vq_loss: float
+    l1_loss: float
 
 
 class GridDict(TypedDict):
@@ -276,7 +278,7 @@ class ARCTransformer(nn.Module):
         task_idx: torch.Tensor,
         input_grid: torch.Tensor,
         num_passes: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass predicting the output grid with variable number of passes.
 
         Applies a transformer block (num_layers_in_block encoder layers) multiple times (weight-tied)
@@ -288,9 +290,10 @@ class ARCTransformer(nn.Module):
             num_passes: Number of times to apply the transformer block (1-MAX_PASSES for training, MAX_PASSES for eval)
 
         Returns:
-            Tuple of (output_logits, vq_loss)
+            Tuple of (output_logits, vq_loss, l1_loss)
             - output_logits: Output logits tensor of shape (batch_size, H*W, num_colors)
             - vq_loss: Vector quantization loss
+            - l1_loss: L1 regularization loss on task embeddings
         """
         batch_size = task_idx.shape[0]
         H, W = input_grid.shape[1], input_grid.shape[2]
@@ -306,6 +309,9 @@ class ARCTransformer(nn.Module):
 
         # Apply vector quantization to task embeddings
         task_emb, vq_loss = self.vector_quantizer(task_emb)
+
+        # Compute L1 regularization loss on task embeddings (after VQ)
+        l1_loss = torch.mean(torch.abs(task_emb))
 
         # Get grid embeddings
         input_emb = self.grid_embedding(input_flat)  # (batch_size, H*W, d_model)
@@ -350,7 +356,7 @@ class ARCTransformer(nn.Module):
         # Calculate output logits using separate projection layer
         output_logits = self.output_projection(output_encoded)
 
-        return output_logits, vq_loss
+        return output_logits, vq_loss, l1_loss
 
 
 def train_epoch(
@@ -360,6 +366,7 @@ def train_epoch(
     criterion,
     device,
     max_passes: int,
+    l1_weight: float,
 ) -> LossComponents:
     """Train for one epoch with random number of passes per batch.
 
@@ -373,6 +380,7 @@ def train_epoch(
         criterion: Loss criterion
         device: Device to train on
         max_passes: Maximum number of passes (blocks) to apply
+        l1_weight: Weight for L1 regularization loss
 
     Returns:
         LossComponents containing average loss for the epoch
@@ -382,6 +390,7 @@ def train_epoch(
     # Initialize accumulators for losses
     total_output_loss = 0
     total_vq_loss = 0
+    total_l1_loss = 0
     num_batches = 0
 
     for batch in dataloader:
@@ -394,7 +403,7 @@ def train_epoch(
         num_passes = torch.randint(1, max_passes + 1, (1,)).item()
 
         # Forward pass with random number of passes
-        output_logits, vq_loss = model(task_indices, input_grids, num_passes)
+        output_logits, vq_loss, l1_loss = model(task_indices, input_grids, num_passes)
 
         # Prepare targets
         output_targets = output_grids.view(output_grids.shape[0], -1)
@@ -405,8 +414,8 @@ def train_epoch(
             output_targets.view(-1),
         )
 
-        # Total loss combines output loss and VQ loss
-        loss = output_loss + vq_loss
+        # Total loss combines output loss, VQ loss, and L1 loss
+        loss = output_loss + vq_loss + l1_weight * l1_loss
 
         # Backward pass
         optimizer.zero_grad()
@@ -416,11 +425,13 @@ def train_epoch(
         # Accumulate losses
         total_output_loss += output_loss.item()
         total_vq_loss += vq_loss.item()
+        total_l1_loss += l1_loss.item()
         num_batches += 1
 
     return LossComponents(
         output_loss=total_output_loss / num_batches,
         vq_loss=total_vq_loss / num_batches,
+        l1_loss=total_l1_loss / num_batches,
     )
 
 
@@ -430,6 +441,7 @@ def test_epoch(
     criterion,
     device,
     max_passes: int,
+    l1_weight: float,
 ) -> LossComponents:
     """Evaluate on test set with fixed number of passes.
 
@@ -442,6 +454,7 @@ def test_epoch(
         criterion: Loss criterion
         device: Device to evaluate on
         max_passes: Number of passes (blocks) to apply during evaluation
+        l1_weight: Weight for L1 regularization loss
 
     Returns:
         LossComponents containing average loss for the epoch
@@ -451,6 +464,7 @@ def test_epoch(
     # Initialize accumulators for losses
     total_output_loss = 0
     total_vq_loss = 0
+    total_l1_loss = 0
     num_batches = 0
 
     with torch.no_grad():
@@ -461,7 +475,7 @@ def test_epoch(
             output_grids = torch.stack([item["output"] for item in batch]).to(device)
 
             # Forward pass with fixed number of passes for evaluation
-            output_logits, vq_loss = model(
+            output_logits, vq_loss, l1_loss = model(
                 task_indices, input_grids, num_passes=max_passes
             )
 
@@ -477,11 +491,13 @@ def test_epoch(
             # Accumulate losses
             total_output_loss += output_loss.item()
             total_vq_loss += vq_loss.item()
+            total_l1_loss += l1_loss.item()
             num_batches += 1
 
     return LossComponents(
         output_loss=total_output_loss / num_batches,
         vq_loss=total_vq_loss / num_batches,
+        l1_loss=total_l1_loss / num_batches,
     )
 
 
@@ -523,6 +539,11 @@ def main():
     # Vector Quantizer hyperparameters
     VQ_NUM_EMBEDDINGS = 10  # Size of the VQ codebook
     VQ_COMMITMENT_COST = 0.25  # Weight for commitment loss
+
+    # L1 Regularization hyperparameter
+    L1_WEIGHT = (
+        1.0  # Weight for L1 regularization on task embeddings (encourages sparsity)
+    )
 
     # Select device
     if torch.cuda.is_available():
@@ -659,8 +680,11 @@ def main():
             criterion,
             device,
             MAX_PASSES,
+            L1_WEIGHT,
         )
-        test_losses = test_epoch(model, test_loader, criterion, device, MAX_PASSES)
+        test_losses = test_epoch(
+            model, test_loader, criterion, device, MAX_PASSES, L1_WEIGHT
+        )
 
         epoch_time = time.time() - epoch_start_time
 
@@ -670,6 +694,9 @@ def main():
         )
         print(
             f"VQ Loss - Train: {train_losses.vq_loss:.4f} | Test: {test_losses.vq_loss:.4f}"
+        )
+        print(
+            f"L1 Loss - Train: {train_losses.l1_loss:.4f} | Test: {test_losses.l1_loss:.4f}"
         )
 
         # Log to TensorBoard
@@ -681,6 +708,11 @@ def main():
         writer.add_scalars(
             "Loss/VQ",
             {"Train": train_losses.vq_loss, "Test": test_losses.vq_loss},
+            epoch,
+        )
+        writer.add_scalars(
+            "Loss/L1",
+            {"Train": train_losses.l1_loss, "Test": test_losses.l1_loss},
             epoch,
         )
 
@@ -698,6 +730,8 @@ def main():
                     "test_loss": test_losses.output_loss,
                     "train_vq_loss": train_losses.vq_loss,
                     "test_vq_loss": test_losses.vq_loss,
+                    "train_l1_loss": train_losses.l1_loss,
+                    "test_l1_loss": test_losses.l1_loss,
                     "vocab_size": actual_num_tasks,
                     "model_config": {
                         "task_embedding_num_tokens": TASK_EMBEDDING_NUM_TOKENS,
@@ -709,6 +743,7 @@ def main():
                         "num_colors": NUM_COLORS,
                         "vq_num_embeddings": VQ_NUM_EMBEDDINGS,
                         "vq_commitment_cost": VQ_COMMITMENT_COST,
+                        "l1_weight": L1_WEIGHT,
                     },
                 },
                 checkpoint_path,
@@ -733,6 +768,8 @@ def main():
             "test_loss": test_losses.output_loss,
             "train_vq_loss": train_losses.vq_loss,
             "test_vq_loss": test_losses.vq_loss,
+            "train_l1_loss": train_losses.l1_loss,
+            "test_l1_loss": test_losses.l1_loss,
             "vocab_size": actual_num_tasks,
             "model_config": {
                 "task_embedding_num_tokens": TASK_EMBEDDING_NUM_TOKENS,
@@ -744,6 +781,7 @@ def main():
                 "num_colors": NUM_COLORS,
                 "vq_num_embeddings": VQ_NUM_EMBEDDINGS,
                 "vq_commitment_cost": VQ_COMMITMENT_COST,
+                "l1_weight": L1_WEIGHT,
             },
         },
         model_path,
