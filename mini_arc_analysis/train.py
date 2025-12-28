@@ -125,14 +125,17 @@ def flatten_collate(batch: List[List[GridDict]]) -> List[GridDict]:
 
 
 class ARCTransformer(nn.Module):
-    """Transformer model for ARC tasks using BERT-style masking.
+    """Transformer model for ARC tasks using BERT-style masking with weight-tied blocks.
+
+    This model uses a transformer block (multiple encoder layers) that is applied multiple times
+    with input injection (residual connection from the initial input) after each block.
 
     Args:
         num_tasks: Number of unique tasks in vocabulary
         task_embedding_num_tokens: Number of tokens to use for task embedding
         d_model: Dimension of embeddings and transformer
         nhead: Number of attention heads
-        num_layers: Number of transformer encoder layers
+        num_layers_in_block: Number of transformer encoder layers in each block
         dim_feedforward: Dimension of feedforward network
         max_seq_len: Maximum sequence length for positional embeddings
         num_colors: Number of unique colors (0-9, so 10)
@@ -144,7 +147,7 @@ class ARCTransformer(nn.Module):
         task_embedding_num_tokens: int,
         d_model: int,
         nhead: int,
-        num_layers: int,
+        num_layers_in_block: int,
         dim_feedforward: int,
         max_seq_len: int,
         num_colors: int,
@@ -166,14 +169,16 @@ class ARCTransformer(nn.Module):
         self.grid_embedding = nn.Embedding(num_colors + 1, d_model)
         self.pos_embedding = nn.Embedding(max_seq_len, d_model)
 
-        # Transformer encoder
+        # Transformer block: multiple encoder layers (weight-tied, reused multiple times)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
             batch_first=True,
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.transformer_block = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_layers_in_block
+        )
 
         # Output projection layer for predicting colors
         self.output_projection = nn.Linear(d_model, num_colors)
@@ -182,14 +187,17 @@ class ARCTransformer(nn.Module):
         self,
         task_idx: torch.Tensor,
         input_grid: torch.Tensor,
+        num_passes: int,
     ):
-        """Forward pass predicting the output grid.
+        """Forward pass predicting the output grid with variable number of passes.
 
-        Masks the output grid and predicts it.
+        Applies a transformer block (num_layers_in_block encoder layers) multiple times (weight-tied)
+        with input injection after each block application.
 
         Args:
             task_idx: (batch_size,) task indices
             input_grid: (batch_size, H, W) input grids
+            num_passes: Number of times to apply the transformer block (1-MAX_PASSES for training, MAX_PASSES for eval)
 
         Returns:
             Output logits tensor of shape (batch_size, H*W, num_colors)
@@ -232,13 +240,19 @@ class ARCTransformer(nn.Module):
         pos_emb = self.pos_embedding(positions)
         seq = seq + pos_emb
 
-        # Pass through transformer
-        encoded = self.transformer(seq)
+        # Store initial input for injection
+        initial_seq = seq
+
+        # Apply the same transformer block multiple times with input injection
+        for _ in range(num_passes):
+            seq = self.transformer_block(seq)
+            # Input injection: add the initial sequence to the output
+            seq = seq + initial_seq
 
         # Extract output portion of encoded sequence
         input_start = self.task_embedding_num_tokens
         input_end = input_start + H * W
-        output_encoded = encoded[:, input_end:, :]
+        output_encoded = seq[:, input_end:, :]
 
         # Calculate output logits using separate projection layer
         output_logits = self.output_projection(output_encoded)
@@ -252,8 +266,12 @@ def train_epoch(
     optimizer,
     criterion,
     device,
+    max_passes: int,
 ) -> LossComponents:
-    """Train for one epoch.
+    """Train for one epoch with random number of passes per batch.
+
+    Each pass applies a transformer block (num_layers_in_block encoder layers).
+    The number of passes is randomly selected between 1 and max_passes for each batch.
 
     Args:
         model: The ARCTransformer model
@@ -261,6 +279,7 @@ def train_epoch(
         optimizer: Optimizer for training
         criterion: Loss criterion
         device: Device to train on
+        max_passes: Maximum number of passes (blocks) to apply
 
     Returns:
         LossComponents containing average loss for the epoch
@@ -277,8 +296,11 @@ def train_epoch(
         input_grids = torch.stack([item["input"] for item in batch]).to(device)
         output_grids = torch.stack([item["output"] for item in batch]).to(device)
 
-        # Forward pass
-        output_logits = model(task_indices, input_grids)
+        # Random number of passes (each pass applies the transformer block) between 1 and max_passes
+        num_passes = torch.randint(1, max_passes + 1, (1,)).item()
+
+        # Forward pass with random number of passes
+        output_logits = model(task_indices, input_grids, num_passes)
 
         # Prepare targets
         output_targets = output_grids.view(output_grids.shape[0], -1)
@@ -308,14 +330,19 @@ def test_epoch(
     dataloader: DataLoader,
     criterion,
     device,
+    max_passes: int,
 ) -> LossComponents:
-    """Evaluate on test set.
+    """Evaluate on test set with fixed number of passes.
+
+    Each pass applies a transformer block (num_layers_in_block encoder layers).
+    Uses max_passes for evaluation to ensure maximum computational depth.
 
     Args:
         model: The ARCTransformer model
         dataloader: DataLoader for test data
         criterion: Loss criterion
         device: Device to evaluate on
+        max_passes: Number of passes (blocks) to apply during evaluation
 
     Returns:
         LossComponents containing average loss for the epoch
@@ -333,8 +360,8 @@ def test_epoch(
             input_grids = torch.stack([item["input"] for item in batch]).to(device)
             output_grids = torch.stack([item["output"] for item in batch]).to(device)
 
-            # Forward pass
-            output_logits = model(task_indices, input_grids)
+            # Forward pass with fixed number of passes for evaluation
+            output_logits = model(task_indices, input_grids, num_passes=max_passes)
 
             # Prepare targets
             output_targets = output_grids.view(output_grids.shape[0], -1)
@@ -368,7 +395,7 @@ def main():
 
     # Hyperparameters
     folder_path = "output/mini_arc_analysis/train"
-    batch_size = 512
+    batch_size = 64
     num_epochs = 1000
     learning_rate = 1e-4
     task_embedding_learning_rate = 1e-2
@@ -377,13 +404,14 @@ def main():
     )
 
     # Model architecture hyperparameters
-    TASK_EMBEDDING_NUM_TOKENS = 1
+    TASK_EMBEDDING_NUM_TOKENS = 2
     D_MODEL = 32
     NHEAD = 4
-    NUM_LAYERS = 3
+    NUM_LAYERS_IN_BLOCK = 3  # Number of transformer encoder layers in each block
     DIM_FEEDFORWARD = 128
     MAX_SEQ_LEN = 55
     NUM_COLORS = 10
+    MAX_PASSES = 30  # Maximum number of transformer block passes
 
     # Select device
     if torch.cuda.is_available():
@@ -434,7 +462,7 @@ def main():
         task_embedding_num_tokens=TASK_EMBEDDING_NUM_TOKENS,
         d_model=D_MODEL,
         nhead=NHEAD,
-        num_layers=NUM_LAYERS,
+        num_layers_in_block=NUM_LAYERS_IN_BLOCK,
         dim_feedforward=DIM_FEEDFORWARD,
         max_seq_len=MAX_SEQ_LEN,
         num_colors=NUM_COLORS,
@@ -511,8 +539,9 @@ def main():
             optimizer,
             criterion,
             device,
+            MAX_PASSES,
         )
-        test_losses = test_epoch(model, test_loader, criterion, device)
+        test_losses = test_epoch(model, test_loader, criterion, device, MAX_PASSES)
 
         epoch_time = time.time() - epoch_start_time
 
@@ -545,7 +574,7 @@ def main():
                         "task_embedding_num_tokens": TASK_EMBEDDING_NUM_TOKENS,
                         "d_model": D_MODEL,
                         "nhead": NHEAD,
-                        "num_layers": NUM_LAYERS,
+                        "num_layers_in_block": NUM_LAYERS_IN_BLOCK,
                         "dim_feedforward": DIM_FEEDFORWARD,
                         "max_seq_len": MAX_SEQ_LEN,
                         "num_colors": NUM_COLORS,
@@ -576,7 +605,7 @@ def main():
                 "task_embedding_num_tokens": TASK_EMBEDDING_NUM_TOKENS,
                 "d_model": D_MODEL,
                 "nhead": NHEAD,
-                "num_layers": NUM_LAYERS,
+                "num_layers_in_block": NUM_LAYERS_IN_BLOCK,
                 "dim_feedforward": DIM_FEEDFORWARD,
                 "max_seq_len": MAX_SEQ_LEN,
                 "num_colors": NUM_COLORS,

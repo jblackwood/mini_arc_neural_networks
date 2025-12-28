@@ -24,10 +24,13 @@ def load_model(model_path: str, device: torch.device):
     """
     checkpoint = torch.load(model_path, map_location=device)
 
-    # Create model with saved config
-    model = ARCTransformer(
-        num_tasks=checkpoint["vocab_size"], **checkpoint["model_config"]
-    ).to(device)
+    # Create model with saved config (filter out num_layers for backward compatibility)
+    model_config = {
+        k: v for k, v in checkpoint["model_config"].items() if k != "num_layers"
+    }
+    model = ARCTransformer(num_tasks=checkpoint["vocab_size"], **model_config).to(
+        device
+    )
 
     # Load state dict
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -41,6 +44,7 @@ def predict_output(
     task_idx: torch.Tensor,
     input_grid: torch.Tensor,
     device: torch.device,
+    num_passes: int,
 ):
     """Generate prediction for an input grid using BERT-style masking.
 
@@ -49,6 +53,7 @@ def predict_output(
         task_idx: Task index tensor
         input_grid: Input grid tensor (H, W)
         device: Device to run inference on
+        num_passes: Number of passes to apply (each pass applies the transformer block)
 
     Returns:
         Predicted output grid as numpy array
@@ -61,8 +66,8 @@ def predict_output(
         task_idx = task_idx.unsqueeze(0).to(device)
         input_grid = input_grid.unsqueeze(0).to(device)
 
-        # Get predictions
-        output_logits = model(task_idx, input_grid)  # (1, H*W, num_colors)
+        # Get predictions with specified number of passes
+        output_logits = model(task_idx, input_grid, num_passes)  # (1, H*W, num_colors)
 
         # Get most probable predictions
         predicted = torch.argmax(output_logits, dim=-1)  # (1, H*W)
@@ -75,7 +80,8 @@ def calculate_test_loss(
     model: ARCTransformer,
     dataset: ARCTaskDataset,
     device: torch.device,
-    batch_size: int = 512,
+    batch_size: int,
+    num_passes: int,
 ):
     """Calculate total loss on the test dataset.
 
@@ -84,6 +90,7 @@ def calculate_test_loss(
         dataset: Test dataset
         device: Device to run inference on
         batch_size: Batch size for evaluation
+        num_passes: Number of passes to apply (each pass applies the transformer block)
 
     Returns:
         Tuple of (average loss, prediction statistics dict)
@@ -115,8 +122,8 @@ def calculate_test_loss(
             input_grids = torch.stack([item["input"] for item in batch]).to(device)
             output_grids = torch.stack([item["output"] for item in batch]).to(device)
 
-            # Forward pass
-            output_logits = model(task_indices, input_grids)
+            # Forward pass with specified number of passes
+            output_logits = model(task_indices, input_grids, num_passes)
 
             # Compute output loss
             output_targets = output_grids.view(output_logits.shape[0], -1)
