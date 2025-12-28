@@ -553,7 +553,7 @@ def main():
     task_embedding_learning_rate = 1e-2
     # Number of tasks to use for training (subset of full dataset)
     # Set to None to use all tasks, or an integer to use a subset
-    use_subset_of_training_tasks: int | None = 1000
+    use_subset_of_training_tasks: int | None = 10_000
     assert use_subset_of_training_tasks is None or isinstance(
         use_subset_of_training_tasks, int
     ), "use_subset_of_training_tasks must be explicitly set to None or an integer"
