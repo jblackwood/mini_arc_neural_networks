@@ -368,20 +368,20 @@ def main():
 
     # Hyperparameters
     folder_path = "output/mini_arc_analysis/train"
-    batch_size = 256
-    num_epochs = 100
+    batch_size = 512
+    num_epochs = 1000
     learning_rate = 1e-4
     task_embedding_learning_rate = 1e-2
     num_training_tasks = (
-        4000  # Number of tasks to use for training (subset of full dataset)
+        1000  # Number of tasks to use for training (subset of full dataset)
     )
 
     # Model architecture hyperparameters
-    TASK_EMBEDDING_NUM_TOKENS = 5
-    D_MODEL = 128
+    TASK_EMBEDDING_NUM_TOKENS = 1
+    D_MODEL = 32
     NHEAD = 4
     NUM_LAYERS = 3
-    DIM_FEEDFORWARD = 512
+    DIM_FEEDFORWARD = 128
     MAX_SEQ_LEN = 55
     NUM_COLORS = 10
 
