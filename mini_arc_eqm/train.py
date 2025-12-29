@@ -283,7 +283,7 @@ def main():
 
     # Training parameters
     batch_size = 128
-    num_epochs = 10
+    num_epochs = 100
     learning_rate = 1e-3
 
     # Data parameters
@@ -295,6 +295,7 @@ def main():
     tensorboard_log_dir = f"output/mini_arc_eqm/runs/{timestamp}_model"
     model_save_dir = "output/mini_arc_eqm/models"
     model_save_path = f"{model_save_dir}/{timestamp}_model.pt"
+    checkpoint_dir = "output/mini_arc_eqm/checkpoints"
     # ===================================
 
     # Set device
@@ -355,6 +356,9 @@ def main():
     Path(tensorboard_log_dir).mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=tensorboard_log_dir)
 
+    # Create checkpoint directory
+    Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+
     # Training loop
     print("\nStarting training...")
     for epoch in range(num_epochs):
@@ -380,6 +384,33 @@ def main():
         writer.add_scalar("Loss/train", train_loss, epoch)
         writer.add_scalar("Loss/test", test_loss, epoch)
         writer.add_scalar("Time/epoch", epoch_time, epoch)
+
+        # Save checkpoint every 20 epochs
+        if (epoch + 1) % 20 == 0:
+            checkpoint_path = (
+                f"{checkpoint_dir}/{timestamp}_epoch_{epoch + 1}_checkpoint.pt"
+            )
+            torch.save(
+                {
+                    "epoch": epoch + 1,
+                    "model_state_dict": model.state_dict(),
+                    "embedding_state_dict": embedding.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "train_loss": train_loss,
+                    "test_loss": test_loss,
+                    "config": {
+                        "d_model": d_model,
+                        "nhead": nhead,
+                        "num_layers": num_layers,
+                        "dim_feedforward": dim_feedforward,
+                        "seq_len": seq_len,
+                        "num_cell_values": num_cell_values,
+                        "dropout": dropout,
+                    },
+                },
+                checkpoint_path,
+            )
+            print(f"Saved checkpoint to {checkpoint_path}")
 
     writer.close()
     print("\nTraining complete!")
