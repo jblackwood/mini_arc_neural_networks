@@ -118,7 +118,9 @@ def plot_all_grids(task_data: np.ndarray, predicted_grid: np.ndarray, output_pat
 def main():
     """Main analysis function."""
     # Configuration
-    model_path = "output/mini_arc_eqm/models/20251229_214316_model.pt"
+    model_path = (
+        "output/mini_arc_eqm/checkpoints/20251229_220918_epoch_20_checkpoint.pt"
+    )
     test_data_path = "output/mini_arc_eqm/train"
     output_dir = Path("output/mini_arc_eqm/analysis")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -143,7 +145,7 @@ def main():
     print(f"Test dataset loaded with {len(test_dataset)} tasks")
 
     # Select a random task
-    random.seed(1)
+    random.seed(2)
     task_idx = random.randint(0, len(test_dataset) - 1)
     task_data = test_dataset[task_idx]  # Shape: (200, d_model)
     print(f"\nSelected task index: {task_idx}")
@@ -163,7 +165,11 @@ def main():
 
     # Optimization parameters
     eta = 0.003
-    num_iterations = 1000
+    mu = 0.3
+    num_iterations = 3000
+
+    # Early stopping parameters
+    patience = 50  # Number of iterations to wait for improvement
 
     # Perform optimization
     print("\nStarting optimization...")
@@ -171,11 +177,39 @@ def main():
         x = x_i.clone()
         grad = model(x)
 
+        # Track best grid and gradient norm
+        best_grad_norm = float("inf")
+        best_x = x.clone()
+        best_iteration = 0
+
+        # Track gradient norm history for early stopping
+        grad_norm_history = []
+        iterations_without_improvement = 0
+
         for i in range(num_iterations):
+            x_last = x.clone()
+
             # Zero out gradient for first 175 tokens
             grad[0, :175, :] = 0
 
+            # Update x
             x = x - eta * grad
+
+            # Compute gradient
+            grad = model(x + mu * (x - x_last))
+
+            # Calculate gradient norm
+            grad_norm = torch.norm(grad).item()
+            grad_norm_history.append(grad_norm)
+
+            # Update best grid if current gradient norm is lower
+            if grad_norm < best_grad_norm:
+                best_grad_norm = grad_norm
+                best_x = x.clone()
+                best_iteration = i + 1
+                iterations_without_improvement = 0
+            else:
+                iterations_without_improvement += 1
 
             # Decode current output grid (last 25 tokens)
             current_output_tokens = x[0, -25:, :]
@@ -185,20 +219,33 @@ def main():
                 current_predicted_values.append(cell_value)
             current_predicted_grid = np.array(current_predicted_values).reshape(5, 5)
 
-            # Compute gradient
-            grad = model(x)
-
             print(f"Iteration {i+1}/{num_iterations}")
-
-            # Also print overall gradient norm
-            grad_norm = torch.norm(grad).item()
-            print(f"\nOverall grad_norm = {grad_norm:.6f}")
+            print(
+                f"grad_norm = {grad_norm:.6f} | best_grad_norm = {best_grad_norm:.6f} (iter {best_iteration})"
+            )
+            print(
+                f"iterations_without_improvement = {iterations_without_improvement}/{patience}"
+            )
 
             # Print current predicted output grid
             print(f"\nCurrent predicted output grid (Example 4):")
             print(current_predicted_grid)
 
-    print("\nOptimization complete!")
+            # Early stopping check
+            if iterations_without_improvement >= patience:
+                print(f"\n*** Early stopping triggered at iteration {i+1} ***")
+                print(f"No improvement in gradient norm for {patience} iterations")
+                print(
+                    f"Best gradient norm: {best_grad_norm:.6f} at iteration {best_iteration}"
+                )
+                break
+
+        # Use the best x (with lowest gradient norm) as final result
+        x = best_x
+        print(f"\nOptimization complete!")
+        print(
+            f"Using grid from iteration {best_iteration} with grad_norm = {best_grad_norm:.6f}"
+        )
 
     # Decode ALL 200 tokens from the final denoised output
     all_predicted_values = []
