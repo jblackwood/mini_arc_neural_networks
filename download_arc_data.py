@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import urllib.request
 import zipfile
+from typing import cast
 
 import datasets
 import kagglehub
@@ -168,7 +169,7 @@ else:
     os.makedirs(heavy_dataset_path, exist_ok=True)
 
     # Download and save the dataset
-    ds = datasets.load_dataset(heavy_dataset_name)
+    ds = cast(datasets.DatasetDict, datasets.load_dataset(heavy_dataset_name))
 
     # Save the dataset to the data directory
     ds.save_to_disk(heavy_dataset_path)

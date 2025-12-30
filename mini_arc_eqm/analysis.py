@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -50,7 +51,7 @@ def decode_one_hot(vector: torch.Tensor) -> int:
         Cell value (0-9) corresponding to the argmax of the first 10 dimensions
     """
     # Take argmax of first 10 dimensions (cell values 0-9)
-    return torch.argmax(vector[:10]).item()
+    return int(torch.argmax(vector[:10]).item())
 
 
 def plot_all_grids(task_data: np.ndarray, predicted_grid: np.ndarray, output_path: str):
@@ -75,7 +76,7 @@ def plot_all_grids(task_data: np.ndarray, predicted_grid: np.ndarray, output_pat
         "#870C25",  # 9: maroon
     ]
 
-    cmap = plt.matplotlib.colors.ListedColormap(colors)
+    cmap = mcolors.ListedColormap(colors)
 
     # Extract all grids from task_data
     # Task has 4 examples, each with input (25 cells) and output (25 cells)

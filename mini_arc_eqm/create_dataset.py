@@ -311,6 +311,26 @@ def create_dataset(
         random_seed: Random seed for deterministic splitting (default: 42)
         max_augmentations: Maximum number of augmented tasks per original task (default: 100)
     """
+    # Create output directories
+    train_output_dir = output_dir / "train"
+    test_output_dir = output_dir / "test"
+
+    # Check if both directories already exist and contain files
+    if train_output_dir.exists() and test_output_dir.exists():
+        train_files_exist = list(train_output_dir.glob("*.json"))
+        test_files_exist = list(test_output_dir.glob("*.json"))
+
+        if train_files_exist and test_files_exist:
+            print(f"Output directories already exist and contain data:")
+            print(
+                f"  Train directory: {train_output_dir} ({len(train_files_exist)} files)"
+            )
+            print(
+                f"  Test directory: {test_output_dir} ({len(test_files_exist)} files)"
+            )
+            print(f"Skipping dataset creation.")
+            return
+
     # Set random seed for reproducibility
     random.seed(random_seed)
 
@@ -326,10 +346,6 @@ def create_dataset(
 
     print(f"Train tasks: {len(train_files)}")
     print(f"Test tasks: {len(test_files)}")
-
-    # Create output directories
-    train_output_dir = output_dir / "train"
-    test_output_dir = output_dir / "test"
 
     # Process train files
     print(f"\nProcessing train files...")
