@@ -118,9 +118,11 @@ def plot_all_grids(task_data: np.ndarray, predicted_grid: np.ndarray, output_pat
 def main():
     """Main analysis function."""
     # Configuration
-    model_path = "output/mini_arc_eqm/models/20251229_220918_model.pt"
-    test_data_path = "output/mini_arc_eqm/train"
-    output_dir = Path("output/mini_arc_eqm/analysis")
+    model_path = (
+        "output/mini_arc_eqm2/checkpoints/20251230_090156_epoch_40_checkpoint.pt"
+    )
+    test_data_path = "output/mini_arc_eqm2/train"
+    output_dir = Path("output/mini_arc_eqm2/analysis")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Set device
@@ -164,7 +166,7 @@ def main():
     x_clean = task_data.unsqueeze(0).to(device)  # Shape: (1, 200, d_model)
 
     # Create noised input - only noise the last 25 tokens, keep first 175 unnoised
-    gamma = 1.0
+    gamma = 0.9
     x_i = x_clean.clone()
     # Only add noise to the last 25 tokens
     eps = torch.randn_like(x_clean[:, -25:, :])
