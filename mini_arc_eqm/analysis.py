@@ -1,6 +1,8 @@
 """Analysis script for mini_arc_eqm model."""
 
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Optional
 
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
@@ -8,6 +10,25 @@ import numpy as np
 import torch
 
 from mini_arc_eqm.train import ARCTaskDataset, TransformerModel
+
+
+@dataclass
+class DenoisingResult:
+    """Result from denoising evaluation.
+
+    Attributes:
+        accuracies: Optional tensor of shape (batch_size,) with accuracy for each task
+        predicted_grids: Optional numpy array of shape (batch_size, 5, 5) with predicted output grids
+        num_iterations: Optional tensor of shape (batch_size,) with number of iterations for each task
+        optimized_output_tokens: Optional tensor of shape (batch_size, 25, d_model) with optimized output tokens
+        best_grad_norm: Optional tensor of shape (batch_size,) with best gradient norm for each task
+    """
+
+    accuracies: Optional[torch.Tensor] = None
+    predicted_grids: Optional[np.ndarray] = None
+    num_iterations: Optional[torch.Tensor] = None
+    optimized_output_tokens: Optional[torch.Tensor] = None
+    best_grad_norm: Optional[torch.Tensor] = None
 
 
 def load_model(model_path: str, device: torch.device):
@@ -54,6 +75,197 @@ def decode_one_hot(vector: torch.Tensor) -> int:
     return int(torch.argmax(vector[:10]).item())
 
 
+def optimize_output_grid(
+    model,
+    x_input: torch.Tensor,
+    mu: float,
+    eta: float,
+    num_iterations: int,
+    patience: int,
+) -> DenoisingResult:
+    """Optimize the output grid using gradient descent with early stopping.
+
+    Args:
+        model: The transformer model to use for computing gradients
+        x_input: Input tensor of shape (batch_size, 200, d_model)
+        mu: Momentum parameter for gradient computation
+        eta: Learning rate for optimization
+        num_iterations: Maximum number of optimization iterations
+        patience: Number of iterations to wait for improvement before early stopping
+
+    Returns:
+        DenoisingResult with optimized_output_tokens and num_iterations fields populated
+    """
+    batch_size = x_input.shape[0]
+
+    with torch.no_grad():
+        x = x_input.clone()
+        grad = model(x)
+
+        # Track best grid and gradient norm
+        best_grad_norm = float("inf")
+        best_x = x.clone()
+
+        # Track gradient norm history for early stopping
+        grad_norm_history = []
+        iterations_without_improvement = 0
+        iterations_taken = num_iterations  # Default to max iterations
+
+        for iteration in range(num_iterations):
+            x_last = x.clone()
+
+            # Zero out gradient for first 175 tokens
+            grad[:, :175, :] = 0
+
+            # Update x
+            x = x - eta * grad
+
+            # Compute gradient
+            grad = model(x + mu * (x - x_last))
+
+            # Calculate gradient norm
+            grad_norm = torch.norm(grad).item()
+            grad_norm_history.append(grad_norm)
+
+            # Update best grid if current gradient norm is lower
+            if grad_norm < best_grad_norm:
+                best_grad_norm = grad_norm
+                best_x = x.clone()
+                iterations_without_improvement = 0
+            else:
+                iterations_without_improvement += 1
+
+            # Early stopping check
+            if iterations_without_improvement >= patience:
+                iterations_taken = iteration + 1
+                break
+
+        # Use the best x (with lowest gradient norm) as final result
+        x = best_x
+
+    # Create iterations tensor
+    iterations_tensor = torch.full((batch_size,), iterations_taken, dtype=torch.int32)
+
+    # Create best grad norm tensor
+    best_grad_norm_tensor = torch.full(
+        (batch_size,), best_grad_norm, dtype=torch.float32
+    )
+
+    # Return DenoisingResult with optimized tokens, iterations, and best grad norm
+    return DenoisingResult(
+        optimized_output_tokens=x[:, -25:, :],
+        num_iterations=iterations_tensor,
+        best_grad_norm=best_grad_norm_tensor,
+    )
+
+
+def evaluate_denoising_accuracy(
+    model,
+    x_clean: torch.Tensor,
+    gamma: float,
+    mu: float,
+    eta: float,
+    num_iterations: int,
+    patience: int,
+) -> DenoisingResult:
+    """Evaluate denoising accuracy by corrupting and denoising output grids.
+
+    Args:
+        model: The transformer model to use for computing gradients
+        x_clean: Clean input tensor of shape (batch_size, 200, d_model)
+        gamma: Noise level parameter (0-1) for corrupting the output grid
+        mu: Momentum parameter for gradient computation
+        eta: Learning rate for optimization
+        num_iterations: Maximum number of optimization iterations
+        patience: Number of iterations to wait for improvement before early stopping
+
+    Returns:
+        DenoisingResult containing accuracies and predicted grids
+    """
+    batch_size = x_clean.shape[0]
+
+    # Create noised input - only noise the last 25 tokens, keep first 175 unnoised
+    x_i = x_clean.clone()
+    eps = torch.randn_like(x_clean[:, -25:, :])
+    x_i[:, -25:, :] = (1 - gamma) * eps + gamma * x_clean[:, -25:, :]
+
+    # Perform optimization to denoise
+    opt_result = optimize_output_grid(
+        model=model,
+        x_input=x_i,
+        mu=mu,
+        eta=eta,
+        num_iterations=num_iterations,
+        patience=patience,
+    )
+
+    # Decode the optimized output grids
+    assert opt_result.optimized_output_tokens is not None
+    predicted_grids = decode_grids(
+        opt_result.optimized_output_tokens
+    )  # Shape: (batch_size, 1, 5, 5)
+    predicted_grids = predicted_grids[:, 0, :, :]  # Shape: (batch_size, 5, 5)
+
+    # Decode the true output grids (last 25 tokens)
+    true_output_tokens = x_clean[:, -25:, :]  # Shape: (batch_size, 25, d_model)
+    true_grids = decode_grids(true_output_tokens)  # Shape: (batch_size, 1, 5, 5)
+    true_grids = true_grids[:, 0, :, :]  # Shape: (batch_size, 5, 5)
+
+    # Calculate accuracy for each task in the batch
+    accuracies = []
+    for batch_idx in range(batch_size):
+        accuracy = (predicted_grids[batch_idx] == true_grids[batch_idx]).mean()
+        accuracies.append(accuracy)
+
+    # Use replace to add accuracies and predicted_grids to the result
+    return replace(
+        opt_result,
+        accuracies=torch.tensor(accuracies),
+        predicted_grids=predicted_grids,
+    )
+
+
+def decode_grids(tokens: torch.Tensor) -> np.ndarray:
+    """Decode grid tokens to integer values.
+
+    Args:
+        tokens: Tensor of shape (batch_size, num_tokens, d_model) containing grid tokens
+                where num_tokens should be a multiple of 25 (for 5x5 grids)
+
+    Returns:
+        Numpy array of shape (batch_size, num_grids, 5, 5) with decoded integer values (0-9)
+        where num_grids = num_tokens // 25
+    """
+    batch_size = tokens.shape[0]
+    num_tokens = tokens.shape[1]
+
+    assert (
+        num_tokens % 25 == 0
+    ), f"num_tokens must be a multiple of 25, got {num_tokens}"
+
+    num_grids = num_tokens // 25
+
+    decoded_grids = []
+
+    for batch_idx in range(batch_size):
+        batch_grids = []
+        for grid_idx in range(num_grids):
+            start_idx = grid_idx * 25
+            end_idx = start_idx + 25
+            grid_tokens = tokens[batch_idx, start_idx:end_idx]
+
+            predicted_values = []
+            for token in grid_tokens:
+                cell_value = decode_one_hot(token)
+                predicted_values.append(cell_value)
+            predicted_grid = np.array(predicted_values).reshape(5, 5)
+            batch_grids.append(predicted_grid)
+
+        decoded_grids.append(batch_grids)
+
+    return np.array(decoded_grids)
+
+
 def plot_all_grids(task_data: np.ndarray, predicted_grid: np.ndarray, output_path: str):
     """Plot all input/output grids for the task plus the denoised output grid.
 
@@ -81,33 +293,38 @@ def plot_all_grids(task_data: np.ndarray, predicted_grid: np.ndarray, output_pat
     # Extract all grids from task_data
     # Task has 4 examples, each with input (25 cells) and output (25 cells)
     # Total: 4 * 2 * 25 = 200 cells
-    grids = []
+    examples = []
     for i in range(4):
         start_idx = i * 50  # Each example has 50 cells (input + output)
         input_grid = task_data[start_idx : start_idx + 25].reshape(5, 5)
         output_grid = task_data[start_idx + 25 : start_idx + 50].reshape(5, 5)
-        grids.append(("input", input_grid))
-        grids.append(("output", output_grid))
+        examples.append((input_grid, output_grid))
 
-    # Create figure with 3 rows and 3 columns
-    # Row 1: Example 1 input, Example 1 output, Example 2 input
-    # Row 2: Example 2 output, Example 3 input, Example 3 output
-    # Row 3: Example 4 input, Example 4 output, Denoised output
-    _, axes = plt.subplots(3, 3, figsize=(12, 12))
+    # Create figure with 5 rows and 2 columns
+    # Row 0: Example 1 input, Example 1 output
+    # Row 1: Example 2 input, Example 2 output
+    # Row 2: Example 3 input, Example 3 output
+    # Row 3: Example 4 input, Example 4 output
+    # Row 4: Empty, Denoised output
+    _, axes = plt.subplots(5, 2, figsize=(8, 20))
 
-    # Plot first 8 grids (4 examples × 2 grids each)
-    for idx, (grid_type, grid) in enumerate(grids):
-        row = idx // 3
-        col = idx % 3
-        axes[row, col].imshow(grid, cmap=cmap, vmin=0, vmax=9)
-        example_num = idx // 2 + 1
-        axes[row, col].set_title(f"Example {example_num} {grid_type.capitalize()}")
-        axes[row, col].axis("off")
+    # Plot 4 examples (each row has input and output)
+    for example_idx, (input_grid, output_grid) in enumerate(examples):
+        # Plot input in first column
+        axes[example_idx, 0].imshow(input_grid, cmap=cmap, vmin=0, vmax=9)
+        axes[example_idx, 0].set_title(f"Example {example_idx + 1} Input")
+        axes[example_idx, 0].axis("off")
 
-    # Plot denoised output in position [2, 2]
-    axes[2, 2].imshow(predicted_grid, cmap=cmap, vmin=0, vmax=9)
-    axes[2, 2].set_title("Denoised Output (Example 4)")
-    axes[2, 2].axis("off")
+        # Plot output in second column
+        axes[example_idx, 1].imshow(output_grid, cmap=cmap, vmin=0, vmax=9)
+        axes[example_idx, 1].set_title(f"Example {example_idx + 1} Output")
+        axes[example_idx, 1].axis("off")
+
+    # Last row: empty first column, denoised output in second column
+    axes[4, 0].axis("off")  # Empty
+    axes[4, 1].imshow(predicted_grid, cmap=cmap, vmin=0, vmax=9)
+    axes[4, 1].set_title("Denoised Output (Example 4)")
+    axes[4, 1].axis("off")
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
@@ -119,7 +336,7 @@ def main():
     """Main analysis function."""
     # Configuration
     model_path = "output/mini_arc_eqm2/models/20251230_094732_model.pt"
-    test_data_path = "output/mini_arc_eqm2/train"
+    test_data_path = "output/mini_arc_eqm2/test"
     output_dir = Path("output/mini_arc_eqm2/analysis")
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -137,169 +354,87 @@ def main():
     model, config = load_model(model_path, device)
     print(f"Model loaded successfully! d_model={config['d_model']}")
 
-    # Load specific task file
-    task_file = (
-        "output/mini_arc_eqm/train/miniarc-1_3_5_l6aejqqqc1b47pjr5g4-original.json"
-    )
-    print(f"Loading task from {task_file}...")
-
-    # Create a temporary dataset with just this task's directory
+    # Load dataset
+    print(f"Loading dataset from {test_data_path}...")
     test_dataset = ARCTaskDataset(test_data_path, d_model=config["d_model"])
 
-    # Find the index of the specific task file
-    task_path = Path(task_file)
-    task_idx = None
-    for idx, file_path in enumerate(test_dataset.task_files):
-        if file_path.name == task_path.name:
-            task_idx = idx
-            break
+    # Filter for original task files
+    original_tasks = [
+        (idx, file_path)
+        for idx, file_path in enumerate(test_dataset.task_files)
+        if file_path.name.endswith("original.json")
+    ]
 
-    if task_idx is None:
-        raise ValueError(f"Task file {task_file} not found in dataset")
-
-    task_data = test_dataset[task_idx]  # Shape: (200, d_model)
-    print(f"Loaded task: {task_path.name} (index {task_idx})")
-
-    # Get clean one-hot encoded data
-    x_clean = task_data.unsqueeze(0).to(device)  # Shape: (1, 200, d_model)
-
-    # Create noised input - only noise the last 25 tokens, keep first 175 unnoised
-    gamma = 0.9
-    x_i = x_clean.clone()
-    # Only add noise to the last 25 tokens
-    eps = torch.randn_like(x_clean[:, -25:, :])
-    x_i[:, -25:, :] = (1 - gamma) * eps + gamma * x_clean[:, -25:, :]
-
-    print(f"Created noised input with shape: {x_i.shape}")
-    print(f"Using gamma = {gamma}")
+    print(f"Found {len(original_tasks)} original task files")
 
     # Optimization parameters
+    gamma = 0.8
     eta = 0.003
     mu = 0.3
-    num_iterations = 3000
-
-    # Early stopping parameters
+    num_iterations = 2000
     patience = 50  # Number of iterations to wait for improvement
 
-    # Perform optimization
-    print("\nStarting optimization...")
-    with torch.no_grad():
-        x = x_i.clone()
-        grad = model(x)
+    print(f"Using gamma = {gamma}")
+    print(f"Using eta = {eta}, mu = {mu}")
+    print(f"Using num_iterations = {num_iterations}, patience = {patience}")
 
-        # Track best grid and gradient norm
-        best_grad_norm = float("inf")
-        best_x = x.clone()
-        best_iteration = 0
+    # Create output directory for this gamma value
+    gamma_output_dir = output_dir / f"denoise_gamma_{gamma}"
+    gamma_output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Track gradient norm history for early stopping
-        grad_norm_history = []
-        iterations_without_improvement = 0
+    # Evaluate each original task
+    print("\n" + "=" * 80)
+    print("EVALUATING ORIGINAL TASKS")
+    print("=" * 80)
 
-        for i in range(num_iterations):
-            x_last = x.clone()
+    for task_idx, task_path in original_tasks:
+        print(f"\nProcessing: {task_path.name}")
 
-            # Zero out gradient for first 175 tokens
-            grad[0, :175, :] = 0
+        # Load task data
+        task_data = test_dataset[task_idx]  # Shape: (200, d_model)
 
-            # Update x
-            x = x - eta * grad
+        # Get clean one-hot encoded data
+        x_clean = task_data.unsqueeze(0).to(device)  # Shape: (1, 200, d_model)
 
-            # Compute gradient
-            grad = model(x + mu * (x - x_last))
-
-            # Calculate gradient norm
-            grad_norm = torch.norm(grad).item()
-            grad_norm_history.append(grad_norm)
-
-            # Update best grid if current gradient norm is lower
-            if grad_norm < best_grad_norm:
-                best_grad_norm = grad_norm
-                best_x = x.clone()
-                best_iteration = i + 1
-                iterations_without_improvement = 0
-            else:
-                iterations_without_improvement += 1
-
-            # Decode current output grid (last 25 tokens)
-            current_output_tokens = x[0, -25:, :]
-            current_predicted_values = []
-            for token in current_output_tokens:
-                cell_value = decode_one_hot(token)
-                current_predicted_values.append(cell_value)
-            current_predicted_grid = np.array(current_predicted_values).reshape(5, 5)
-
-            print(f"Iteration {i+1}/{num_iterations}")
-            print(
-                f"grad_norm = {grad_norm:.6f} | best_grad_norm = {best_grad_norm:.6f} (iter {best_iteration})"
-            )
-            print(
-                f"iterations_without_improvement = {iterations_without_improvement}/{patience}"
-            )
-
-            # Print current predicted output grid
-            print(f"\nCurrent predicted output grid (Example 4):")
-            print(current_predicted_grid)
-
-            # Early stopping check
-            if iterations_without_improvement >= patience:
-                print(f"\n*** Early stopping triggered at iteration {i+1} ***")
-                print(f"No improvement in gradient norm for {patience} iterations")
-                print(
-                    f"Best gradient norm: {best_grad_norm:.6f} at iteration {best_iteration}"
-                )
-                break
-
-        # Use the best x (with lowest gradient norm) as final result
-        x = best_x
-        print(f"\nOptimization complete!")
-        print(
-            f"Using grid from iteration {best_iteration} with grad_norm = {best_grad_norm:.6f}"
+        # Perform denoising evaluation
+        result = evaluate_denoising_accuracy(
+            model=model,
+            x_clean=x_clean,
+            gamma=gamma,
+            mu=mu,
+            eta=eta,
+            num_iterations=num_iterations,
+            patience=patience,
         )
 
-    # Decode ALL 200 tokens from the final denoised output
-    all_predicted_values = []
-    for token in x[0]:  # Iterate through all 200 tokens
-        cell_value = decode_one_hot(token)
-        all_predicted_values.append(cell_value)
+        # Extract predicted grid from result
+        assert result.predicted_grids is not None
+        assert result.accuracies is not None
+        assert result.num_iterations is not None
+        assert result.best_grad_norm is not None
 
-    # Convert to numpy array
-    all_predicted_values = np.array(all_predicted_values)
+        predicted_grid = result.predicted_grids[0]  # Shape: (5, 5)
+        accuracy = result.accuracies[0].item()
+        iterations = result.num_iterations[0].item()
+        grad_norm = result.best_grad_norm[0].item()
 
-    # Extract the last 25 tokens for the main predicted grid (Example 4 output)
-    predicted_grid = all_predicted_values[-25:].reshape(5, 5)
+        # Decode all true grids from task data (200 tokens = 8 grids of 25 tokens each)
+        all_true_grids = decode_grids(task_data.unsqueeze(0))  # Shape: (1, 8, 5, 5)
+        all_true_grids = all_true_grids[0]  # Extract first batch: (8, 5, 5)
 
-    # Get true output grid (last 25 values of the task)
-    # Decode the one-hot encoded values
-    true_values = []
-    for i in range(175, 200):  # Last 25 tokens
-        cell_value = decode_one_hot(task_data[i])
-        true_values.append(cell_value)
-    true_values = np.array(true_values)
-    true_grid = true_values.reshape(5, 5)
+        # Plot and save - flatten all true grids for plotting
+        all_true_values = all_true_grids.reshape(-1)  # Flatten (8, 5, 5) -> (200,)
+        output_path = gamma_output_dir / f"{task_path.stem}.png"
+        plot_all_grids(all_true_values, predicted_grid, str(output_path))
 
-    print("\n" + "=" * 60)
+        # Print accuracy, iterations, and gradient norm
+        print(
+            f"  Accuracy: {accuracy * 100:.2f}% | Iterations: {iterations} | Grad Norm: {grad_norm:.6f}"
+        )
 
-    print("\n" + "=" * 60)
-    print("DENOISING RESULTS (Example 4 Output)")
-    print("=" * 60)
-    print("\nDenoised output grid (Example 4):")
-    print(predicted_grid)
-    print("\nTrue output grid (Example 4):")
-    print(true_grid)
-
-    # Plot and save
-    output_path = output_dir / "denoising_result.png"
-    all_true_values = []
-    for i in range(200):
-        cell_value = decode_one_hot(task_data[i])
-        all_true_values.append(cell_value)
-    all_true_values = np.array(all_true_values)
-    plot_all_grids(all_true_values, predicted_grid, str(output_path))
-
-    # Calculate accuracy
-    accuracy = (predicted_grid == true_grid).mean()
-    print(f"\nAccuracy: {accuracy * 100:.2f}%")
+    print("\n" + "=" * 80)
+    print("EVALUATION COMPLETE")
+    print("=" * 80)
 
 
 if __name__ == "__main__":
