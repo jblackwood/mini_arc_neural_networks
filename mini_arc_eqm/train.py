@@ -277,15 +277,15 @@ def main():
     """Train transformer model on ARC tasks."""
     # ========== Configuration ==========
     # Model parameters
-    d_model = 32  # Model dimension
+    d_model = 128  # Model dimension
     nhead = 4  # Number of attention heads
     num_layers = 3  # Number of transformer layers
-    dim_feedforward = 64  # Feedforward dimension
+    dim_feedforward = 512  # Feedforward dimension
     dropout = 0.1
 
     # Training parameters
     batch_size = 128
-    num_epochs = 10
+    num_epochs = 40
     learning_rate = 1e-3
 
     # Data parameters
