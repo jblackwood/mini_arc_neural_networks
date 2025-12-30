@@ -1,6 +1,5 @@
 """Analysis script for mini_arc_eqm model."""
 
-import random
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -118,9 +117,7 @@ def plot_all_grids(task_data: np.ndarray, predicted_grid: np.ndarray, output_pat
 def main():
     """Main analysis function."""
     # Configuration
-    model_path = (
-        "output/mini_arc_eqm/checkpoints/20251229_220918_epoch_20_checkpoint.pt"
-    )
+    model_path = "output/mini_arc_eqm/models/20251229_220918_model.pt"
     test_data_path = "output/mini_arc_eqm/train"
     output_dir = Path("output/mini_arc_eqm/analysis")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -139,22 +136,34 @@ def main():
     model, config = load_model(model_path, device)
     print(f"Model loaded successfully! d_model={config['d_model']}")
 
-    # Load test dataset
-    print(f"Loading test dataset from {test_data_path}...")
-    test_dataset = ARCTaskDataset(test_data_path, d_model=config["d_model"])
-    print(f"Test dataset loaded with {len(test_dataset)} tasks")
+    # Load specific task file
+    task_file = (
+        "output/mini_arc_eqm/train/miniarc-1_3_5_l6aejqqqc1b47pjr5g4-original.json"
+    )
+    print(f"Loading task from {task_file}...")
 
-    # Select a random task
-    random.seed(2)
-    task_idx = random.randint(0, len(test_dataset) - 1)
+    # Create a temporary dataset with just this task's directory
+    test_dataset = ARCTaskDataset(test_data_path, d_model=config["d_model"])
+
+    # Find the index of the specific task file
+    task_path = Path(task_file)
+    task_idx = None
+    for idx, file_path in enumerate(test_dataset.task_files):
+        if file_path.name == task_path.name:
+            task_idx = idx
+            break
+
+    if task_idx is None:
+        raise ValueError(f"Task file {task_file} not found in dataset")
+
     task_data = test_dataset[task_idx]  # Shape: (200, d_model)
-    print(f"\nSelected task index: {task_idx}")
+    print(f"Loaded task: {task_path.name} (index {task_idx})")
 
     # Get clean one-hot encoded data
     x_clean = task_data.unsqueeze(0).to(device)  # Shape: (1, 200, d_model)
 
     # Create noised input - only noise the last 25 tokens, keep first 175 unnoised
-    gamma = 0.8
+    gamma = 0.0
     x_i = x_clean.clone()
     # Only add noise to the last 25 tokens
     eps = torch.randn_like(x_clean[:, -25:, :])
