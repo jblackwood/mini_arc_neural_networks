@@ -126,9 +126,6 @@ class TransformerModel(nn.Module):
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
 
-        # Output projection to d_model (will be converted back to embeddings)
-        self.output_proj = nn.Linear(d_model, d_model)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass.
 
@@ -143,9 +140,6 @@ class TransformerModel(nn.Module):
 
         # Apply transformer encoder
         x = self.transformer_encoder(x)  # (batch_size, seq_len, d_model)
-
-        # Project output
-        x = self.output_proj(x)  # (batch_size, seq_len, d_model)
 
         return x
 
@@ -283,7 +277,7 @@ def main():
 
     # Training parameters
     batch_size = 128
-    num_epochs = 100
+    num_epochs = 10
     learning_rate = 1e-3
 
     # Data parameters
