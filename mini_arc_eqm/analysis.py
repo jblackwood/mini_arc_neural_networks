@@ -163,7 +163,7 @@ def main():
     x_clean = task_data.unsqueeze(0).to(device)  # Shape: (1, 200, d_model)
 
     # Create noised input - only noise the last 25 tokens, keep first 175 unnoised
-    gamma = 0.0
+    gamma = 1.0
     x_i = x_clean.clone()
     # Only add noise to the last 25 tokens
     eps = torch.randn_like(x_clean[:, -25:, :])
