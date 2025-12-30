@@ -15,36 +15,42 @@ from arc_shared import parse_arc_json
 
 
 class ARCTaskDataset(Dataset):
-    """PyTorch dataset that loads ARC tasks and returns concatenated cell values.
+    """PyTorch dataset that loads ARC tasks and returns centered one-hot encoded cell values.
 
-    Each task returns a 200-length tensor of cell values:
+    Each task returns a (200, d_model) tensor:
     - 4 examples (train + test combined)
     - Each example has input and output grids (2 grids per example)
     - Each grid is 5x5 = 25 cells
     - Total: 4 examples * 2 grids * 25 cells = 200 cells
-    - Each cell contains a value from 0-9
+    - Each cell is one-hot encoded with 10 values (0-9) padded to d_model
+    - One-hot vectors are centered to have mean 0 (subtract 1/d_model from all dims)
     """
 
-    def __init__(self, folder_path: str):
+    def __init__(self, folder_path: str, d_model: int):
         """Initialize the dataset.
 
         Args:
             folder_path: Path to folder containing task JSON files
+            d_model: Model dimension for one-hot encoding (must be >= 10)
         """
+        if d_model < 10:
+            raise ValueError(f"d_model must be >= 10, got {d_model}")
         self.folder_path = Path(folder_path)
         self.task_files = sorted(self.folder_path.glob("*.json"))
+        self.d_model = d_model
 
     def __len__(self) -> int:
         return len(self.task_files)
 
     def __getitem__(self, idx: int) -> torch.Tensor:
-        """Get a task as a 200-length tensor of cell values.
+        """Get a task as a (200, d_model) tensor of centered one-hot encoded cell values.
 
         Args:
             idx: Index of the task
 
         Returns:
-            Tensor of shape (200,) containing cell values (0-9)
+            Tensor of shape (200, d_model) containing centered one-hot encoded cell values.
+            Each vector has mean 0 across all d_model dimensions.
         """
         task_file = self.task_files[idx]
         task_data = parse_arc_json(task_file)
@@ -82,11 +88,18 @@ class ARCTaskDataset(Dataset):
             for row in grid:
                 all_cells.extend(row)
 
-        # Convert to tensor
+        # Convert to one-hot encoding
         # all_cells should have 200 elements (4 examples * 2 grids * 25 cells)
-        cells_tensor = torch.tensor(all_cells, dtype=torch.long)
+        one_hot = torch.zeros(200, self.d_model, dtype=torch.float32)
+        for i, cell_value in enumerate(all_cells):
+            one_hot[i, cell_value] = 1.0
 
-        return cells_tensor
+        # Center the one-hot vectors to have mean 0
+        # Each vector has one 1.0 and (d_model-1) 0.0s, so mean is 1/d_model
+        # We subtract 1/d_model from all dimensions to center around 0
+        one_hot -= 1.0 / self.d_model
+
+        return one_hot
 
 
 class TransformerModel(nn.Module):
@@ -99,7 +112,7 @@ class TransformerModel(nn.Module):
         num_layers: int,
         dim_feedforward: int,
         seq_len: int,
-        dropout: float = 0.1,
+        dropout: float,
     ):
         """Initialize the transformer model.
 
@@ -126,6 +139,9 @@ class TransformerModel(nn.Module):
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
 
+        # Linear output projection (d_model -> d_model)
+        self.output_proj = nn.Linear(d_model, d_model)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass.
 
@@ -141,12 +157,14 @@ class TransformerModel(nn.Module):
         # Apply transformer encoder
         x = self.transformer_encoder(x)  # (batch_size, seq_len, d_model)
 
+        # Apply output projection
+        x = self.output_proj(x)  # (batch_size, seq_len, d_model)
+
         return x
 
 
 def compute_loss_for_batch(
     model: nn.Module,
-    embedding: nn.Embedding,
     batch: torch.Tensor,
     device: torch.device,
 ) -> torch.Tensor:
@@ -154,17 +172,13 @@ def compute_loss_for_batch(
 
     Args:
         model: The transformer model
-        embedding: Embedding layer for cell values
-        batch: Batch of cell values, shape (batch_size, 200)
+        batch: Batch of one-hot encoded cell values, shape (batch_size, 200, d_model)
         device: Device to compute on
 
     Returns:
         Loss tensor (scalar)
     """
-    cell_values = batch.to(device)  # (batch_size, 200)
-
-    # Convert to embeddings
-    x = embedding(cell_values)  # (batch_size, 200, d_model)
+    x = batch.to(device)  # (batch_size, 200, d_model)
 
     # Create noisy input - corrupt all 200 tokens
     xg = x.clone()
@@ -195,7 +209,6 @@ def compute_loss_for_batch(
 
 def train_epoch(
     model: nn.Module,
-    embedding: nn.Embedding,
     train_loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
@@ -204,7 +217,6 @@ def train_epoch(
 
     Args:
         model: The transformer model
-        embedding: Embedding layer for cell values
         train_loader: Training data loader
         optimizer: Optimizer
         device: Device to train on
@@ -213,13 +225,12 @@ def train_epoch(
         Average training loss
     """
     model.train()
-    embedding.train()
     total_loss = 0.0
     num_batches = 0
 
     for batch in train_loader:
         # Compute loss
-        loss = compute_loss_for_batch(model, embedding, batch, device)
+        loss = compute_loss_for_batch(model, batch, device)
 
         # Backward pass
         optimizer.zero_grad()
@@ -234,7 +245,6 @@ def train_epoch(
 
 def test_epoch(
     model: nn.Module,
-    embedding: nn.Embedding,
     test_loader: DataLoader,
     device: torch.device,
 ) -> float:
@@ -242,7 +252,6 @@ def test_epoch(
 
     Args:
         model: The transformer model
-        embedding: Embedding layer for cell values
         test_loader: Test data loader
         device: Device to evaluate on
 
@@ -250,14 +259,13 @@ def test_epoch(
         Average test loss
     """
     model.eval()
-    embedding.eval()
     total_loss = 0.0
     num_batches = 0
 
     with torch.no_grad():
         for batch in test_loader:
             # Compute loss
-            loss = compute_loss_for_batch(model, embedding, batch, device)
+            loss = compute_loss_for_batch(model, batch, device)
 
             total_loss += loss.item()
             num_batches += 1
@@ -269,10 +277,10 @@ def main():
     """Train transformer model on ARC tasks."""
     # ========== Configuration ==========
     # Model parameters
-    d_model = 128  # Model dimension
+    d_model = 32  # Model dimension
     nhead = 4  # Number of attention heads
     num_layers = 3  # Number of transformer layers
-    dim_feedforward = 512  # Feedforward dimension
+    dim_feedforward = 64  # Feedforward dimension
     dropout = 0.1
 
     # Training parameters
@@ -302,8 +310,8 @@ def main():
     print(f"Using device: {device}")
 
     # Create datasets
-    train_dataset = ARCTaskDataset("output/mini_arc_eqm/train")
-    test_dataset = ARCTaskDataset("output/mini_arc_eqm/test")
+    train_dataset = ARCTaskDataset("output/mini_arc_eqm/train", d_model=d_model)
+    test_dataset = ARCTaskDataset("output/mini_arc_eqm/test", d_model=d_model)
 
     print(f"Train dataset size: {len(train_dataset)}")
     print(f"Test dataset size: {len(test_dataset)}")
@@ -320,9 +328,6 @@ def main():
         shuffle=False,
     )
 
-    # Create embedding layer
-    embedding = nn.Embedding(num_cell_values, d_model).to(device)
-
     # Create model
     model = TransformerModel(
         d_model=d_model,
@@ -334,17 +339,11 @@ def main():
     ).to(device)
 
     # Count parameters
-    embedding_params = sum(p.numel() for p in embedding.parameters() if p.requires_grad)
     model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total_params = embedding_params + model_params
-    print(f"Embedding has {embedding_params:,} trainable parameters")
     print(f"Model has {model_params:,} trainable parameters")
-    print(f"Total: {total_params:,} trainable parameters")
 
-    # Create optimizer (include both embedding and model parameters)
-    optimizer = torch.optim.Adam(
-        list(embedding.parameters()) + list(model.parameters()), lr=learning_rate
-    )
+    # Create optimizer
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
     # Create tensorboard writer
     Path(tensorboard_log_dir).mkdir(parents=True, exist_ok=True)
@@ -359,10 +358,10 @@ def main():
         epoch_start_time = time.time()
 
         # Train
-        train_loss = train_epoch(model, embedding, train_loader, optimizer, device)
+        train_loss = train_epoch(model, train_loader, optimizer, device)
 
         # Test
-        test_loss = test_epoch(model, embedding, test_loader, device)
+        test_loss = test_epoch(model, test_loader, device)
 
         # Calculate epoch time
         epoch_time = time.time() - epoch_start_time
@@ -388,7 +387,6 @@ def main():
                 {
                     "epoch": epoch + 1,
                     "model_state_dict": model.state_dict(),
-                    "embedding_state_dict": embedding.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "train_loss": train_loss,
                     "test_loss": test_loss,
@@ -414,7 +412,6 @@ def main():
     torch.save(
         {
             "model_state_dict": model.state_dict(),
-            "embedding_state_dict": embedding.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "config": {
                 "d_model": d_model,
