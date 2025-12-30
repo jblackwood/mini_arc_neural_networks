@@ -118,9 +118,7 @@ def plot_all_grids(task_data: np.ndarray, predicted_grid: np.ndarray, output_pat
 def main():
     """Main analysis function."""
     # Configuration
-    model_path = (
-        "output/mini_arc_eqm2/checkpoints/20251230_090156_epoch_40_checkpoint.pt"
-    )
+    model_path = "output/mini_arc_eqm2/models/20251230_094732_model.pt"
     test_data_path = "output/mini_arc_eqm2/train"
     output_dir = Path("output/mini_arc_eqm2/analysis")
     output_dir.mkdir(parents=True, exist_ok=True)
