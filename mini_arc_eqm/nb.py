@@ -44,6 +44,9 @@ class Config:
     seq_len: int
     num_cell_values: int
 
+    # Optional model loading
+    load_model_path: Optional[str] = None
+
     # Paths (computed)
     timestamp: str = ""
     tensorboard_log_dir: str = ""
@@ -836,6 +839,23 @@ def train(config: Config):
     # Create optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 
+    # Load existing model if specified
+    start_epoch = 0
+    if config.load_model_path:
+        if Path(config.load_model_path).exists():
+            print(f"\nLoading existing model from {config.load_model_path}")
+            checkpoint = torch.load(config.load_model_path, map_location=device)
+            model.load_state_dict(checkpoint["model_state_dict"])
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            start_epoch = checkpoint.get("epoch", 0)
+            print(f"Resumed from epoch {start_epoch}")
+            print(f"Previous train loss: {checkpoint.get('train_loss', 'N/A')}")
+            print(f"Previous test loss: {checkpoint.get('test_loss', 'N/A')}")
+        else:
+            print(
+                f"\nWarning: Model path {config.load_model_path} does not exist. Starting from scratch."
+            )
+
     # Create tensorboard writer
     Path(config.tensorboard_log_dir).mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=config.tensorboard_log_dir)
@@ -845,7 +865,7 @@ def train(config: Config):
 
     # Training loop
     print("\nStarting training...")
-    for epoch in range(config.num_epochs):
+    for epoch in range(start_epoch, start_epoch + config.num_epochs):
         epoch_start_time = time.time()
 
         # Train
@@ -859,7 +879,7 @@ def train(config: Config):
 
         # Log to console
         print(
-            f"Epoch {epoch + 1}/{config.num_epochs} - "
+            f"Epoch {epoch + 1}/{start_epoch + config.num_epochs} - "
             f"Train Loss: {train_loss:.6f}, Test Loss: {test_loss:.6f}, "
             f"Time: {epoch_time:.2f}s"
         )
@@ -939,6 +959,8 @@ def main():
         # Data parameters
         seq_len=200,
         num_cell_values=10,
+        # Optional: Load existing model to continue training
+        load_model_path="output/mini_arc_eqm2/checkpoints/20251230_090156_epoch_40_checkpoint.pt",
     )
 
     # Download dataset
