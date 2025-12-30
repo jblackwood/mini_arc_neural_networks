@@ -172,29 +172,29 @@ def compute_loss_for_batch(
     # Convert to embeddings
     x = embedding(cell_values)  # (batch_size, 200, d_model)
 
-    # Create noisy input - only corrupt the last 25 tokens (output grid)
+    # Create noisy input - corrupt all 200 tokens
     xg = x.clone()
 
-    # Create random gaussian noise for the last 25 tokens
-    eps = torch.randn_like(xg[:, -25:, :])
+    # Create random gaussian noise for all tokens
+    eps = torch.randn_like(xg)
 
     # Sample random gamma uniformly between 0 and 1
-    # Shape: (batch_size, 1, 1) - broadcasts across the 25 positions and d_model
+    # Shape: (batch_size, 1, 1) - broadcasts across all 200 positions and d_model
     gamma = torch.rand(x.size(0), 1, 1, device=device)
 
-    # Create noisy input for the last 25 tokens
-    xg[:, -25:, :] = (1 - gamma) * eps + gamma * x[:, -25:, :]
+    # Create noisy input for all tokens
+    xg = (1 - gamma) * eps + gamma * x
 
-    # Create target with conditional scaling for the last 25 tokens
+    # Create target with conditional scaling for all tokens
     # c(gamma) = 1 if gamma < 0.8, else (1-gamma)/(1-0.8)
     c_gamma = torch.where(gamma < 0.8, torch.ones_like(gamma), (1 - gamma) / 0.2)
-    target_last_25 = (eps - x[:, -25:, :]) * c_gamma
+    target = (eps - x) * c_gamma
 
     # Forward pass
     output = model(xg)
 
-    # Compute loss only on the last 25 tokens
-    loss = ((output[:, -25:, :] - target_last_25) ** 2).mean()
+    # Compute loss on all tokens
+    loss = ((output - target) ** 2).mean()
 
     return loss
 
