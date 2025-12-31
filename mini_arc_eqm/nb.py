@@ -18,6 +18,37 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 
 
+# ARC color palette mapping (0-9 to RGB hex colors)
+ARC_COLORS = [
+    "#000000",  # 0: black
+    "#0074D9",  # 1: blue
+    "#FF4136",  # 2: red
+    "#2ECC40",  # 3: green
+    "#FFDC00",  # 4: yellow
+    "#AAAAAA",  # 5: grey
+    "#F012BE",  # 6: magenta
+    "#FF851B",  # 7: orange
+    "#7FDBFF",  # 8: sky
+    "#870C25",  # 9: maroon
+]
+
+
+def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
+    """Convert hex color string to RGB tuple."""
+    hex_color = hex_color.lstrip("#")
+    r = int(hex_color[0:2], 16)
+    g = int(hex_color[2:4], 16)
+    b = int(hex_color[4:6], 16)
+    return (r, g, b)
+
+
+# Precompute RGB values for all colors (normalized to [-1, 1])
+ARC_RGB_NORMALIZED = torch.tensor(
+    [[c / 127.5 - 1.0 for c in hex_to_rgb(color)] for color in ARC_COLORS],
+    dtype=torch.float32,
+)  # Shape: (10, 3)
+
+
 @dataclass
 class Config:
     """Configuration for ARC dataset creation and model training."""
@@ -43,7 +74,6 @@ class Config:
 
     # Data parameters
     seq_len: int
-    vocab_size: int
 
     # Denoising evaluation parameters
     eval_denoise_epoch_interval: int
@@ -554,14 +584,14 @@ def create_dataset(
 
 
 class ARCTaskDataset(Dataset):
-    """PyTorch dataset that loads ARC tasks and returns flattened grid values.
+    """PyTorch dataset that loads ARC tasks and returns RGB color values.
 
-    Each task returns a (200,) tensor of integers:
+    Each task returns a (200, 3) tensor of RGB values:
     - 4 examples (train + test combined)
     - Each example has input and output grids (2 grids per example)
     - Each grid is 5x5 = 25 cells
     - Total: 4 examples * 2 grids * 25 cells = 200 cells
-    - Each cell is an integer value representing the color (0 to vocab_size-1)
+    - Each cell has 3 RGB channels normalized to [-1, 1]
     """
 
     def __init__(self, folder_path: str, d_model: int):
@@ -579,13 +609,13 @@ class ARCTaskDataset(Dataset):
         return len(self.task_files)
 
     def __getitem__(self, idx: int) -> torch.Tensor:
-        """Get a task as a (200,) tensor of integer cell values.
+        """Get a task as a (200, 3) tensor of RGB values.
 
         Args:
             idx: Index of the task
 
         Returns:
-            Tensor of shape (200,) containing integer color values for each grid cell.
+            Tensor of shape (200, 3) containing RGB values normalized to [-1, 1] for each grid cell.
         """
         task_file = self.task_files[idx]
         task_data = parse_arc_json(task_file)
@@ -623,9 +653,11 @@ class ARCTaskDataset(Dataset):
             for row in grid:
                 all_cells.extend(row)
 
-        # Return as integer tensor
+        # Convert integer color indices to RGB values
         # all_cells should have 200 elements (4 examples * 2 grids * 25 cells)
-        return torch.tensor(all_cells, dtype=torch.long)
+        color_indices = torch.tensor(all_cells, dtype=torch.long)
+        rgb_values = ARC_RGB_NORMALIZED[color_indices]  # Shape: (200, 3)
+        return rgb_values
 
 
 class TransformerModel(nn.Module):
@@ -639,7 +671,6 @@ class TransformerModel(nn.Module):
         dim_feedforward: int,
         seq_len: int,
         dropout: float,
-        vocab_size: int,
     ):
         """Initialize the transformer model.
 
@@ -650,12 +681,11 @@ class TransformerModel(nn.Module):
             dim_feedforward: Dimension of feedforward network
             seq_len: Sequence length (200 positions)
             dropout: Dropout rate
-            vocab_size: Vocabulary size for color embeddings
         """
         super().__init__()
 
-        # Color embedding layer
-        self.color_embedding = nn.Embedding(vocab_size, d_model)
+        # Linear projection from RGB (3 channels) to d_model
+        self.input_proj = nn.Linear(3, d_model)
 
         # Positional embedding (learnable)
         self.pos_embedding = nn.Parameter(torch.randn(seq_len, d_model))
@@ -670,22 +700,20 @@ class TransformerModel(nn.Module):
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
 
-        # Linear output projection (d_model -> d_model)
-        self.output_proj = nn.Linear(d_model, d_model)
+        # Linear output projection (d_model -> 3 RGB channels)
+        self.output_proj = nn.Linear(d_model, 3)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass.
 
         Args:
-            x: Input tensor of shape (batch_size, seq_len, d_model) for continuous embeddings
-               or (batch_size, seq_len) for integer color indices
+            x: Input tensor of shape (batch_size, seq_len, 3) containing RGB values
 
         Returns:
-            Output tensor of shape (batch_size, seq_len, d_model)
+            Output tensor of shape (batch_size, seq_len, 3) containing predicted RGB values
         """
-        # If input is integer indices, embed them
-        if x.dim() == 2:
-            x = self.color_embedding(x)  # (batch_size, seq_len, d_model)
+        # Project RGB to d_model
+        x = self.input_proj(x)  # (batch_size, seq_len, d_model)
         
         # Add positional embedding
         x = x + self.pos_embedding.unsqueeze(0)  # (batch_size, seq_len, d_model)
@@ -693,8 +721,8 @@ class TransformerModel(nn.Module):
         # Apply transformer encoder
         x = self.transformer_encoder(x)  # (batch_size, seq_len, d_model)
 
-        # Apply output projection
-        x = self.output_proj(x)  # (batch_size, seq_len, d_model)
+        # Apply output projection to RGB
+        x = self.output_proj(x)  # (batch_size, seq_len, 3)
 
         return x
 
@@ -710,7 +738,7 @@ def optimize_output_grid(
 
     Args:
         model: The transformer model to use for computing gradients
-        x_input: Input tensor of shape (batch_size, 200, d_model)
+        x_input: Input tensor of shape (batch_size, 200, 3) containing RGB values
         mu: Momentum parameter for gradient computation
         eta: Learning rate for optimization
         num_iterations: Number of optimization iterations
@@ -741,7 +769,7 @@ def optimize_output_grid(
             grad = model(x + mu * (x - x_last))
 
             # Calculate gradient norm per sample in batch
-            # grad shape: (batch_size, 200, d_model)
+            # grad shape: (batch_size, 200, 3)
             grad_norm_per_sample = torch.norm(grad.view(batch_size, -1), dim=1)  # Shape: (batch_size,)
 
             # Update best grid for each sample if current gradient norm is lower
@@ -751,7 +779,7 @@ def optimize_output_grid(
             best_grad_norm = torch.where(improved_mask, grad_norm_per_sample, best_grad_norm)
             
             # Update best_x for improved samples
-            # Expand mask to match x dimensions: (batch_size, 200, d_model)
+            # Expand mask to match x dimensions: (batch_size, 200, 3)
             improved_mask_expanded = improved_mask.view(batch_size, 1, 1).expand_as(x)
             best_x = torch.where(improved_mask_expanded, x, best_x)
 
@@ -765,20 +793,19 @@ def optimize_output_grid(
     )
 
 
-def decode_grids(tokens: torch.Tensor, color_embeddings: torch.Tensor) -> torch.Tensor:
-    """Decode grid tokens to integer values using cosine distance to color embeddings.
+def decode_grids(rgb_tokens: torch.Tensor) -> torch.Tensor:
+    """Decode RGB tokens to integer color values by finding closest ARC color.
 
     Args:
-        tokens: Tensor of shape (batch_size, num_tokens, d_model) containing grid tokens
-                where num_tokens should be a multiple of 25 (for 5x5 grids)
-        color_embeddings: Tensor of shape (vocab_size, d_model) containing the color embedding weights
+        rgb_tokens: Tensor of shape (batch_size, num_tokens, 3) containing RGB values
+                    where num_tokens should be a multiple of 25 (for 5x5 grids)
 
     Returns:
-        Tensor of shape (batch_size, num_grids, 5, 5) with decoded integer values
+        Tensor of shape (batch_size, num_grids, 5, 5) with decoded integer values (0-9)
         where num_grids = num_tokens // 25
     """
-    batch_size = tokens.shape[0]
-    num_tokens = tokens.shape[1]
+    batch_size = rgb_tokens.shape[0]
+    num_tokens = rgb_tokens.shape[1]
 
     assert (
         num_tokens % 25 == 0
@@ -786,19 +813,23 @@ def decode_grids(tokens: torch.Tensor, color_embeddings: torch.Tensor) -> torch.
 
     num_grids = num_tokens // 25
 
-    # Normalize tokens and color embeddings for cosine similarity
-    # tokens: (batch_size, num_tokens, d_model)
-    # color_embeddings: (vocab_size, d_model)
-    tokens_normalized = torch.nn.functional.normalize(tokens, p=2, dim=2)  # (batch_size, num_tokens, d_model)
-    embeddings_normalized = torch.nn.functional.normalize(color_embeddings, p=2, dim=1)  # (vocab_size, d_model)
+    # Move color palette to same device as tokens
+    arc_colors = ARC_RGB_NORMALIZED.to(rgb_tokens.device)  # (10, 3)
     
-    # Compute cosine similarity: tokens @ embeddings.T
-    # Shape: (batch_size, num_tokens, vocab_size)
-    cosine_similarities = torch.matmul(tokens_normalized, embeddings_normalized.T)
+    # Compute L2 distance between each token and each color
+    # rgb_tokens: (batch_size, num_tokens, 3)
+    # arc_colors: (10, 3)
+    # Expand dimensions for broadcasting:
+    # rgb_tokens: (batch_size, num_tokens, 1, 3)
+    # arc_colors: (1, 1, 10, 3)
+    rgb_expanded = rgb_tokens.unsqueeze(2)  # (batch_size, num_tokens, 1, 3)
+    colors_expanded = arc_colors.unsqueeze(0).unsqueeze(0)  # (1, 1, 10, 3)
     
-    # Find color with highest cosine similarity (lowest cosine distance)
-    # Shape: (batch_size, num_tokens)
-    decoded_values = torch.argmax(cosine_similarities, dim=2)
+    # Compute squared L2 distance
+    distances = torch.sum((rgb_expanded - colors_expanded) ** 2, dim=3)  # (batch_size, num_tokens, 10)
+    
+    # Find color with minimum distance
+    decoded_values = torch.argmin(distances, dim=2)  # (batch_size, num_tokens)
     
     # Reshape to (batch_size, num_grids, 5, 5)
     decoded_grids = decoded_values.view(batch_size, num_grids, 5, 5)
@@ -818,7 +849,7 @@ def evaluate_denoising_accuracy(
 
     Args:
         model: The transformer model to use for computing gradients
-        x_clean: Clean input tensor of shape (batch_size, 200) with integer color indices (0 to vocab_size-1)
+        x_clean: Clean input tensor of shape (batch_size, 200, 3) with RGB values
         gamma: Noise level parameter (0-1) for corrupting the output grid
         mu: Momentum parameter for gradient computation
         eta: Learning rate for optimization
@@ -828,14 +859,10 @@ def evaluate_denoising_accuracy(
         DenoisingResult containing accuracies and predicted grids
     """
 
-    # Embed the integer indices to get continuous embeddings
-    # Shape: (batch_size, 200, d_model)
-    x_clean_embedded = model.color_embedding(x_clean)
-
     # Create noised input - only noise the last 25 tokens, keep first 175 unnoised
-    x_i = x_clean_embedded.clone()
-    eps = torch.randn_like(x_clean_embedded[:, -25:, :])
-    x_i[:, -25:, :] = (1 - gamma) * eps + gamma * x_clean_embedded[:, -25:, :]
+    x_i = x_clean.clone()
+    eps = torch.randn_like(x_clean[:, -25:, :])
+    x_i[:, -25:, :] = (1 - gamma) * eps + gamma * x_clean[:, -25:, :]
 
     # Perform optimization to denoise
     opt_result = optimize_output_grid(
@@ -846,19 +873,16 @@ def evaluate_denoising_accuracy(
         num_iterations=num_iterations,
     )
 
-    # Get color embeddings for decoding
-    color_embeddings = model.color_embedding.weight  # Shape: (vocab_size, d_model)
-
     # Decode the optimized output grids
     assert opt_result.optimized_output_tokens is not None
     predicted_grids = decode_grids(
-        opt_result.optimized_output_tokens, color_embeddings
+        opt_result.optimized_output_tokens
     )  # Shape: (batch_size, 1, 5, 5)
     predicted_grids = predicted_grids[:, 0, :, :]  # Shape: (batch_size, 5, 5)
 
     # Decode the true output grids (last 25 tokens)
-    true_output_tokens = x_clean_embedded[:, -25:, :]  # Shape: (batch_size, 25, d_model)
-    true_grids = decode_grids(true_output_tokens, color_embeddings)  # Shape: (batch_size, 1, 5, 5)
+    true_output_tokens = x_clean[:, -25:, :]  # Shape: (batch_size, 25, 3)
+    true_grids = decode_grids(true_output_tokens)  # Shape: (batch_size, 1, 5, 5)
     true_grids = true_grids[:, 0, :, :]  # Shape: (batch_size, 5, 5)
 
     # Calculate accuracy for each task in the batch (vectorized)
@@ -882,17 +906,17 @@ def random_shift_examples(batch: torch.Tensor, device: torch.device) -> torch.Te
     rotating examples that go past the end back to the beginning.
     
     Args:
-        batch: Batch tensor of shape (batch_size, 200) with integer indices
+        batch: Batch tensor of shape (batch_size, 200, 3) with RGB values
         device: Device to perform operations on
     
     Returns:
         Shifted batch tensor of same shape
     """
-    batch_size, seq_len = batch.shape
+    batch_size, seq_len, channels = batch.shape
     
-    # Reshape to (batch_size, 4 examples, 50 cells per example)
+    # Reshape to (batch_size, 4 examples, 50 cells per example, 3 channels)
     # Each example has 50 cells: input grid (25 cells) + output grid (25 cells)
-    batch_reshaped = batch.view(batch_size, 4, 50)
+    batch_reshaped = batch.view(batch_size, 4, 50, channels)
     
     # Randomly choose shift amount for each item in batch (0, 1, 2, or 3 example shifts)
     # We use 0-3 because we have 4 examples. Shifting by 0 means no shift.
@@ -906,7 +930,7 @@ def random_shift_examples(batch: torch.Tensor, device: torch.device) -> torch.Te
         shifted_batch[i] = torch.roll(batch_reshaped[i], shifts=int(shift_amounts[i].item()), dims=0)
     
     # Reshape back to original shape
-    return shifted_batch.view(batch_size, seq_len)
+    return shifted_batch.view(batch_size, seq_len, channels)
 
 
 def compute_loss_for_batch(
@@ -918,16 +942,13 @@ def compute_loss_for_batch(
 
     Args:
         model: The transformer model
-        batch: Batch of integer color indices, shape (batch_size, 200)
+        batch: Batch of RGB values, shape (batch_size, 200, 3)
         device: Device to compute on
 
     Returns:
         Loss tensor (scalar)
     """
-    batch = batch.to(device)  # (batch_size, 200)
-    
-    # Embed the integer indices
-    x = model.color_embedding(batch)  # (batch_size, 200, d_model)
+    x = batch.to(device)  # (batch_size, 200, 3)
 
     # Create noisy input - corrupt all 200 tokens
     xg = x.clone()
@@ -936,7 +957,7 @@ def compute_loss_for_batch(
     eps = torch.randn_like(xg)
 
     # Sample random gamma uniformly between 0 and 1
-    # Shape: (batch_size, 1, 1) - broadcasts across all 200 positions and d_model
+    # Shape: (batch_size, 1, 1) - broadcasts across all 200 positions and 3 channels
     gamma = torch.rand(x.size(0), 1, 1, device=device)
 
     # Create noisy input for all tokens
@@ -1068,7 +1089,6 @@ def train(config: Config):
         dim_feedforward=config.dim_feedforward,
         seq_len=config.seq_len,
         dropout=config.dropout,
-        vocab_size=config.vocab_size,
     ).to(device)
 
     # Count parameters
@@ -1229,7 +1249,6 @@ def train(config: Config):
                         "num_layers": config.num_layers,
                         "dim_feedforward": config.dim_feedforward,
                         "seq_len": config.seq_len,
-                        "vocab_size": config.vocab_size,
                         "dropout": config.dropout,
                     },
                 },
@@ -1252,7 +1271,6 @@ def train(config: Config):
                 "num_layers": config.num_layers,
                 "dim_feedforward": config.dim_feedforward,
                 "seq_len": config.seq_len,
-                "vocab_size": config.vocab_size,
                 "dropout": config.dropout,
             },
         },
@@ -1278,7 +1296,6 @@ def main():
         dropout=0.1,
         # Data parameters
         seq_len=200,
-        vocab_size=10,
         # Denoising evaluation parameters
         eval_denoise_epoch_interval=2,
         eval_denoise_gamma=[0.0],
