@@ -43,7 +43,7 @@ class Config:
 
     # Data parameters
     seq_len: int
-    num_cell_values: int
+    vocab_size: int
 
     # Denoising evaluation parameters
     eval_denoise_epoch_interval: int
@@ -554,15 +554,14 @@ def create_dataset(
 
 
 class ARCTaskDataset(Dataset):
-    """PyTorch dataset that loads ARC tasks and returns centered one-hot encoded cell values.
+    """PyTorch dataset that loads ARC tasks and returns flattened grid values.
 
-    Each task returns a (200, d_model) tensor:
+    Each task returns a (200,) tensor of integers:
     - 4 examples (train + test combined)
     - Each example has input and output grids (2 grids per example)
     - Each grid is 5x5 = 25 cells
     - Total: 4 examples * 2 grids * 25 cells = 200 cells
-    - Each cell is one-hot encoded with 10 values (0-9) padded to d_model
-    - One-hot vectors are centered to have mean 0 (subtract 1/d_model from all dims)
+    - Each cell is an integer value representing the color (0 to vocab_size-1)
     """
 
     def __init__(self, folder_path: str, d_model: int):
@@ -570,10 +569,8 @@ class ARCTaskDataset(Dataset):
 
         Args:
             folder_path: Path to folder containing task JSON files
-            d_model: Model dimension for one-hot encoding (must be >= 10)
+            d_model: Model dimension (not used in dataset, kept for compatibility)
         """
-        if d_model < 10:
-            raise ValueError(f"d_model must be >= 10, got {d_model}")
         self.folder_path = Path(folder_path)
         self.task_files = sorted(self.folder_path.glob("*.json"))
         self.d_model = d_model
@@ -582,14 +579,13 @@ class ARCTaskDataset(Dataset):
         return len(self.task_files)
 
     def __getitem__(self, idx: int) -> torch.Tensor:
-        """Get a task as a (200, d_model) tensor of centered one-hot encoded cell values.
+        """Get a task as a (200,) tensor of integer cell values.
 
         Args:
             idx: Index of the task
 
         Returns:
-            Tensor of shape (200, d_model) containing centered one-hot encoded cell values.
-            Each vector has mean 0 across all d_model dimensions.
+            Tensor of shape (200,) containing integer color values for each grid cell.
         """
         task_file = self.task_files[idx]
         task_data = parse_arc_json(task_file)
@@ -627,18 +623,9 @@ class ARCTaskDataset(Dataset):
             for row in grid:
                 all_cells.extend(row)
 
-        # Convert to one-hot encoding
+        # Return as integer tensor
         # all_cells should have 200 elements (4 examples * 2 grids * 25 cells)
-        one_hot = torch.zeros(200, self.d_model, dtype=torch.float32)
-        for i, cell_value in enumerate(all_cells):
-            one_hot[i, cell_value] = 1.0
-
-        # Center the one-hot vectors to have mean 0
-        # Each vector has one 1.0 and (d_model-1) 0.0s, so mean is 1/d_model
-        # We subtract 1/d_model from all dimensions to center around 0
-        one_hot -= 1.0 / self.d_model
-
-        return one_hot
+        return torch.tensor(all_cells, dtype=torch.long)
 
 
 class TransformerModel(nn.Module):
@@ -652,6 +639,7 @@ class TransformerModel(nn.Module):
         dim_feedforward: int,
         seq_len: int,
         dropout: float,
+        vocab_size: int,
     ):
         """Initialize the transformer model.
 
@@ -662,8 +650,12 @@ class TransformerModel(nn.Module):
             dim_feedforward: Dimension of feedforward network
             seq_len: Sequence length (200 positions)
             dropout: Dropout rate
+            vocab_size: Vocabulary size for color embeddings
         """
         super().__init__()
+
+        # Color embedding layer
+        self.color_embedding = nn.Embedding(vocab_size, d_model)
 
         # Positional embedding (learnable)
         self.pos_embedding = nn.Parameter(torch.randn(seq_len, d_model))
@@ -685,11 +677,16 @@ class TransformerModel(nn.Module):
         """Forward pass.
 
         Args:
-            x: Input tensor of shape (batch_size, seq_len, d_model) - already embedded
+            x: Input tensor of shape (batch_size, seq_len, d_model) for continuous embeddings
+               or (batch_size, seq_len) for integer color indices
 
         Returns:
             Output tensor of shape (batch_size, seq_len, d_model)
         """
+        # If input is integer indices, embed them
+        if x.dim() == 2:
+            x = self.color_embedding(x)  # (batch_size, seq_len, d_model)
+        
         # Add positional embedding
         x = x + self.pos_embedding.unsqueeze(0)  # (batch_size, seq_len, d_model)
 
@@ -700,19 +697,6 @@ class TransformerModel(nn.Module):
         x = self.output_proj(x)  # (batch_size, seq_len, d_model)
 
         return x
-
-
-def decode_one_hot(vector: torch.Tensor) -> int:
-    """Decode a one-hot encoded vector to its cell value.
-
-    Args:
-        vector: One-hot encoded vector of shape (d_model,)
-
-    Returns:
-        Cell value (0-9) corresponding to the argmax of the first 10 dimensions
-    """
-    # Take argmax of first 10 dimensions (cell values 0-9)
-    return int(torch.argmax(vector[:10]).item())
 
 
 def optimize_output_grid(
@@ -781,15 +765,16 @@ def optimize_output_grid(
     )
 
 
-def decode_grids(tokens: torch.Tensor) -> torch.Tensor:
-    """Decode grid tokens to integer values using vectorized operations.
+def decode_grids(tokens: torch.Tensor, color_embeddings: torch.Tensor) -> torch.Tensor:
+    """Decode grid tokens to integer values using cosine distance to color embeddings.
 
     Args:
         tokens: Tensor of shape (batch_size, num_tokens, d_model) containing grid tokens
                 where num_tokens should be a multiple of 25 (for 5x5 grids)
+        color_embeddings: Tensor of shape (vocab_size, d_model) containing the color embedding weights
 
     Returns:
-        Tensor of shape (batch_size, num_grids, 5, 5) with decoded integer values (0-9)
+        Tensor of shape (batch_size, num_grids, 5, 5) with decoded integer values
         where num_grids = num_tokens // 25
     """
     batch_size = tokens.shape[0]
@@ -801,9 +786,19 @@ def decode_grids(tokens: torch.Tensor) -> torch.Tensor:
 
     num_grids = num_tokens // 25
 
-    # Take argmax of first 10 dimensions for all tokens at once
+    # Normalize tokens and color embeddings for cosine similarity
+    # tokens: (batch_size, num_tokens, d_model)
+    # color_embeddings: (vocab_size, d_model)
+    tokens_normalized = torch.nn.functional.normalize(tokens, p=2, dim=2)  # (batch_size, num_tokens, d_model)
+    embeddings_normalized = torch.nn.functional.normalize(color_embeddings, p=2, dim=1)  # (vocab_size, d_model)
+    
+    # Compute cosine similarity: tokens @ embeddings.T
+    # Shape: (batch_size, num_tokens, vocab_size)
+    cosine_similarities = torch.matmul(tokens_normalized, embeddings_normalized.T)
+    
+    # Find color with highest cosine similarity (lowest cosine distance)
     # Shape: (batch_size, num_tokens)
-    decoded_values = torch.argmax(tokens[:, :, :10], dim=2)
+    decoded_values = torch.argmax(cosine_similarities, dim=2)
     
     # Reshape to (batch_size, num_grids, 5, 5)
     decoded_grids = decoded_values.view(batch_size, num_grids, 5, 5)
@@ -823,7 +818,7 @@ def evaluate_denoising_accuracy(
 
     Args:
         model: The transformer model to use for computing gradients
-        x_clean: Clean input tensor of shape (batch_size, 200, d_model)
+        x_clean: Clean input tensor of shape (batch_size, 200) with integer color indices (0 to vocab_size-1)
         gamma: Noise level parameter (0-1) for corrupting the output grid
         mu: Momentum parameter for gradient computation
         eta: Learning rate for optimization
@@ -833,10 +828,14 @@ def evaluate_denoising_accuracy(
         DenoisingResult containing accuracies and predicted grids
     """
 
+    # Embed the integer indices to get continuous embeddings
+    # Shape: (batch_size, 200, d_model)
+    x_clean_embedded = model.color_embedding(x_clean)
+
     # Create noised input - only noise the last 25 tokens, keep first 175 unnoised
-    x_i = x_clean.clone()
-    eps = torch.randn_like(x_clean[:, -25:, :])
-    x_i[:, -25:, :] = (1 - gamma) * eps + gamma * x_clean[:, -25:, :]
+    x_i = x_clean_embedded.clone()
+    eps = torch.randn_like(x_clean_embedded[:, -25:, :])
+    x_i[:, -25:, :] = (1 - gamma) * eps + gamma * x_clean_embedded[:, -25:, :]
 
     # Perform optimization to denoise
     opt_result = optimize_output_grid(
@@ -847,16 +846,19 @@ def evaluate_denoising_accuracy(
         num_iterations=num_iterations,
     )
 
+    # Get color embeddings for decoding
+    color_embeddings = model.color_embedding.weight  # Shape: (vocab_size, d_model)
+
     # Decode the optimized output grids
     assert opt_result.optimized_output_tokens is not None
     predicted_grids = decode_grids(
-        opt_result.optimized_output_tokens
+        opt_result.optimized_output_tokens, color_embeddings
     )  # Shape: (batch_size, 1, 5, 5)
     predicted_grids = predicted_grids[:, 0, :, :]  # Shape: (batch_size, 5, 5)
 
     # Decode the true output grids (last 25 tokens)
-    true_output_tokens = x_clean[:, -25:, :]  # Shape: (batch_size, 25, d_model)
-    true_grids = decode_grids(true_output_tokens)  # Shape: (batch_size, 1, 5, 5)
+    true_output_tokens = x_clean_embedded[:, -25:, :]  # Shape: (batch_size, 25, d_model)
+    true_grids = decode_grids(true_output_tokens, color_embeddings)  # Shape: (batch_size, 1, 5, 5)
     true_grids = true_grids[:, 0, :, :]  # Shape: (batch_size, 5, 5)
 
     # Calculate accuracy for each task in the batch (vectorized)
@@ -1063,6 +1065,7 @@ def train(config: Config):
         dim_feedforward=config.dim_feedforward,
         seq_len=config.seq_len,
         dropout=config.dropout,
+        vocab_size=config.vocab_size,
     ).to(device)
 
     # Count parameters
@@ -1223,7 +1226,7 @@ def train(config: Config):
                         "num_layers": config.num_layers,
                         "dim_feedforward": config.dim_feedforward,
                         "seq_len": config.seq_len,
-                        "num_cell_values": config.num_cell_values,
+                        "vocab_size": config.vocab_size,
                         "dropout": config.dropout,
                     },
                 },
@@ -1246,7 +1249,7 @@ def train(config: Config):
                 "num_layers": config.num_layers,
                 "dim_feedforward": config.dim_feedforward,
                 "seq_len": config.seq_len,
-                "num_cell_values": config.num_cell_values,
+                "vocab_size": config.vocab_size,
                 "dropout": config.dropout,
             },
         },
@@ -1272,7 +1275,7 @@ def main():
         dropout=0.1,
         # Data parameters
         seq_len=200,
-        num_cell_values=10,
+        vocab_size=10,
         # Denoising evaluation parameters
         eval_denoise_epoch_interval=5,
         eval_denoise_gamma=[0.0, 0.5, 0.75],
