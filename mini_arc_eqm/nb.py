@@ -1324,7 +1324,7 @@ def main():
         max_augmentations=config.max_augmentations,
     )
 
-    # # Train model
+    # Train model
     train(config)
 
 
