@@ -1092,22 +1092,16 @@ def train(config: Config):
                 (idx, file_path)
                 for idx, file_path in enumerate(train_dataset.task_files)
                 if file_path.name.endswith("original.json")
-            ][
-                :10
-            ]  # Take first 10
+            ]
+            assert len(train_original_tasks) > 10 and len(train_original_tasks) < 200, "Expected between 10 and 200 original tasks in train dataset"
 
             # Filter for original tasks in test dataset
             test_original_tasks = [
                 (idx, file_path)
                 for idx, file_path in enumerate(test_dataset.task_files)
                 if file_path.name.endswith("original.json")
-            ][
-                :10
-            ]  # Take first 10
-
-            print(
-                f"Found {len(train_original_tasks)} train original tasks and {len(test_original_tasks)} test original tasks"
-            )
+            ]
+            assert len(test_original_tasks) > 10 and len(test_original_tasks) < 50, "Expected between 10 and 50 original tasks in test dataset"
 
             # Evaluate for each gamma value
             for gamma_val in config.eval_denoise_gamma:
@@ -1242,7 +1236,7 @@ def main():
         num_cell_values=10,
         # Denoising evaluation parameters
         eval_denoise_epoch_interval=1,
-        eval_denoise_gamma=[0.0, 0.5, 0.75],
+        eval_denoise_gamma=[0.75],
         eval_denoise_mu=0.3,
         eval_denoise_eta=0.003,
         eval_denoise_num_iterations=2000,
