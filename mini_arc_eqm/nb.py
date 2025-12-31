@@ -51,7 +51,6 @@ class Config:
     eval_denoise_mu: float
     eval_denoise_eta: float
     eval_denoise_num_iterations: int
-    eval_denoise_patience: int
 
     # Optional model loading
     load_model_path: Optional[str] = None
@@ -109,15 +108,13 @@ class DenoisingResult:
 
     Attributes:
         accuracies: Optional tensor of shape (batch_size,) with accuracy for each task
-        predicted_grids: Optional numpy array of shape (batch_size, 5, 5) with predicted output grids
-        num_iterations: Optional tensor of shape (batch_size,) with number of iterations for each task
+        predicted_grids: Optional tensor of shape (batch_size, 5, 5) with predicted output grids
         optimized_output_tokens: Optional tensor of shape (batch_size, 25, d_model) with optimized output tokens
         best_grad_norm: Optional tensor of shape (batch_size,) with best gradient norm for each task
     """
 
     accuracies: Optional[torch.Tensor] = None
-    predicted_grids: Optional[np.ndarray] = None
-    num_iterations: Optional[torch.Tensor] = None
+    predicted_grids: Optional[torch.Tensor] = None
     optimized_output_tokens: Optional[torch.Tensor] = None
     best_grad_norm: Optional[torch.Tensor] = None
 
@@ -724,20 +721,18 @@ def optimize_output_grid(
     mu: float,
     eta: float,
     num_iterations: int,
-    patience: int,
 ) -> DenoisingResult:
-    """Optimize the output grid using gradient descent with early stopping.
+    """Optimize the output grid using gradient descent.
 
     Args:
         model: The transformer model to use for computing gradients
         x_input: Input tensor of shape (batch_size, 200, d_model)
         mu: Momentum parameter for gradient computation
         eta: Learning rate for optimization
-        num_iterations: Maximum number of optimization iterations
-        patience: Number of iterations to wait for improvement before early stopping
+        num_iterations: Number of optimization iterations
 
     Returns:
-        DenoisingResult with optimized_output_tokens and num_iterations fields populated
+        DenoisingResult with optimized_output_tokens and best_grad_norm fields populated
     """
     batch_size = x_input.shape[0]
 
@@ -745,14 +740,9 @@ def optimize_output_grid(
         x = x_input.clone()
         grad = model(x)
 
-        # Track best grid and gradient norm
-        best_grad_norm = float("inf")
+        # Track best grid and gradient norm per sample in batch
+        best_grad_norm = torch.full((batch_size,), float("inf"), device=x_input.device)
         best_x = x.clone()
-
-        # Track gradient norm history for early stopping
-        grad_norm_history = []
-        iterations_without_improvement = 0
-        iterations_taken = num_iterations  # Default to max iterations
 
         for iteration in range(num_iterations):
             x_last = x.clone()
@@ -766,51 +756,40 @@ def optimize_output_grid(
             # Compute gradient
             grad = model(x + mu * (x - x_last))
 
-            # Calculate gradient norm
-            grad_norm = torch.norm(grad).item()
-            grad_norm_history.append(grad_norm)
+            # Calculate gradient norm per sample in batch
+            # grad shape: (batch_size, 200, d_model)
+            grad_norm_per_sample = torch.norm(grad.view(batch_size, -1), dim=1)  # Shape: (batch_size,)
 
-            # Update best grid if current gradient norm is lower
-            if grad_norm < best_grad_norm:
-                best_grad_norm = grad_norm
-                best_x = x.clone()
-                iterations_without_improvement = 0
-            else:
-                iterations_without_improvement += 1
-
-            # Early stopping check
-            if iterations_without_improvement >= patience:
-                iterations_taken = iteration + 1
-                break
+            # Update best grid for each sample if current gradient norm is lower
+            improved_mask = grad_norm_per_sample < best_grad_norm  # Shape: (batch_size,)
+            
+            # Update best_grad_norm for improved samples
+            best_grad_norm = torch.where(improved_mask, grad_norm_per_sample, best_grad_norm)
+            
+            # Update best_x for improved samples
+            # Expand mask to match x dimensions: (batch_size, 200, d_model)
+            improved_mask_expanded = improved_mask.view(batch_size, 1, 1).expand_as(x)
+            best_x = torch.where(improved_mask_expanded, x, best_x)
 
         # Use the best x (with lowest gradient norm) as final result
         x = best_x
 
-    # Create iterations tensor
-    iterations_tensor = torch.full((batch_size,), iterations_taken, dtype=torch.int32)
-
-    # Create best grad norm tensor
-    best_grad_norm_tensor = torch.full(
-        (batch_size,), best_grad_norm, dtype=torch.float32
-    )
-
-    # Return DenoisingResult with optimized tokens, iterations, and best grad norm
+    # Return DenoisingResult with optimized tokens and best grad norm per sample
     return DenoisingResult(
         optimized_output_tokens=x[:, -25:, :],
-        num_iterations=iterations_tensor,
-        best_grad_norm=best_grad_norm_tensor,
+        best_grad_norm=best_grad_norm,
     )
 
 
-def decode_grids(tokens: torch.Tensor) -> np.ndarray:
-    """Decode grid tokens to integer values.
+def decode_grids(tokens: torch.Tensor) -> torch.Tensor:
+    """Decode grid tokens to integer values using vectorized operations.
 
     Args:
         tokens: Tensor of shape (batch_size, num_tokens, d_model) containing grid tokens
                 where num_tokens should be a multiple of 25 (for 5x5 grids)
 
     Returns:
-        Numpy array of shape (batch_size, num_grids, 5, 5) with decoded integer values (0-9)
+        Tensor of shape (batch_size, num_grids, 5, 5) with decoded integer values (0-9)
         where num_grids = num_tokens // 25
     """
     batch_size = tokens.shape[0]
@@ -822,25 +801,14 @@ def decode_grids(tokens: torch.Tensor) -> np.ndarray:
 
     num_grids = num_tokens // 25
 
-    decoded_grids = []
-
-    for batch_idx in range(batch_size):
-        batch_grids = []
-        for grid_idx in range(num_grids):
-            start_idx = grid_idx * 25
-            end_idx = start_idx + 25
-            grid_tokens = tokens[batch_idx, start_idx:end_idx]
-
-            predicted_values = []
-            for token in grid_tokens:
-                cell_value = decode_one_hot(token)
-                predicted_values.append(cell_value)
-            predicted_grid = np.array(predicted_values).reshape(5, 5)
-            batch_grids.append(predicted_grid)
-
-        decoded_grids.append(batch_grids)
-
-    return np.array(decoded_grids)
+    # Take argmax of first 10 dimensions for all tokens at once
+    # Shape: (batch_size, num_tokens)
+    decoded_values = torch.argmax(tokens[:, :, :10], dim=2)
+    
+    # Reshape to (batch_size, num_grids, 5, 5)
+    decoded_grids = decoded_values.view(batch_size, num_grids, 5, 5)
+    
+    return decoded_grids
 
 
 def evaluate_denoising_accuracy(
@@ -850,7 +818,6 @@ def evaluate_denoising_accuracy(
     mu: float,
     eta: float,
     num_iterations: int,
-    patience: int,
 ) -> DenoisingResult:
     """Evaluate denoising accuracy by corrupting and denoising output grids.
 
@@ -860,13 +827,11 @@ def evaluate_denoising_accuracy(
         gamma: Noise level parameter (0-1) for corrupting the output grid
         mu: Momentum parameter for gradient computation
         eta: Learning rate for optimization
-        num_iterations: Maximum number of optimization iterations
-        patience: Number of iterations to wait for improvement before early stopping
+        num_iterations: Number of optimization iterations
 
     Returns:
         DenoisingResult containing accuracies and predicted grids
     """
-    batch_size = x_clean.shape[0]
 
     # Create noised input - only noise the last 25 tokens, keep first 175 unnoised
     x_i = x_clean.clone()
@@ -880,7 +845,6 @@ def evaluate_denoising_accuracy(
         mu=mu,
         eta=eta,
         num_iterations=num_iterations,
-        patience=patience,
     )
 
     # Decode the optimized output grids
@@ -895,16 +859,14 @@ def evaluate_denoising_accuracy(
     true_grids = decode_grids(true_output_tokens)  # Shape: (batch_size, 1, 5, 5)
     true_grids = true_grids[:, 0, :, :]  # Shape: (batch_size, 5, 5)
 
-    # Calculate accuracy for each task in the batch
-    accuracies = []
-    for batch_idx in range(batch_size):
-        accuracy = (predicted_grids[batch_idx] == true_grids[batch_idx]).mean()
-        accuracies.append(accuracy)
+    # Calculate accuracy for each task in the batch (vectorized)
+    # Shape: (batch_size,) - mean over the 5x5 grid for each batch element
+    accuracies = (predicted_grids == true_grids).float().mean(dim=(1, 2))
 
     # Use replace to add accuracies and predicted_grids to the result
     return replace(
         opt_result,
-        accuracies=torch.tensor(accuracies),
+        accuracies=accuracies,
         predicted_grids=predicted_grids,
     )
 
@@ -1150,50 +1112,49 @@ def train(config: Config):
             # Evaluate for each gamma value
             for gamma_val in config.eval_denoise_gamma:
                 gamma_start_time = time.time()
-                train_accuracies = []
-                test_accuracies = []
 
-                # Evaluate train tasks
+                # Evaluate train tasks in batch
                 model.eval()
                 with torch.no_grad():
-                    for task_idx, task_path in train_original_tasks:
-                        task_data = train_dataset[task_idx]
-                        x_clean = task_data.unsqueeze(0).to(device)
+                    # Load all train tasks into a batch
+                    train_batch = torch.stack([
+                        train_dataset[task_idx].to(device)
+                        for task_idx, _ in train_original_tasks
+                    ])
 
-                        result = evaluate_denoising_accuracy(
-                            model=model,
-                            x_clean=x_clean,
-                            gamma=gamma_val,
-                            mu=config.eval_denoise_mu,
-                            eta=config.eval_denoise_eta,
-                            num_iterations=config.eval_denoise_num_iterations,
-                            patience=config.eval_denoise_patience,
-                        )
+                    train_result = evaluate_denoising_accuracy(
+                        model=model,
+                        x_clean=train_batch,
+                        gamma=gamma_val,
+                        mu=config.eval_denoise_mu,
+                        eta=config.eval_denoise_eta,
+                        num_iterations=config.eval_denoise_num_iterations,
+                    )
 
-                        assert result.accuracies is not None
-                        train_accuracies.append(result.accuracies[0].item())
+                    assert train_result.accuracies is not None
+                    train_accuracies = train_result.accuracies.cpu().numpy()
 
-                    # Evaluate test tasks
-                    for task_idx, task_path in test_original_tasks:
-                        task_data = test_dataset[task_idx]
-                        x_clean = task_data.unsqueeze(0).to(device)
+                    # Load all test tasks into a batch
+                    test_batch = torch.stack([
+                        test_dataset[task_idx].to(device)
+                        for task_idx, _ in test_original_tasks
+                    ])
 
-                        result = evaluate_denoising_accuracy(
-                            model=model,
-                            x_clean=x_clean,
-                            gamma=gamma_val,
-                            mu=config.eval_denoise_mu,
-                            eta=config.eval_denoise_eta,
-                            num_iterations=config.eval_denoise_num_iterations,
-                            patience=config.eval_denoise_patience,
-                        )
+                    test_result = evaluate_denoising_accuracy(
+                        model=model,
+                        x_clean=test_batch,
+                        gamma=gamma_val,
+                        mu=config.eval_denoise_mu,
+                        eta=config.eval_denoise_eta,
+                        num_iterations=config.eval_denoise_num_iterations,
+                    )
 
-                        assert result.accuracies is not None
-                        test_accuracies.append(result.accuracies[0].item())
+                    assert test_result.accuracies is not None
+                    test_accuracies = test_result.accuracies.cpu().numpy()
 
                 # Compute average accuracies
-                avg_train_acc = np.mean(train_accuracies) if train_accuracies else 0.0
-                avg_test_acc = np.mean(test_accuracies) if test_accuracies else 0.0
+                avg_train_acc = np.mean(train_accuracies) if len(train_accuracies) > 0 else 0.0
+                avg_test_acc = np.mean(test_accuracies) if len(test_accuracies) > 0 else 0.0
 
                 # Calculate time for this gamma value
                 gamma_time = time.time() - gamma_start_time
@@ -1280,12 +1241,11 @@ def main():
         seq_len=200,
         num_cell_values=10,
         # Denoising evaluation parameters
-        eval_denoise_epoch_interval=5,
+        eval_denoise_epoch_interval=1,
         eval_denoise_gamma=[0.0, 0.5, 0.75],
         eval_denoise_mu=0.3,
         eval_denoise_eta=0.003,
         eval_denoise_num_iterations=2000,
-        eval_denoise_patience=50,
         # Training parameters
         num_epochs=40,
         batch_size=128,
