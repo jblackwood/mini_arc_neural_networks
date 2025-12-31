@@ -871,6 +871,42 @@ def evaluate_denoising_accuracy(
     )
 
 
+def random_shift_examples(batch: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Randomly shift the order of examples in each task while keeping input/output pairs together.
+    
+    Each task has 4 examples, with each example consisting of an input grid (25 cells) 
+    followed by an output grid (25 cells), for a total of 50 cells per example.
+    This function shifts by 2, 4, or 6 slots (i.e., 50, 100, or 150 cells), 
+    rotating examples that go past the end back to the beginning.
+    
+    Args:
+        batch: Batch tensor of shape (batch_size, 200, d_model)
+        device: Device to perform operations on
+    
+    Returns:
+        Shifted batch tensor of same shape
+    """
+    batch_size, seq_len, d_model = batch.shape
+    
+    # Reshape to (batch_size, 4 examples, 50 cells per example, d_model)
+    # Each example has 50 cells: input grid (25 cells) + output grid (25 cells)
+    batch_reshaped = batch.view(batch_size, 4, 50, d_model)
+    
+    # Randomly choose shift amount for each item in batch (0, 1, 2, or 3 example shifts)
+    # We use 0-3 because we have 4 examples. Shifting by 0 means no shift.
+    # This corresponds to shifts of 0, 2, 4, or 6 slots (0, 100, 200, or 300 cells)
+    shift_amounts = torch.randint(0, 4, (batch_size,), device=device)
+    
+    # Create shifted batch using torch.roll for each batch item
+    # We need to handle each batch item separately because they have different shift amounts
+    shifted_batch = torch.zeros_like(batch_reshaped)
+    for i in range(batch_size):
+        shifted_batch[i] = torch.roll(batch_reshaped[i], shifts=int(shift_amounts[i].item()), dims=0)
+    
+    # Reshape back to original shape
+    return shifted_batch.view(batch_size, seq_len, d_model)
+
+
 def compute_loss_for_batch(
     model: nn.Module,
     batch: torch.Tensor,
@@ -937,6 +973,9 @@ def train_epoch(
     num_batches = 0
 
     for batch in train_loader:
+        # Randomly shift examples in each task
+        batch = random_shift_examples(batch, device)
+        
         # Compute loss
         loss = compute_loss_for_batch(model, batch, device)
 
