@@ -629,7 +629,7 @@ class ARCTaskDataset(Dataset):
 
 
 class TransformerModel(nn.Module):
-    """Non-causal transformer encoder for ARC tasks with diagonal masking (leave-one-out)."""
+    """Non-causal transformer encoder for ARC tasks."""
 
     def __init__(
         self,
@@ -653,8 +653,6 @@ class TransformerModel(nn.Module):
             vocab_size: Vocabulary size for color embeddings
         """
         super().__init__()
-
-        self.seq_len = seq_len
 
         # Color embedding layer
         self.color_embedding = nn.Embedding(vocab_size, d_model)
@@ -692,12 +690,8 @@ class TransformerModel(nn.Module):
         # Add positional embedding
         x = x + self.pos_embedding.unsqueeze(0)  # (batch_size, seq_len, d_model)
 
-        # Create diagonal mask (leave-one-out) on the same device as input
-        # mask[i, i] = True (masked), all others False - prevents self-attention
-        diagonal_mask = torch.eye(x.shape[1], dtype=torch.bool, device=x.device)
-
-        # Apply transformer encoder with diagonal mask
-        x = self.transformer_encoder(x, mask=diagonal_mask)  # (batch_size, seq_len, d_model)
+        # Apply transformer encoder
+        x = self.transformer_encoder(x)  # (batch_size, seq_len, d_model)
 
         # Apply output projection
         x = self.output_proj(x)  # (batch_size, seq_len, d_model)
