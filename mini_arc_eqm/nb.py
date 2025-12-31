@@ -1124,36 +1124,42 @@ def train(config: Config):
         # Evaluate denoising accuracy periodically
         if (epoch + 1) % config.eval_denoise_epoch_interval == 0:
             print(f"\nEvaluating denoising accuracy at epoch {epoch + 1}...")
-            
+
             # Filter for original tasks in train dataset
             train_original_tasks = [
                 (idx, file_path)
                 for idx, file_path in enumerate(train_dataset.task_files)
                 if file_path.name.endswith("original.json")
-            ][:10]  # Take first 10
-            
+            ][
+                :10
+            ]  # Take first 10
+
             # Filter for original tasks in test dataset
             test_original_tasks = [
                 (idx, file_path)
                 for idx, file_path in enumerate(test_dataset.task_files)
                 if file_path.name.endswith("original.json")
-            ][:10]  # Take first 10
-            
-            print(f"Found {len(train_original_tasks)} train original tasks and {len(test_original_tasks)} test original tasks")
-            
+            ][
+                :10
+            ]  # Take first 10
+
+            print(
+                f"Found {len(train_original_tasks)} train original tasks and {len(test_original_tasks)} test original tasks"
+            )
+
             # Evaluate for each gamma value
             for gamma_val in config.eval_denoise_gamma:
                 gamma_start_time = time.time()
                 train_accuracies = []
                 test_accuracies = []
-                
+
                 # Evaluate train tasks
                 model.eval()
                 with torch.no_grad():
                     for task_idx, task_path in train_original_tasks:
                         task_data = train_dataset[task_idx]
                         x_clean = task_data.unsqueeze(0).to(device)
-                        
+
                         result = evaluate_denoising_accuracy(
                             model=model,
                             x_clean=x_clean,
@@ -1163,15 +1169,15 @@ def train(config: Config):
                             num_iterations=config.eval_denoise_num_iterations,
                             patience=config.eval_denoise_patience,
                         )
-                        
+
                         assert result.accuracies is not None
                         train_accuracies.append(result.accuracies[0].item())
-                    
+
                     # Evaluate test tasks
                     for task_idx, task_path in test_original_tasks:
                         task_data = test_dataset[task_idx]
                         x_clean = task_data.unsqueeze(0).to(device)
-                        
+
                         result = evaluate_denoising_accuracy(
                             model=model,
                             x_clean=x_clean,
@@ -1181,24 +1187,30 @@ def train(config: Config):
                             num_iterations=config.eval_denoise_num_iterations,
                             patience=config.eval_denoise_patience,
                         )
-                        
+
                         assert result.accuracies is not None
                         test_accuracies.append(result.accuracies[0].item())
-                
+
                 # Compute average accuracies
                 avg_train_acc = np.mean(train_accuracies) if train_accuracies else 0.0
                 avg_test_acc = np.mean(test_accuracies) if test_accuracies else 0.0
-                
+
                 # Calculate time for this gamma value
                 gamma_time = time.time() - gamma_start_time
-                
+
                 # Print to terminal
-                print(f"  Gamma {gamma_val:.2f} - Train Accuracy: {avg_train_acc * 100:.2f}%, Test Accuracy: {avg_test_acc * 100:.2f}%, Time: {gamma_time:.2f}s")
-                
+                print(
+                    f"  Gamma {gamma_val:.2f} - Train Accuracy: {avg_train_acc * 100:.2f}%, Test Accuracy: {avg_test_acc * 100:.2f}%, Time: {gamma_time:.2f}s"
+                )
+
                 # Log to tensorboard
-                writer.add_scalar(f"DenoiseAccuracy/train_gamma_{gamma_val}", avg_train_acc, epoch)
-                writer.add_scalar(f"DenoiseAccuracy/test_gamma_{gamma_val}", avg_test_acc, epoch)
-            
+                writer.add_scalar(
+                    f"DenoiseAccuracy/train_gamma_{gamma_val}", avg_train_acc, epoch
+                )
+                writer.add_scalar(
+                    f"DenoiseAccuracy/test_gamma_{gamma_val}", avg_test_acc, epoch
+                )
+
             print()  # Empty line for readability
 
         # Save checkpoint every 20 epochs
@@ -1264,10 +1276,6 @@ def main():
         num_layers=3,
         dim_feedforward=512,
         dropout=0.1,
-        # Training parameters
-        batch_size=128,
-        num_epochs=40,
-        learning_rate=1e-3,
         # Data parameters
         seq_len=200,
         num_cell_values=10,
@@ -1278,6 +1286,10 @@ def main():
         eval_denoise_eta=0.003,
         eval_denoise_num_iterations=2000,
         eval_denoise_patience=50,
+        # Training parameters
+        num_epochs=40,
+        batch_size=128,
+        learning_rate=1e-3,
         # Optional: Load existing model to continue training
         load_model_path=None,
     )
