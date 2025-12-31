@@ -1283,7 +1283,7 @@ def main():
         eval_denoise_eta=0.003,
         eval_denoise_num_iterations=2000,
         # Training parameters
-        num_epochs=200,
+        num_epochs=40,
         batch_size=128,
         learning_rate=1e-3,
         # Optional: Load existing model to continue training
