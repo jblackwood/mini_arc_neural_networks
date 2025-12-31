@@ -1298,7 +1298,7 @@ def main():
         seq_len=200,
         # Denoising evaluation parameters
         eval_denoise_epoch_interval=5,
-        eval_denoise_gamma=[0.0, 0.5, 0.8],
+        eval_denoise_gamma=[0.0, 0.5, 0.75, 1.0],
         eval_denoise_mu=0.3,
         eval_denoise_eta=0.003,
         eval_denoise_num_iterations=2000,
