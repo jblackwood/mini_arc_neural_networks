@@ -882,17 +882,17 @@ def random_shift_examples(batch: torch.Tensor, device: torch.device) -> torch.Te
     rotating examples that go past the end back to the beginning.
     
     Args:
-        batch: Batch tensor of shape (batch_size, 200, d_model)
+        batch: Batch tensor of shape (batch_size, 200) with integer indices
         device: Device to perform operations on
     
     Returns:
         Shifted batch tensor of same shape
     """
-    batch_size, seq_len, d_model = batch.shape
+    batch_size, seq_len = batch.shape
     
-    # Reshape to (batch_size, 4 examples, 50 cells per example, d_model)
+    # Reshape to (batch_size, 4 examples, 50 cells per example)
     # Each example has 50 cells: input grid (25 cells) + output grid (25 cells)
-    batch_reshaped = batch.view(batch_size, 4, 50, d_model)
+    batch_reshaped = batch.view(batch_size, 4, 50)
     
     # Randomly choose shift amount for each item in batch (0, 1, 2, or 3 example shifts)
     # We use 0-3 because we have 4 examples. Shifting by 0 means no shift.
@@ -906,11 +906,11 @@ def random_shift_examples(batch: torch.Tensor, device: torch.device) -> torch.Te
         shifted_batch[i] = torch.roll(batch_reshaped[i], shifts=int(shift_amounts[i].item()), dims=0)
     
     # Reshape back to original shape
-    return shifted_batch.view(batch_size, seq_len, d_model)
+    return shifted_batch.view(batch_size, seq_len)
 
 
 def compute_loss_for_batch(
-    model: nn.Module,
+    model: TransformerModel,
     batch: torch.Tensor,
     device: torch.device,
 ) -> torch.Tensor:
@@ -918,13 +918,16 @@ def compute_loss_for_batch(
 
     Args:
         model: The transformer model
-        batch: Batch of one-hot encoded cell values, shape (batch_size, 200, d_model)
+        batch: Batch of integer color indices, shape (batch_size, 200)
         device: Device to compute on
 
     Returns:
         Loss tensor (scalar)
     """
-    x = batch.to(device)  # (batch_size, 200, d_model)
+    batch = batch.to(device)  # (batch_size, 200)
+    
+    # Embed the integer indices
+    x = model.color_embedding(batch)  # (batch_size, 200, d_model)
 
     # Create noisy input - corrupt all 200 tokens
     xg = x.clone()
@@ -954,7 +957,7 @@ def compute_loss_for_batch(
 
 
 def train_epoch(
-    model: nn.Module,
+    model: TransformerModel,
     train_loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
@@ -993,7 +996,7 @@ def train_epoch(
 
 
 def test_epoch(
-    model: nn.Module,
+    model: TransformerModel,
     test_loader: DataLoader,
     device: torch.device,
 ) -> float:
@@ -1277,7 +1280,7 @@ def main():
         seq_len=200,
         vocab_size=10,
         # Denoising evaluation parameters
-        eval_denoise_epoch_interval=5,
+        eval_denoise_epoch_interval=1,
         eval_denoise_gamma=[0.0, 0.5, 0.75],
         eval_denoise_mu=0.3,
         eval_denoise_eta=0.003,
