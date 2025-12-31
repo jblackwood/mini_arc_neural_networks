@@ -3,6 +3,7 @@
 import json
 import os
 import random
+import shutil
 import time
 import urllib.request
 import zipfile
@@ -200,35 +201,36 @@ def download_mini_arc(data_dir: Path) -> None:
     miniarc_zip_url = (
         "https://github.com/KSB21ST/MINI-ARC/archive/refs/heads/master.zip"
     )
-    miniarc_dataset_folder = "MINI-ARC"
-    miniarc_dataset_path = os.path.join(data_dir, miniarc_dataset_folder)
 
-    if os.path.exists(miniarc_dataset_path) and os.listdir(miniarc_dataset_path):
+    if os.path.exists(data_dir) and os.listdir(data_dir):
         print(
-            f"MINI-ARC dataset already exists in '{miniarc_dataset_path}'. Skipping download."
+            f"MINI-ARC dataset already exists in '{data_dir}'. Skipping download."
         )
     else:
         print(f"Downloading MINI-ARC from GitHub...")
 
+        # Create parent directory
+        parent_dir = os.path.dirname(data_dir)
+        os.makedirs(parent_dir, exist_ok=True)
+
         # Download the zip file
-        miniarc_zip_filename = os.path.join(data_dir, "mini-arc-master.zip")
-        os.makedirs(data_dir, exist_ok=True)
+        miniarc_zip_filename = os.path.join(parent_dir, "mini-arc-master.zip")
         urllib.request.urlretrieve(miniarc_zip_url, miniarc_zip_filename)
 
         print(f"Downloaded to: {miniarc_zip_filename}")
 
         # Extract the zip file
         with zipfile.ZipFile(miniarc_zip_filename, "r") as zip_ref:
-            zip_ref.extractall(data_dir)
+            zip_ref.extractall(parent_dir)
 
-        # Rename the extracted folder
-        extracted_folder = os.path.join(data_dir, "MINI-ARC-master")
-        os.rename(extracted_folder, miniarc_dataset_path)
+        # Rename the extracted folder to data_dir
+        extracted_folder = os.path.join(parent_dir, "MINI-ARC-master")
+        os.rename(extracted_folder, data_dir)
 
         # Remove the zip file
         os.remove(miniarc_zip_filename)
 
-        print(f"MINI-ARC dataset extracted to '{miniarc_dataset_path}' directory.")
+        print(f"MINI-ARC dataset extracted to '{data_dir}' directory.")
 
 
 # Transformation functions for grid augmentation
@@ -1284,7 +1286,7 @@ def main():
     config = Config(
         # Dataset creation parameters
         data_dir=Path("data/MINI-ARC"),
-        output_dir=Path("output/mini_arc_eqm2"),
+        output_dir=Path("output/mini_arc_eqm3"),
         test_ratio=0.2,
         random_seed=42,
         max_augmentations=500,
