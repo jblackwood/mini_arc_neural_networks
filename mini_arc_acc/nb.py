@@ -885,6 +885,8 @@ def train(config: Config):
     # Set device
     if torch.cuda.is_available():
         device = torch.device("cuda")
+        # Enable TF32 for faster matmul on Ampere+ GPUs
+        torch.set_float32_matmul_precision('high')
     elif torch.backends.mps.is_available():
         device = torch.device("mps")
     else:
@@ -924,6 +926,11 @@ def train(config: Config):
     # Count parameters
     model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model has {model_params:,} trainable parameters")
+
+    # Compile model for faster training (PyTorch 2.0+)
+    from typing import cast
+    model = cast(TransformerModel, torch.compile(model))
+    print("Model compiled for optimized execution")
 
     # Create optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
