@@ -775,6 +775,8 @@ def compute_loss_for_batch(
     d_model = model.d_model
     z = torch.zeros((batch_size, seq_len, d_model), device=device)
 
+    loss = torch.tensor(0.0, device=device)  # Initialize loss
+
     for _ in range(num_iterations):
         # Forward pass
         output, z = model(
