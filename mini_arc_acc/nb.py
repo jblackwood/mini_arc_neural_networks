@@ -43,6 +43,9 @@ class Config:
     seq_len: int
     vocab_size: int
 
+    # Noising parameters
+    last_grid_noising_epoch_multiple: int
+
     # Optional model loading
     load_model_path: Optional[str] = None
 
@@ -741,40 +744,24 @@ def random_shift_examples(batch: torch.Tensor, device: torch.device) -> torch.Te
     return shifted_batch.view(batch_size, seq_len)
 
 
-def compute_loss_for_batch(
-    model: TransformerModel,
-    batch: torch.Tensor,
-    optimizer: torch.optim.Optimizer | None,
-    device: torch.device,
-    num_iterations: int,
-) -> torch.Tensor:
-    """Compute loss for a single batch using iterative denoising.
-
-    Performs multiple iterations of forward pass, loss computation, and optimization.
-    Each iteration refines the latent representation while training the model
-    to denoise the noisy input (randomly replacing 0-25 tokens with random values 0-9).
-
+def apply_random_noising(x: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Apply random noising by replacing 0-25 tokens with random values 0-9.
+    
     Args:
-        model: The transformer model
-        batch: Batch of integer cell values, shape (batch_size, 200)
-        optimizer: Optimizer for updating model parameters (None for evaluation)
+        x: Input tensor of shape (batch_size, seq_len)
         device: Device to compute on
-        num_iterations: Number of iterations to perform
-
+    
     Returns:
-        Loss tensor (scalar) from the final iteration
+        Noisy version of x with randomly replaced tokens
     """
-    x = batch.to(device)  # (batch_size, 200)
-
-    # Create noisy input by randomly replacing 0-25 tokens with random values
     x_noisy = x.clone()
     batch_size, seq_len = x.shape
     
     # For each example in the batch, pick a random gamma between 0-25
-    gamma = torch.randint(0, 26, (batch_size,), device=device)  # (batch_size,)
+    gamma = torch.randint(0, 26, (batch_size,), device=device)
     
     # Generate random noise values between 0-9 for all positions
-    noise = torch.randint(0, 10, (batch_size, seq_len), device=device)  # (batch_size, 200)
+    noise = torch.randint(0, 10, (batch_size, seq_len), device=device)
     
     # For each example, randomly select gamma indices to replace
     for i in range(batch_size):
@@ -782,35 +769,22 @@ def compute_loss_for_batch(
             # Randomly select gamma[i] indices to replace
             indices = torch.randperm(seq_len, device=device)[:gamma[i]]
             x_noisy[i, indices] = noise[i, indices]
+    
+    return x_noisy
 
-    # Create initial latent vector of zeros
-    d_model = model.d_model
-    z = torch.zeros((batch_size, seq_len, d_model), device=device)
 
-    loss = torch.tensor(0.0, device=device)  # Initialize loss
-
-    for _ in range(num_iterations):
-        # Forward pass
-        output, z = model(
-            x_noisy, z
-        )  # (batch_size, 200, vocab_size), (batch_size, 200, d_model)
-
-        # Compute cross-entropy loss between predicted output and original input
-        # Reshape output to (batch_size * 200, vocab_size) and target to (batch_size * 200)
-        loss = nn.functional.cross_entropy(
-            output.view(-1, output.size(-1)),  # (batch_size * 200, vocab_size)
-            x.view(-1),  # (batch_size * 200)
-        )
-        # Backpropagation and optimization step
-        if optimizer is not None:
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-        # Detach z to prevent gradient accumulation
-        z = z.detach()
-
-    return loss
+def apply_last_grid_noising(x: torch.Tensor) -> torch.Tensor:
+    """Apply noising by masking the last 25 tokens (last output grid) with 0.
+    
+    Args:
+        x: Input tensor of shape (batch_size, seq_len)
+    
+    Returns:
+        Noisy version of x with last 25 tokens set to 0
+    """
+    x_noisy = x.clone()
+    x_noisy[:, -25:] = 0  # Mask the last 25 tokens
+    return x_noisy
 
 
 def train_epoch(
@@ -819,11 +793,14 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     num_iterations: int,
+    epoch: int,
+    last_grid_noising_epoch_multiple: int,
 ) -> float:
     """Train for one epoch.
 
-    Each batch undergoes multiple iterations of optimization via compute_loss_for_batch,
-    meaning the model is updated multiple times per batch.
+    Each batch undergoes multiple iterations of optimization.
+    Uses random noising for most epochs, and last grid noising for epochs
+    that are multiples of last_grid_noising_epoch_multiple.
 
     Args:
         model: The transformer model
@@ -831,6 +808,8 @@ def train_epoch(
         optimizer: Optimizer
         device: Device to train on
         num_iterations: Number of iterations per batch
+        epoch: Current epoch number (0-indexed)
+        last_grid_noising_epoch_multiple: Use last grid noising every N epochs
 
     Returns:
         Average training loss across all batches (final iteration loss per batch)
@@ -838,14 +817,47 @@ def train_epoch(
     model.train()
     total_loss = 0.0
     num_batches = 0
+    
+    # Determine which noising method to use
+    use_last_grid_noising = (epoch % last_grid_noising_epoch_multiple == 0)
 
     for batch in train_loader:
         # Randomly shift examples in each task
         batch = random_shift_examples(batch, device)
-
-        # Compute loss
-        loss = compute_loss_for_batch(model, batch, optimizer, device, num_iterations)
-
+        
+        x = batch.to(device)  # (batch_size, 200)
+        
+        # Apply noising based on epoch
+        if use_last_grid_noising:
+            x_noisy = apply_last_grid_noising(x)
+        else:
+            x_noisy = apply_random_noising(x, device)
+        
+        # Create initial latent vector of zeros
+        batch_size, seq_len = x.shape
+        d_model = model.d_model
+        z = torch.zeros((batch_size, seq_len, d_model), device=device)
+        
+        loss = torch.tensor(0.0, device=device)  # Initialize loss
+        
+        for _ in range(num_iterations):
+            # Forward pass
+            output, z = model(x_noisy, z)  # (batch_size, 200, vocab_size), (batch_size, 200, d_model)
+            
+            # Compute cross-entropy loss between predicted output and original input
+            loss = nn.functional.cross_entropy(
+                output.view(-1, output.size(-1)),  # (batch_size * 200, vocab_size)
+                x.view(-1),  # (batch_size * 200)
+            )
+            
+            # Backpropagation and optimization step
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            # Detach z to prevent gradient accumulation
+            z = z.detach()
+        
         total_loss += loss.item()
         num_batches += 1
 
@@ -861,7 +873,7 @@ def test_epoch(
     """Evaluate on test set.
 
     Each batch undergoes multiple iterations of forward passes (without optimization)
-    via compute_loss_for_batch to refine the latent representation.
+    to refine the latent representation. Always uses last grid noising (masking last 25 tokens).
 
     Args:
         model: The transformer model
@@ -878,9 +890,30 @@ def test_epoch(
 
     with torch.no_grad():
         for batch in test_loader:
-            # Compute loss
-            loss = compute_loss_for_batch(model, batch, None, device, num_iterations)
+            x = batch.to(device)  # (batch_size, 200)
+            
+            # Apply last grid noising (always for test)
+            x_noisy = apply_last_grid_noising(x)
+            
+            # Create initial latent vector of zeros
+            batch_size, seq_len = x.shape
+            d_model = model.d_model
+            z = torch.zeros((batch_size, seq_len, d_model), device=device)
+            
+            output = None  # Initialize output
+            for _ in range(num_iterations):
+                # Forward pass
+                output, z = model(x_noisy, z)  # (batch_size, 200, vocab_size), (batch_size, 200, d_model)
+                
+                # Detach z to prevent gradient accumulation
+                z = z.detach()
 
+            # Compute cross-entropy loss between predicted output and original input
+            assert output is not None, "Output should not be None"
+            loss = nn.functional.cross_entropy(
+                output.view(-1, output.size(-1)),  # (batch_size * 200, vocab_size)
+                x.view(-1),  # (batch_size * 200)
+            )
             total_loss += loss.item()
             num_batches += 1
 
@@ -979,11 +1012,22 @@ def train(config: Config):
 
         # Train
         train_loss = train_epoch(
-            model, train_loader, optimizer, device, config.num_iterations
+            model=model,
+            train_loader=train_loader,
+            optimizer=optimizer,
+            device=device,
+            num_iterations=config.num_iterations,
+            epoch=epoch,
+            last_grid_noising_epoch_multiple=config.last_grid_noising_epoch_multiple,
         )
 
         # Test
-        test_loss = test_epoch(model, test_loader, device, config.num_iterations)
+        test_loss = test_epoch(
+            model=model,
+            test_loader=test_loader,
+            device=device,
+            num_iterations=config.num_iterations,
+        )
 
         # Calculate epoch time
         epoch_time = time.time() - epoch_start_time
@@ -1061,7 +1105,7 @@ def main():
         d_model=128,
         nhead=4,
         num_layers=3,
-        dim_feedforward=512,
+        dim_feedforward=24,
         dropout=0.1,
         # Data parameters
         seq_len=200,
@@ -1071,6 +1115,8 @@ def main():
         batch_size=128,
         learning_rate=1e-3,
         num_iterations=10,
+        # Noising parameters
+        last_grid_noising_epoch_multiple=4,
         # Optional: Load existing model to continue training
         load_model_path=None,
     )
