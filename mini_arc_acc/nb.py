@@ -886,7 +886,7 @@ def train(config: Config):
     if torch.cuda.is_available():
         device = torch.device("cuda")
         # Enable TF32 for faster matmul on Ampere+ GPUs
-        torch.set_float32_matmul_precision('high')
+        torch.set_float32_matmul_precision("high")
     elif torch.backends.mps.is_available():
         device = torch.device("mps")
     else:
@@ -929,6 +929,7 @@ def train(config: Config):
 
     # Compile model for faster training (PyTorch 2.0+)
     from typing import cast
+
     model = cast(TransformerModel, torch.compile(model))
     print("Model compiled for optimized execution")
 
@@ -1045,10 +1046,10 @@ def main():
         random_seed=42,
         max_augmentations=500,
         # Model parameters
-        d_model=32,
+        d_model=128,
         nhead=4,
         num_layers=3,
-        dim_feedforward=64,
+        dim_feedforward=512,
         dropout=0.1,
         # Data parameters
         seq_len=200,
