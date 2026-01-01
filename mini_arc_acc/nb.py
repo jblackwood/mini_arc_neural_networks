@@ -1046,8 +1046,8 @@ def main():
         vocab_size=10,
         # Training parameters
         num_epochs=10,
-        batch_size=512,
-        learning_rate=4e-3,
+        batch_size=128,
+        learning_rate=1e-3,
         num_iterations=10,
         # Optional: Load existing model to continue training
         load_model_path=None,
