@@ -43,7 +43,7 @@ class Config:
 
     # Data parameters
     seq_len: int
-    num_cell_values: int
+    vocab_size: int
 
     # Denoising evaluation parameters
     eval_denoise_epoch_interval: int
@@ -555,42 +555,36 @@ def create_dataset(
 
 
 class ARCTaskDataset(Dataset):
-    """PyTorch dataset that loads ARC tasks and returns centered one-hot encoded cell values.
+    """PyTorch dataset that loads ARC tasks and returns one-hot encoded cell values.
 
-    Each task returns a (200, d_model) tensor:
+    Each task returns a (200, 10) tensor:
     - 4 examples (train + test combined)
     - Each example has input and output grids (2 grids per example)
     - Each grid is 5x5 = 25 cells
     - Total: 4 examples * 2 grids * 25 cells = 200 cells
-    - Each cell is one-hot encoded with 10 values (0-9) padded to d_model
-    - One-hot vectors are centered to have mean 0 (subtract 1/d_model from all dims)
+    - Each cell is one-hot encoded with 10 values (0-9)
     """
 
-    def __init__(self, folder_path: str, d_model: int):
+    def __init__(self, folder_path: str):
         """Initialize the dataset.
 
         Args:
             folder_path: Path to folder containing task JSON files
-            d_model: Model dimension for one-hot encoding (must be >= 10)
         """
-        if d_model < 10:
-            raise ValueError(f"d_model must be >= 10, got {d_model}")
         self.folder_path = Path(folder_path)
         self.task_files = sorted(self.folder_path.glob("*.json"))
-        self.d_model = d_model
 
     def __len__(self) -> int:
         return len(self.task_files)
 
     def __getitem__(self, idx: int) -> torch.Tensor:
-        """Get a task as a (200, d_model) tensor of centered one-hot encoded cell values.
+        """Get a task as a (200, 10) tensor of one-hot encoded cell values.
 
         Args:
             idx: Index of the task
 
         Returns:
-            Tensor of shape (200, d_model) containing centered one-hot encoded cell values.
-            Each vector has mean 0 across all d_model dimensions.
+            Tensor of shape (200, 10) containing one-hot encoded cell values.
         """
         task_file = self.task_files[idx]
         task_data = parse_arc_json(task_file)
@@ -630,14 +624,9 @@ class ARCTaskDataset(Dataset):
 
         # Convert to one-hot encoding
         # all_cells should have 200 elements (4 examples * 2 grids * 25 cells)
-        one_hot = torch.zeros(200, self.d_model, dtype=torch.float32)
+        one_hot = torch.zeros(200, 10, dtype=torch.float32)
         for i, cell_value in enumerate(all_cells):
             one_hot[i, cell_value] = 1.0
-
-        # Center the one-hot vectors to have mean 0
-        # Each vector has one 1.0 and (d_model-1) 0.0s, so mean is 1/d_model
-        # We subtract 1/d_model from all dimensions to center around 0
-        one_hot -= 1.0 / self.d_model
 
         return one_hot
 
@@ -652,6 +641,7 @@ class TransformerModel(nn.Module):
         num_layers: int,
         dim_feedforward: int,
         seq_len: int,
+        vocab_size: int,
         dropout: float,
     ):
         """Initialize the transformer model.
@@ -662,9 +652,13 @@ class TransformerModel(nn.Module):
             num_layers: Number of transformer layers
             dim_feedforward: Dimension of feedforward network
             seq_len: Sequence length (200 positions)
+            vocab_size: Number of possible cell values (10 for ARC)
             dropout: Dropout rate
         """
         super().__init__()
+
+        # Linear input projection (vocab_size -> d_model)
+        self.input_proj = nn.Linear(vocab_size, d_model)
 
         # Positional embedding (learnable)
         self.pos_embedding = nn.Parameter(torch.randn(seq_len, d_model))
@@ -679,18 +673,21 @@ class TransformerModel(nn.Module):
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
 
-        # Linear output projection (d_model -> d_model)
-        self.output_proj = nn.Linear(d_model, d_model)
+        # Linear output projection (d_model -> vocab_size)
+        self.output_proj = nn.Linear(d_model, vocab_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass.
 
         Args:
-            x: Input tensor of shape (batch_size, seq_len, d_model) - already embedded
+            x: Input tensor of shape (batch_size, seq_len, vocab_size) - one-hot encoded
 
         Returns:
-            Output tensor of shape (batch_size, seq_len, d_model)
+            Output tensor of shape (batch_size, seq_len, vocab_size)
         """
+        # Apply input projection
+        x = self.input_proj(x)  # (batch_size, seq_len, d_model)
+
         # Add positional embedding
         x = x + self.pos_embedding.unsqueeze(0)  # (batch_size, seq_len, d_model)
 
@@ -698,22 +695,9 @@ class TransformerModel(nn.Module):
         x = self.transformer_encoder(x)  # (batch_size, seq_len, d_model)
 
         # Apply output projection
-        x = self.output_proj(x)  # (batch_size, seq_len, d_model)
+        x = self.output_proj(x)  # (batch_size, seq_len, vocab_size)
 
         return x
-
-
-def decode_one_hot(vector: torch.Tensor) -> int:
-    """Decode a one-hot encoded vector to its cell value.
-
-    Args:
-        vector: One-hot encoded vector of shape (d_model,)
-
-    Returns:
-        Cell value (0-9) corresponding to the argmax of the first 10 dimensions
-    """
-    # Take argmax of first 10 dimensions (cell values 0-9)
-    return int(torch.argmax(vector[:10]).item())
 
 
 def optimize_output_grid(
@@ -727,7 +711,7 @@ def optimize_output_grid(
 
     Args:
         model: The transformer model to use for computing gradients
-        x_input: Input tensor of shape (batch_size, 200, d_model)
+        x_input: Input tensor of shape (batch_size, 200, vocab_size)
         mu: Momentum parameter for gradient computation
         eta: Learning rate for optimization
         num_iterations: Number of optimization iterations
@@ -782,15 +766,16 @@ def optimize_output_grid(
     )
 
 
-def decode_grids(tokens: torch.Tensor) -> torch.Tensor:
+def decode_grids(tokens: torch.Tensor, vocab_size: int) -> torch.Tensor:
     """Decode grid tokens to integer values using vectorized operations.
 
     Args:
-        tokens: Tensor of shape (batch_size, num_tokens, d_model) containing grid tokens
+        tokens: Tensor of shape (batch_size, num_tokens, vocab_size) containing grid tokens
                 where num_tokens should be a multiple of 25 (for 5x5 grids)
+        vocab_size: Number of possible cell values
 
     Returns:
-        Tensor of shape (batch_size, num_grids, 5, 5) with decoded integer values (0-9)
+        Tensor of shape (batch_size, num_grids, 5, 5) with decoded integer values
         where num_grids = num_tokens // 25
     """
     batch_size = tokens.shape[0]
@@ -802,9 +787,9 @@ def decode_grids(tokens: torch.Tensor) -> torch.Tensor:
 
     num_grids = num_tokens // 25
 
-    # Take argmax of first 10 dimensions for all tokens at once
+    # Take argmax of all dimensions for all tokens at once
     # Shape: (batch_size, num_tokens)
-    decoded_values = torch.argmax(tokens[:, :, :10], dim=2)
+    decoded_values = torch.argmax(tokens[:, :, :vocab_size], dim=2)
     
     # Reshape to (batch_size, num_grids, 5, 5)
     decoded_grids = decoded_values.view(batch_size, num_grids, 5, 5)
@@ -815,6 +800,7 @@ def decode_grids(tokens: torch.Tensor) -> torch.Tensor:
 def evaluate_denoising_accuracy(
     model,
     x_clean: torch.Tensor,
+    vocab_size: int,
     gamma: float,
     mu: float,
     eta: float,
@@ -824,7 +810,8 @@ def evaluate_denoising_accuracy(
 
     Args:
         model: The transformer model to use for computing gradients
-        x_clean: Clean input tensor of shape (batch_size, 200, d_model)
+        x_clean: Clean input tensor of shape (batch_size, 200, vocab_size)
+        vocab_size: Number of possible cell values
         gamma: Noise level parameter (0-1) for corrupting the output grid
         mu: Momentum parameter for gradient computation
         eta: Learning rate for optimization
@@ -851,13 +838,13 @@ def evaluate_denoising_accuracy(
     # Decode the optimized output grids
     assert opt_result.optimized_output_tokens is not None
     predicted_grids = decode_grids(
-        opt_result.optimized_output_tokens
+        opt_result.optimized_output_tokens, vocab_size
     )  # Shape: (batch_size, 1, 5, 5)
     predicted_grids = predicted_grids[:, 0, :, :]  # Shape: (batch_size, 5, 5)
 
     # Decode the true output grids (last 25 tokens)
-    true_output_tokens = x_clean[:, -25:, :]  # Shape: (batch_size, 25, d_model)
-    true_grids = decode_grids(true_output_tokens)  # Shape: (batch_size, 1, 5, 5)
+    true_output_tokens = x_clean[:, -25:, :]  # Shape: (batch_size, 25, vocab_size)
+    true_grids = decode_grids(true_output_tokens, vocab_size)  # Shape: (batch_size, 1, 5, 5)
     true_grids = true_grids[:, 0, :, :]  # Shape: (batch_size, 5, 5)
 
     # Calculate accuracy for each task in the batch (vectorized)
@@ -881,17 +868,17 @@ def random_shift_examples(batch: torch.Tensor, device: torch.device) -> torch.Te
     rotating examples that go past the end back to the beginning.
     
     Args:
-        batch: Batch tensor of shape (batch_size, 200, d_model)
+        batch: Batch tensor of shape (batch_size, 200, vocab_size)
         device: Device to perform operations on
     
     Returns:
         Shifted batch tensor of same shape
     """
-    batch_size, seq_len, d_model = batch.shape
+    batch_size, seq_len, vocab_size = batch.shape
     
-    # Reshape to (batch_size, 4 examples, 50 cells per example, d_model)
+    # Reshape to (batch_size, 4 examples, 50 cells per example, vocab_size)
     # Each example has 50 cells: input grid (25 cells) + output grid (25 cells)
-    batch_reshaped = batch.view(batch_size, 4, 50, d_model)
+    batch_reshaped = batch.view(batch_size, 4, 50, vocab_size)
     
     # Randomly choose shift amount for each item in batch (0, 1, 2, or 3 example shifts)
     # We use 0-3 because we have 4 examples. Shifting by 0 means no shift.
@@ -905,7 +892,7 @@ def random_shift_examples(batch: torch.Tensor, device: torch.device) -> torch.Te
         shifted_batch[i] = torch.roll(batch_reshaped[i], shifts=int(shift_amounts[i].item()), dims=0)
     
     # Reshape back to original shape
-    return shifted_batch.view(batch_size, seq_len, d_model)
+    return shifted_batch.view(batch_size, seq_len, vocab_size)
 
 
 def compute_loss_for_batch(
@@ -917,22 +904,22 @@ def compute_loss_for_batch(
 
     Args:
         model: The transformer model
-        batch: Batch of one-hot encoded cell values, shape (batch_size, 200, d_model)
+        batch: Batch of one-hot encoded cell values, shape (batch_size, 200, vocab_size)
         device: Device to compute on
 
     Returns:
         Loss tensor (scalar)
     """
-    x = batch.to(device)  # (batch_size, 200, d_model)
+    x = batch.to(device)  # (batch_size, 200, vocab_size)
 
-    # Create noisy input - corrupt all 200 tokens
+    # Create noisy input - corrupt all 200 tokens at the one-hot vector level
     xg = x.clone()
 
-    # Create random gaussian noise for all tokens
-    eps = torch.randn_like(xg)
+    # Create random gaussian noise for all tokens at the one-hot vector level
+    eps = torch.randn_like(xg)  # (batch_size, 200, vocab_size)
 
     # Sample random gamma uniformly between 0 and 1
-    # Shape: (batch_size, 1, 1) - broadcasts across all 200 positions and d_model
+    # Shape: (batch_size, 1, 1) - broadcasts across all 200 positions and vocab_size
     gamma = torch.rand(x.size(0), 1, 1, device=device)
 
     # Create noisy input for all tokens
@@ -944,7 +931,7 @@ def compute_loss_for_batch(
     target = (eps - x) * c_gamma
 
     # Forward pass
-    output = model(xg)
+    output = model(xg)  # (batch_size, 200, vocab_size)
 
     # Compute loss on all tokens
     loss = ((output - target) ** 2).mean()
@@ -1038,8 +1025,8 @@ def train(config: Config):
     print(f"Using device: {device}")
 
     # Create datasets
-    train_dataset = ARCTaskDataset(config.train_data_dir, d_model=config.d_model)
-    test_dataset = ARCTaskDataset(config.test_data_dir, d_model=config.d_model)
+    train_dataset = ARCTaskDataset(config.train_data_dir)
+    test_dataset = ARCTaskDataset(config.test_data_dir)
 
     print(f"Train dataset size: {len(train_dataset)}")
     print(f"Test dataset size: {len(test_dataset)}")
@@ -1063,6 +1050,7 @@ def train(config: Config):
         num_layers=config.num_layers,
         dim_feedforward=config.dim_feedforward,
         seq_len=config.seq_len,
+        vocab_size=config.vocab_size,
         dropout=config.dropout,
     ).to(device)
 
@@ -1159,6 +1147,7 @@ def train(config: Config):
                     train_result = evaluate_denoising_accuracy(
                         model=model,
                         x_clean=train_batch,
+                        vocab_size=config.vocab_size,
                         gamma=gamma_val,
                         mu=config.eval_denoise_mu,
                         eta=config.eval_denoise_eta,
@@ -1177,6 +1166,7 @@ def train(config: Config):
                     test_result = evaluate_denoising_accuracy(
                         model=model,
                         x_clean=test_batch,
+                        vocab_size=config.vocab_size,
                         gamma=gamma_val,
                         mu=config.eval_denoise_mu,
                         eta=config.eval_denoise_eta,
@@ -1224,7 +1214,7 @@ def train(config: Config):
                         "num_layers": config.num_layers,
                         "dim_feedforward": config.dim_feedforward,
                         "seq_len": config.seq_len,
-                        "num_cell_values": config.num_cell_values,
+                        "vocab_size": config.vocab_size,
                         "dropout": config.dropout,
                     },
                 },
@@ -1247,7 +1237,7 @@ def train(config: Config):
                 "num_layers": config.num_layers,
                 "dim_feedforward": config.dim_feedforward,
                 "seq_len": config.seq_len,
-                "num_cell_values": config.num_cell_values,
+                "vocab_size": config.vocab_size,
                 "dropout": config.dropout,
             },
         },
@@ -1269,13 +1259,13 @@ def main():
         d_model=128,
         nhead=4,
         num_layers=3,
-        dim_feedforward=512,
+        dim_feedforward=64,
         dropout=0.1,
         # Data parameters
         seq_len=200,
-        num_cell_values=10,
+        vocab_size=10,
         # Denoising evaluation parameters
-        eval_denoise_epoch_interval=5,
+        eval_denoise_epoch_interval=1,
         eval_denoise_gamma=[0.0, 0.5, 0.75],
         eval_denoise_mu=0.3,
         eval_denoise_eta=0.003,
