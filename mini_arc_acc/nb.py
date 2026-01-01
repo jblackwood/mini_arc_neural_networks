@@ -1105,7 +1105,7 @@ def main():
         d_model=128,
         nhead=4,
         num_layers=3,
-        dim_feedforward=24,
+        dim_feedforward=512,
         dropout=0.1,
         # Data parameters
         seq_len=200,
