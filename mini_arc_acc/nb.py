@@ -4,12 +4,11 @@ import random
 import time
 import urllib.request
 import zipfile
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Set, Tuple
 
-import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
@@ -38,6 +37,7 @@ class Config:
     batch_size: int
     num_epochs: int
     learning_rate: float
+    num_iterations: int
 
     # Data parameters
     seq_len: int
@@ -746,10 +746,11 @@ def compute_loss_for_batch(
     batch: torch.Tensor,
     optimizer: torch.optim.Optimizer | None,
     device: torch.device,
+    num_iterations: int,
 ) -> torch.Tensor:
     """Compute loss for a single batch using iterative denoising.
 
-    Performs 10 iterations of forward pass, loss computation, and optimization.
+    Performs multiple iterations of forward pass, loss computation, and optimization.
     Each iteration refines the latent representation while training the model
     to denoise the masked input (last 25 tokens set to 0).
 
@@ -758,12 +759,11 @@ def compute_loss_for_batch(
         batch: Batch of integer cell values, shape (batch_size, 200)
         optimizer: Optimizer for updating model parameters (None for evaluation)
         device: Device to compute on
+        num_iterations: Number of iterations to perform
 
     Returns:
         Loss tensor (scalar) from the final iteration
     """
-    NUM_ITERATIONS = 10
-
     x = batch.to(device)  # (batch_size, 200)
 
     # Create noisy input by setting the last 25 tokens to 0
@@ -775,7 +775,7 @@ def compute_loss_for_batch(
     d_model = model.d_model
     z = torch.zeros((batch_size, seq_len, d_model), device=device)
 
-    for _ in range(NUM_ITERATIONS):
+    for _ in range(num_iterations):
         # Forward pass
         output, z = model(
             x_noisy, z
@@ -804,17 +804,19 @@ def train_epoch(
     train_loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    num_iterations: int,
 ) -> float:
     """Train for one epoch.
 
-    Each batch undergoes 10 iterations of optimization via compute_loss_for_batch,
-    meaning the model is updated 10 times per batch.
+    Each batch undergoes multiple iterations of optimization via compute_loss_for_batch,
+    meaning the model is updated multiple times per batch.
 
     Args:
         model: The transformer model
         train_loader: Training data loader
         optimizer: Optimizer
         device: Device to train on
+        num_iterations: Number of iterations per batch
 
     Returns:
         Average training loss across all batches (final iteration loss per batch)
@@ -828,7 +830,7 @@ def train_epoch(
         batch = random_shift_examples(batch, device)
 
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, optimizer, device)
+        loss = compute_loss_for_batch(model, batch, optimizer, device, num_iterations)
 
         total_loss += loss.item()
         num_batches += 1
@@ -840,16 +842,18 @@ def test_epoch(
     model: TransformerModel,
     test_loader: DataLoader,
     device: torch.device,
+    num_iterations: int,
 ) -> float:
     """Evaluate on test set.
 
-    Each batch undergoes 10 iterations of forward passes (without optimization)
+    Each batch undergoes multiple iterations of forward passes (without optimization)
     via compute_loss_for_batch to refine the latent representation.
 
     Args:
         model: The transformer model
         test_loader: Test data loader
         device: Device to evaluate on
+        num_iterations: Number of iterations per batch
 
     Returns:
         Average test loss across all batches (final iteration loss per batch)
@@ -861,7 +865,7 @@ def test_epoch(
     with torch.no_grad():
         for batch in test_loader:
             # Compute loss
-            loss = compute_loss_for_batch(model, batch, None, device)
+            loss = compute_loss_for_batch(model, batch, None, device, num_iterations)
 
             total_loss += loss.item()
             num_batches += 1
@@ -952,10 +956,12 @@ def train(config: Config):
         epoch_start_time = time.time()
 
         # Train
-        train_loss = train_epoch(model, train_loader, optimizer, device)
+        train_loss = train_epoch(
+            model, train_loader, optimizer, device, config.num_iterations
+        )
 
         # Test
-        test_loss = test_epoch(model, test_loader, device)
+        test_loss = test_epoch(model, test_loader, device, config.num_iterations)
 
         # Calculate epoch time
         epoch_time = time.time() - epoch_start_time
@@ -1040,8 +1046,9 @@ def main():
         vocab_size=10,
         # Training parameters
         num_epochs=10,
-        batch_size=128,
-        learning_rate=1e-3,
+        batch_size=512,
+        learning_rate=4e-3,
+        num_iterations=10,
         # Optional: Load existing model to continue training
         load_model_path=None,
     )
