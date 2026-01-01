@@ -93,23 +93,6 @@ class ARCTask:
     color_permutation: Optional[Dict[int, int]] = None
 
 
-@dataclass
-class DenoisingResult:
-    """Result from denoising evaluation.
-
-    Attributes:
-        accuracies: Optional tensor of shape (batch_size,) with accuracy for each task
-        predicted_grids: Optional tensor of shape (batch_size, 5, 5) with predicted output grids
-        optimized_output_tokens: Optional tensor of shape (batch_size, 25, d_model) with optimized output tokens
-        best_grad_norm: Optional tensor of shape (batch_size,) with best gradient norm for each task
-    """
-
-    accuracies: Optional[torch.Tensor] = None
-    predicted_grids: Optional[torch.Tensor] = None
-    optimized_output_tokens: Optional[torch.Tensor] = None
-    best_grad_norm: Optional[torch.Tensor] = None
-
-
 def parse_arc_json(file_path: Path) -> ARCTask:
     """Parse an ARC JSON file into an ARCTask dataclass.
 
