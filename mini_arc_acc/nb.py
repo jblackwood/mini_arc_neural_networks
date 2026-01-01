@@ -752,7 +752,7 @@ def compute_loss_for_batch(
 
     Performs multiple iterations of forward pass, loss computation, and optimization.
     Each iteration refines the latent representation while training the model
-    to denoise the masked input (last 25 tokens set to 0).
+    to denoise the noisy input (randomly replacing 0-25 tokens with random values 0-9).
 
     Args:
         model: The transformer model
@@ -766,12 +766,24 @@ def compute_loss_for_batch(
     """
     x = batch.to(device)  # (batch_size, 200)
 
-    # Create noisy input by setting the last 25 tokens to 0
+    # Create noisy input by randomly replacing 0-25 tokens with random values
     x_noisy = x.clone()
-    x_noisy[:, -25:] = 0  # Mask the last 25 tokens (last output grid)
+    batch_size, seq_len = x.shape
+    
+    # For each example in the batch, pick a random gamma between 0-25
+    gamma = torch.randint(0, 26, (batch_size,), device=device)  # (batch_size,)
+    
+    # Generate random noise values between 0-9 for all positions
+    noise = torch.randint(0, 10, (batch_size, seq_len), device=device)  # (batch_size, 200)
+    
+    # For each example, randomly select gamma indices to replace
+    for i in range(batch_size):
+        if gamma[i] > 0:
+            # Randomly select gamma[i] indices to replace
+            indices = torch.randperm(seq_len, device=device)[:gamma[i]]
+            x_noisy[i, indices] = noise[i, indices]
 
     # Create initial latent vector of zeros
-    batch_size, seq_len = x.shape
     d_model = model.d_model
     z = torch.zeros((batch_size, seq_len, d_model), device=device)
 
