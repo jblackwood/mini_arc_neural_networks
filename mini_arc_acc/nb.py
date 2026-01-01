@@ -44,7 +44,7 @@ class Config:
     vocab_size: int
 
     # Noising parameters
-    last_grid_noising_epoch_multiple: int
+    last_grid_masking_ratio: float
 
     # Optional model loading
     load_model_path: Optional[str] = None
@@ -793,14 +793,13 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     num_iterations: int,
-    epoch: int,
-    last_grid_noising_epoch_multiple: int,
+    last_grid_masking_ratio: float,
 ) -> float:
     """Train for one epoch.
 
     Each batch undergoes multiple iterations of optimization.
-    Uses random noising for most epochs, and last grid noising for epochs
-    that are multiples of last_grid_noising_epoch_multiple.
+    Within each batch, approximately last_grid_masking_ratio of samples use
+    last grid noising, and the rest use random noising.
 
     Args:
         model: The transformer model
@@ -808,8 +807,7 @@ def train_epoch(
         optimizer: Optimizer
         device: Device to train on
         num_iterations: Number of iterations per batch
-        epoch: Current epoch number (0-indexed)
-        last_grid_noising_epoch_multiple: Use last grid noising every N epochs
+        last_grid_masking_ratio: Fraction of samples to use last grid masking (e.g., 0.25)
 
     Returns:
         Average training loss across all batches (final iteration loss per batch)
@@ -817,24 +815,29 @@ def train_epoch(
     model.train()
     total_loss = 0.0
     num_batches = 0
-    
-    # Determine which noising method to use
-    use_last_grid_noising = (epoch % last_grid_noising_epoch_multiple == 0)
 
     for batch in train_loader:
         # Randomly shift examples in each task
         batch = random_shift_examples(batch, device)
         
         x = batch.to(device)  # (batch_size, 200)
+        batch_size, seq_len = x.shape
         
-        # Apply noising based on epoch
-        if use_last_grid_noising:
-            x_noisy = apply_last_grid_noising(x)
-        else:
-            x_noisy = apply_random_noising(x, device)
+        # Randomly select which samples get last grid masking vs random noising
+        # Generate random values [0, 1) for each sample
+        random_vals = torch.rand(batch_size, device=device)
+        use_last_grid_mask = random_vals < last_grid_masking_ratio  # (batch_size,)
+        
+        # Apply both noising methods
+        x_noisy_random = apply_random_noising(x, device)
+        x_noisy_last_grid = apply_last_grid_noising(x)
+        
+        # Select the appropriate noising for each sample
+        # Expand use_last_grid_mask to match dimensions: (batch_size, 1) -> (batch_size, seq_len)
+        mask_expanded = use_last_grid_mask.unsqueeze(1).expand(-1, seq_len)
+        x_noisy = torch.where(mask_expanded, x_noisy_last_grid, x_noisy_random)
         
         # Create initial latent vector of zeros
-        batch_size, seq_len = x.shape
         d_model = model.d_model
         z = torch.zeros((batch_size, seq_len, d_model), device=device)
         
@@ -1017,8 +1020,7 @@ def train(config: Config):
             optimizer=optimizer,
             device=device,
             num_iterations=config.num_iterations,
-            epoch=epoch,
-            last_grid_noising_epoch_multiple=config.last_grid_noising_epoch_multiple,
+            last_grid_masking_ratio=config.last_grid_masking_ratio,
         )
 
         # Test
@@ -1116,7 +1118,7 @@ def main():
         learning_rate=1e-3,
         num_iterations=10,
         # Noising parameters
-        last_grid_noising_epoch_multiple=4,
+        last_grid_masking_ratio=0.25,
         # Optional: Load existing model to continue training
         load_model_path=None,
     )
