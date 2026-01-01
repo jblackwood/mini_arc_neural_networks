@@ -1,5 +1,3 @@
-"""Core data structures for ARC datasets."""
-
 import json
 import os
 import random
