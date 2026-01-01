@@ -1256,7 +1256,7 @@ def main():
         random_seed=42,
         max_augmentations=500,
         # Model parameters
-        d_model=128,
+        d_model=32,
         nhead=4,
         num_layers=3,
         dim_feedforward=64,
@@ -1266,7 +1266,7 @@ def main():
         vocab_size=10,
         # Denoising evaluation parameters
         eval_denoise_epoch_interval=1,
-        eval_denoise_gamma=[0.0, 0.5, 0.75],
+        eval_denoise_gamma=[0.0, 0.5, 0.75, 1.0],
         eval_denoise_mu=0.3,
         eval_denoise_eta=0.003,
         eval_denoise_num_iterations=2000,
