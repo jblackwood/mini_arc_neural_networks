@@ -744,46 +744,43 @@ def random_shift_examples(batch: torch.Tensor, device: torch.device) -> torch.Te
     return shifted_batch.view(batch_size, seq_len)
 
 
-def apply_random_noising(x: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """Apply random noising by replacing 0-25 tokens with random values 0-9.
+def apply_combined_noising(x: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Apply combined noising strategy for training and testing.
+    
+    Strategy:
+    - Always mask the final 25 tokens with token 10
+    - For the first 175 tokens, randomly mask approximately 20 tokens with 10
+    - Randomly flip approximately 2 tokens to random values between 0-9
     
     Args:
         x: Input tensor of shape (batch_size, seq_len)
         device: Device to compute on
     
     Returns:
-        Noisy version of x with randomly replaced tokens
+        Noisy version of x with the combined masking and noise applied
     """
     x_noisy = x.clone()
     batch_size, seq_len = x.shape
     
-    # For each example in the batch, pick a random gamma between 0-25
-    gamma = torch.randint(0, 26, (batch_size,), device=device)
+    # Always mask the last 25 tokens with 10
+    x_noisy[:, -25:] = 10
     
-    # Generate random noise values between 0-9 for all positions
-    noise = torch.randint(0, 10, (batch_size, seq_len), device=device)
-    
-    # For each example, randomly select gamma indices to replace
+    # For the first 175 tokens, randomly mask approximately 20 tokens with 10
     for i in range(batch_size):
-        if gamma[i] > 0:
-            # Randomly select gamma[i] indices to replace
-            indices = torch.randperm(seq_len, device=device)[:gamma[i]]
-            x_noisy[i, indices] = noise[i, indices]
+        # Randomly select approximately 20 indices from the first 175 tokens
+        num_mask = torch.randint(1, 25, (1,), device=device).item()  # Randomly mask 1-24 tokens
+        mask_indices = torch.randperm(175, device=device)[:num_mask]
+        x_noisy[i, mask_indices] = 10
     
-    return x_noisy
-
-
-def apply_last_grid_noising(x: torch.Tensor) -> torch.Tensor:
-    """Apply noising by masking the last 25 tokens (last output grid) with 0.
+    # Randomly flip approximately 2 tokens to random values between 0-9
+    for i in range(batch_size):
+        # Randomly select approximately 2 indices from the first 175 tokens
+        num_flip = int(torch.randint(0, 4, (1,), device=device).item())  # ~2 tokens (0-3)
+        if num_flip > 0:
+            flip_indices = torch.randperm(175, device=device)[:num_flip]
+            random_values = torch.randint(0, 10, (num_flip,), device=device)
+            x_noisy[i, flip_indices] = random_values
     
-    Args:
-        x: Input tensor of shape (batch_size, seq_len)
-    
-    Returns:
-        Noisy version of x with last 25 tokens set to 0
-    """
-    x_noisy = x.clone()
-    x_noisy[:, -25:] = 0  # Mask the last 25 tokens
     return x_noisy
 
 
@@ -797,17 +794,16 @@ def train_epoch(
 ) -> float:
     """Train for one epoch.
 
-    Each batch undergoes multiple iterations of optimization.
-    Within each batch, approximately last_grid_masking_ratio of samples use
-    last grid noising, and the rest use random noising.
+    Each batch undergoes multiple iterations of optimization on the first 175 tokens,
+    followed by one final iteration on the last 25 tokens.
 
     Args:
         model: The transformer model
         train_loader: Training data loader
         optimizer: Optimizer
         device: Device to train on
-        num_iterations: Number of iterations per batch
-        last_grid_masking_ratio: Fraction of samples to use last grid masking (e.g., 0.25)
+        num_iterations: Number of iterations per batch on first 175 tokens
+        last_grid_masking_ratio: Unused parameter (kept for backward compatibility)
 
     Returns:
         Average training loss across all batches (final iteration loss per batch)
@@ -823,34 +819,22 @@ def train_epoch(
         x = batch.to(device)  # (batch_size, 200)
         batch_size, seq_len = x.shape
         
-        # Randomly select which samples get last grid masking vs random noising
-        # Generate random values [0, 1) for each sample
-        random_vals = torch.rand(batch_size, device=device)
-        use_last_grid_mask = random_vals < last_grid_masking_ratio  # (batch_size,)
-        
-        # Apply both noising methods
-        x_noisy_random = apply_random_noising(x, device)
-        x_noisy_last_grid = apply_last_grid_noising(x)
-        
-        # Select the appropriate noising for each sample
-        # Expand use_last_grid_mask to match dimensions: (batch_size, 1) -> (batch_size, seq_len)
-        mask_expanded = use_last_grid_mask.unsqueeze(1).expand(-1, seq_len)
-        x_noisy = torch.where(mask_expanded, x_noisy_last_grid, x_noisy_random)
+        # Apply combined noising strategy
+        x_noisy = apply_combined_noising(x, device)
         
         # Create initial latent vector of zeros
         d_model = model.d_model
         z = torch.zeros((batch_size, seq_len, d_model), device=device)
         
-        loss = torch.tensor(0.0, device=device)  # Initialize loss
-        
+        # Phase 1: num_iterations on first 175 tokens
         for _ in range(num_iterations):
             # Forward pass
             output, z = model(x_noisy, z)  # (batch_size, 200, vocab_size), (batch_size, 200, d_model)
             
-            # Compute cross-entropy loss between predicted output and original input
+            # Compute cross-entropy loss on first 175 tokens only
             loss = nn.functional.cross_entropy(
-                output.view(-1, output.size(-1)),  # (batch_size * 200, vocab_size)
-                x.view(-1),  # (batch_size * 200)
+                output[:, :175, :].reshape(-1, output.size(-1)),  # (batch_size * 175, vocab_size)
+                x[:, :175].reshape(-1),  # (batch_size * 175)
             )
             
             # Backpropagation and optimization step
@@ -861,6 +845,20 @@ def train_epoch(
             # Detach z to prevent gradient accumulation
             z = z.detach()
         
+        # Phase 2: One final iteration on last 25 tokens
+        output, z = model(x_noisy, z)  # (batch_size, 200, vocab_size), (batch_size, 200, d_model)
+        
+        # Compute cross-entropy loss on last 25 tokens only
+        loss = nn.functional.cross_entropy(
+            output[:, -25:, :].reshape(-1, output.size(-1)),  # (batch_size * 25, vocab_size)
+            x[:, -25:].reshape(-1),  # (batch_size * 25)
+        )
+        
+        # Backpropagation and optimization step
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
         total_loss += loss.item()
         num_batches += 1
 
@@ -870,55 +868,73 @@ def train_epoch(
 def test_epoch(
     model: TransformerModel,
     test_loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
     device: torch.device,
     num_iterations: int,
 ) -> float:
     """Evaluate on test set.
 
-    Each batch undergoes multiple iterations of forward passes (without optimization)
-    to refine the latent representation. Always uses last grid noising (masking last 25 tokens).
+    Each batch undergoes multiple iterations with optimization on the first 175 tokens
+    (train mode), followed by one final forward pass on the last 25 tokens for evaluation
+    (eval mode, no gradients).
 
     Args:
         model: The transformer model
         test_loader: Test data loader
+        optimizer: Optimizer
         device: Device to evaluate on
-        num_iterations: Number of iterations per batch
+        num_iterations: Number of iterations per batch on first 175 tokens
 
     Returns:
-        Average test loss across all batches (final iteration loss per batch)
+        Average test loss across all batches (loss on last 25 tokens)
     """
-    model.eval()
     total_loss = 0.0
     num_batches = 0
 
-    with torch.no_grad():
-        for batch in test_loader:
-            x = batch.to(device)  # (batch_size, 200)
+    for batch in test_loader:
+        x = batch.to(device)  # (batch_size, 200)
+        batch_size, seq_len = x.shape
+        
+        # Apply combined noising strategy
+        x_noisy = apply_combined_noising(x, device)
+        
+        # Create initial latent vector of zeros
+        d_model = model.d_model
+        z = torch.zeros((batch_size, seq_len, d_model), device=device)
+        
+        # Phase 1: num_iterations on first 175 tokens (WITH optimization)
+        model.train()
+        for _ in range(num_iterations):
+            # Forward pass
+            output, z = model(x_noisy, z)  # (batch_size, 200, vocab_size), (batch_size, 200, d_model)
             
-            # Apply last grid noising (always for test)
-            x_noisy = apply_last_grid_noising(x)
-            
-            # Create initial latent vector of zeros
-            batch_size, seq_len = x.shape
-            d_model = model.d_model
-            z = torch.zeros((batch_size, seq_len, d_model), device=device)
-            
-            output = None  # Initialize output
-            for _ in range(num_iterations):
-                # Forward pass
-                output, z = model(x_noisy, z)  # (batch_size, 200, vocab_size), (batch_size, 200, d_model)
-                
-                # Detach z to prevent gradient accumulation
-                z = z.detach()
-
-            # Compute cross-entropy loss between predicted output and original input
-            assert output is not None, "Output should not be None"
+            # Compute cross-entropy loss on first 175 tokens only
             loss = nn.functional.cross_entropy(
-                output.view(-1, output.size(-1)),  # (batch_size * 200, vocab_size)
-                x.view(-1),  # (batch_size * 200)
+                output[:, :175, :].reshape(-1, output.size(-1)),  # (batch_size * 175, vocab_size)
+                x[:, :175].reshape(-1),  # (batch_size * 175)
             )
-            total_loss += loss.item()
-            num_batches += 1
+            
+            # Backpropagation and optimization step
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            # Detach z to prevent gradient accumulation
+            z = z.detach()
+        
+        # Phase 2: One final forward pass for evaluation on last 25 tokens (NO optimization)
+        model.eval()
+        with torch.no_grad():
+            output, z = model(x_noisy, z)  # (batch_size, 200, vocab_size), (batch_size, 200, d_model)
+            
+            # Compute cross-entropy loss on last 25 tokens only
+            loss = nn.functional.cross_entropy(
+                output[:, -25:, :].reshape(-1, output.size(-1)),  # (batch_size * 25, vocab_size)
+                x[:, -25:].reshape(-1),  # (batch_size * 25)
+            )
+        
+        total_loss += loss.item()
+        num_batches += 1
 
     return total_loss / num_batches
 
@@ -1027,6 +1043,7 @@ def train(config: Config):
         test_loss = test_epoch(
             model=model,
             test_loader=test_loader,
+            optimizer=optimizer,
             device=device,
             num_iterations=config.num_iterations,
         )
@@ -1111,7 +1128,7 @@ def main():
         dropout=0.1,
         # Data parameters
         seq_len=200,
-        vocab_size=10,
+        vocab_size=11,
         # Training parameters
         num_epochs=40,
         batch_size=128,
