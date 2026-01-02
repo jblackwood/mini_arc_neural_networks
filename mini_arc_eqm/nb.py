@@ -1264,7 +1264,7 @@ def main():
     config = Config(
         # Dataset creation parameters
         data_dir=Path("data/MINI-ARC"),
-        output_dir=Path("output/mini_arc_eqm4"),
+        output_dir=Path("output/mini_arc_eqm5"),
         test_ratio=0.2,
         random_seed=42,
         max_augmentations=500,
