@@ -1113,7 +1113,7 @@ def main():
         seq_len=200,
         vocab_size=10,
         # Training parameters
-        num_epochs=10,
+        num_epochs=40,
         batch_size=128,
         learning_rate=1e-3,
         num_iterations=10,
