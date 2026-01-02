@@ -554,34 +554,36 @@ def create_dataset(
 class ARCTaskDataset(Dataset):
     """PyTorch dataset that loads ARC tasks and returns one-hot encoded cell values.
 
-    Each task returns a (200, 10) tensor:
+    Each task returns a (200, vocab_size) tensor:
     - 4 examples (train + test combined)
     - Each example has input and output grids (2 grids per example)
     - Each grid is 5x5 = 25 cells
     - Total: 4 examples * 2 grids * 25 cells = 200 cells
-    - Each cell is one-hot encoded with 10 values (0-9)
+    - Each cell is one-hot encoded with vocab_size values
     """
 
-    def __init__(self, folder_path: str):
+    def __init__(self, folder_path: str, vocab_size: int = 11):
         """Initialize the dataset.
 
         Args:
             folder_path: Path to folder containing task JSON files
+            vocab_size: Size of vocabulary (default 11: 0-9 for colors, 10 for mask token)
         """
         self.folder_path = Path(folder_path)
         self.task_files = sorted(self.folder_path.glob("*.json"))
+        self.vocab_size = vocab_size
 
     def __len__(self) -> int:
         return len(self.task_files)
 
     def __getitem__(self, idx: int) -> torch.Tensor:
-        """Get a task as a (200, 10) tensor of one-hot encoded cell values.
+        """Get a task as a (200, vocab_size) tensor of one-hot encoded cell values.
 
         Args:
             idx: Index of the task
 
         Returns:
-            Tensor of shape (200, 10) containing one-hot encoded cell values.
+            Tensor of shape (200, vocab_size) containing one-hot encoded cell values.
         """
         task_file = self.task_files[idx]
         task_data = parse_arc_json(task_file)
@@ -621,7 +623,7 @@ class ARCTaskDataset(Dataset):
 
         # Convert to one-hot encoding
         # all_cells should have 200 elements (4 examples * 2 grids * 25 cells)
-        one_hot = torch.zeros(200, 10, dtype=torch.float32)
+        one_hot = torch.zeros(200, self.vocab_size, dtype=torch.float32)
         for i, cell_value in enumerate(all_cells):
             one_hot[i, cell_value] = 1.0
 
@@ -1041,8 +1043,8 @@ def train(config: Config):
     print(f"Using device: {device}")
 
     # Create datasets
-    train_dataset = ARCTaskDataset(config.train_data_dir)
-    test_dataset = ARCTaskDataset(config.test_data_dir)
+    train_dataset = ARCTaskDataset(config.train_data_dir, vocab_size=config.vocab_size)
+    test_dataset = ARCTaskDataset(config.test_data_dir, vocab_size=config.vocab_size)
 
     print(f"Train dataset size: {len(train_dataset)}")
     print(f"Test dataset size: {len(test_dataset)}")
