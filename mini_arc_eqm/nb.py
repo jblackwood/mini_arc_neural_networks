@@ -696,6 +696,9 @@ class TransformerModel(nn.Module):
         # Apply output projection
         x = self.output_proj(x)  # (batch_size, seq_len, vocab_size)
 
+        # Apply hard tanh to clamp values between -1 and 1
+        x = torch.nn.functional.hardtanh(x, min_val=-1.0, max_val=1.0)
+
         return x
 
 
