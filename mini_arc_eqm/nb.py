@@ -45,7 +45,6 @@ class Config:
 
     # Denoising evaluation parameters
     eval_denoise_epoch_interval: int
-    eval_denoise_gamma: List[float]
     eval_denoise_mu: float
     eval_denoise_eta: float
     eval_denoise_num_iterations: int
@@ -656,7 +655,7 @@ class TransformerModel(nn.Module):
         super().__init__()
 
         # Linear input projection (vocab_size -> d_model)
-        self.input_proj = nn.Linear(vocab_size, d_model)
+        self.input_proj = nn.Linear(vocab_size, d_model, bias=False)
 
         # Positional embedding (learnable)
         self.pos_embedding = nn.Parameter(torch.randn(seq_len, d_model))
@@ -799,7 +798,6 @@ def evaluate_denoising_accuracy(
     model,
     x_clean: torch.Tensor,
     vocab_size: int,
-    gamma: float,
     mu: float,
     eta: float,
     num_iterations: int,
@@ -810,7 +808,6 @@ def evaluate_denoising_accuracy(
         model: The transformer model to use for computing gradients
         x_clean: Clean input tensor of shape (batch_size, 200, vocab_size)
         vocab_size: Number of possible cell values
-        gamma: Noise level parameter (0-1) for corrupting the output grid
         mu: Momentum parameter for gradient computation
         eta: Learning rate for optimization
         num_iterations: Number of optimization iterations
@@ -819,10 +816,10 @@ def evaluate_denoising_accuracy(
         DenoisingResult containing accuracies and predicted grids
     """
 
-    # Create noised input - only noise the last 25 tokens, keep first 175 unnoised
+    # Create noised input - mask all final 25 tokens with mask token (index 10)
     x_i = x_clean.clone()
-    eps = torch.randn_like(x_clean[:, -25:, :])
-    x_i[:, -25:, :] = (1 - gamma) * eps + gamma * x_clean[:, -25:, :]
+    x_i[:, -25:, :] = 0
+    x_i[:, -25:, 10] = 1
 
     # Perform optimization to denoise
     opt_result = optimize_output_grid(
@@ -909,24 +906,45 @@ def compute_loss_for_batch(
         Loss tensor (scalar)
     """
     x = batch.to(device)  # (batch_size, 200, vocab_size)
+    batch_size = x.size(0)
 
-    # Create noisy input - corrupt all 200 tokens at the one-hot vector level
+    # Create noisy input using discrete token masking
     xg = x.clone()
 
-    # Create random gaussian noise for all tokens at the one-hot vector level
-    eps = torch.randn_like(xg)  # (batch_size, 200, vocab_size)
+    # Sample number of mask tokens (0-195) and random tokens (0-5) for each batch item
+    num_mask_tokens = torch.randint(0, 196, (batch_size,), device=device)  # 0-195
+    num_random_tokens = torch.randint(0, 6, (batch_size,), device=device)  # 0-5
+    
+    # Initialize eps as zeros (one-hot encoded noise)
+    eps = torch.zeros_like(x)  # (batch_size, 200, vocab_size)
 
-    # Sample random gamma uniformly between 0 and 1
-    # Shape: (batch_size, 1, 1) - broadcasts across all 200 positions and vocab_size
-    gamma = torch.rand(x.size(0), 1, 1, device=device)
+    # For each batch item, select random positions and apply masking
+    for i in range(batch_size):
+        n_mask = num_mask_tokens[i].item()
+        n_random = num_random_tokens[i].item()
+        total_noise = n_mask + n_random
+        
+        if total_noise > 0:
+            # Select random positions to corrupt
+            positions = torch.randperm(200, device=device)[:total_noise]
+            
+            # First n_mask positions get mask token (index 10)
+            if n_mask > 0:
+                mask_positions = positions[:n_mask]
+                xg[i, mask_positions, :] = 0
+                xg[i, mask_positions, 10] = 1
+                eps[i, mask_positions, 10] = 1
+            
+            # Next n_random positions get random tokens (0-9)
+            if n_random > 0:
+                random_positions = positions[n_mask:]
+                random_tokens = torch.randint(0, 10, (int(n_random),), device=device)
+                xg[i, random_positions, :] = 0
+                xg[i, random_positions[torch.arange(n_random)], random_tokens] = 1
+                eps[i, random_positions[torch.arange(n_random)], random_tokens] = 1
 
-    # Create noisy input for all tokens
-    xg = (1 - gamma) * eps + gamma * x
-
-    # Create target with conditional scaling for all tokens
-    # c(gamma) = 1 if gamma < 0.8, else (1-gamma)/(1-0.8)
-    c_gamma = torch.where(gamma < 0.8, torch.ones_like(gamma), (1 - gamma) / 0.2)
-    target = (eps - x) * c_gamma
+    # Create target as (eps - x) without any gamma scaling
+    target = eps - x
 
     # Forward pass
     output = model(xg)  # (batch_size, 200, vocab_size)
@@ -1129,70 +1147,67 @@ def train(config: Config):
             ]
             assert len(test_original_tasks) > 10 and len(test_original_tasks) < 50, "Expected between 10 and 50 original tasks in test dataset"
 
-            # Evaluate for each gamma value
-            for gamma_val in config.eval_denoise_gamma:
-                gamma_start_time = time.time()
+            # Evaluate denoising accuracy
+            eval_start_time = time.time()
 
-                # Evaluate train tasks in batch
-                model.eval()
-                with torch.no_grad():
-                    # Load all train tasks into a batch
-                    train_batch = torch.stack([
-                        train_dataset[task_idx].to(device)
-                        for task_idx, _ in train_original_tasks
-                    ])
+            # Evaluate train tasks in batch
+            model.eval()
+            with torch.no_grad():
+                # Load all train tasks into a batch
+                train_batch = torch.stack([
+                    train_dataset[task_idx].to(device)
+                    for task_idx, _ in train_original_tasks
+                ])
 
-                    train_result = evaluate_denoising_accuracy(
-                        model=model,
-                        x_clean=train_batch,
-                        vocab_size=config.vocab_size,
-                        gamma=gamma_val,
-                        mu=config.eval_denoise_mu,
-                        eta=config.eval_denoise_eta,
-                        num_iterations=config.eval_denoise_num_iterations,
-                    )
-
-                    assert train_result.accuracies is not None
-                    train_accuracies = train_result.accuracies.cpu().numpy()
-
-                    # Load all test tasks into a batch
-                    test_batch = torch.stack([
-                        test_dataset[task_idx].to(device)
-                        for task_idx, _ in test_original_tasks
-                    ])
-
-                    test_result = evaluate_denoising_accuracy(
-                        model=model,
-                        x_clean=test_batch,
-                        vocab_size=config.vocab_size,
-                        gamma=gamma_val,
-                        mu=config.eval_denoise_mu,
-                        eta=config.eval_denoise_eta,
-                        num_iterations=config.eval_denoise_num_iterations,
-                    )
-
-                    assert test_result.accuracies is not None
-                    test_accuracies = test_result.accuracies.cpu().numpy()
-
-                # Compute average accuracies
-                avg_train_acc = np.mean(train_accuracies) if len(train_accuracies) > 0 else 0.0
-                avg_test_acc = np.mean(test_accuracies) if len(test_accuracies) > 0 else 0.0
-
-                # Calculate time for this gamma value
-                gamma_time = time.time() - gamma_start_time
-
-                # Print to terminal
-                print(
-                    f"  Gamma {gamma_val:.2f} - Train Accuracy: {avg_train_acc * 100:.2f}%, Test Accuracy: {avg_test_acc * 100:.2f}%, Time: {gamma_time:.2f}s"
+                train_result = evaluate_denoising_accuracy(
+                    model=model,
+                    x_clean=train_batch,
+                    vocab_size=config.vocab_size,
+                    mu=config.eval_denoise_mu,
+                    eta=config.eval_denoise_eta,
+                    num_iterations=config.eval_denoise_num_iterations,
                 )
 
-                # Log to tensorboard
-                writer.add_scalar(
-                    f"DenoiseAccuracy/train_gamma_{gamma_val}", avg_train_acc, epoch
+                assert train_result.accuracies is not None
+                train_accuracies = train_result.accuracies.cpu().numpy()
+
+                # Load all test tasks into a batch
+                test_batch = torch.stack([
+                    test_dataset[task_idx].to(device)
+                    for task_idx, _ in test_original_tasks
+                ])
+
+                test_result = evaluate_denoising_accuracy(
+                    model=model,
+                    x_clean=test_batch,
+                    vocab_size=config.vocab_size,
+                    mu=config.eval_denoise_mu,
+                    eta=config.eval_denoise_eta,
+                    num_iterations=config.eval_denoise_num_iterations,
                 )
-                writer.add_scalar(
-                    f"DenoiseAccuracy/test_gamma_{gamma_val}", avg_test_acc, epoch
-                )
+
+                assert test_result.accuracies is not None
+                test_accuracies = test_result.accuracies.cpu().numpy()
+
+            # Compute average accuracies
+            avg_train_acc = np.mean(train_accuracies) if len(train_accuracies) > 0 else 0.0
+            avg_test_acc = np.mean(test_accuracies) if len(test_accuracies) > 0 else 0.0
+
+            # Calculate evaluation time
+            eval_time = time.time() - eval_start_time
+
+            # Print to terminal
+            print(
+                f"  Train Accuracy: {avg_train_acc * 100:.2f}%, Test Accuracy: {avg_test_acc * 100:.2f}%, Time: {eval_time:.2f}s"
+            )
+
+            # Log to tensorboard
+            writer.add_scalar(
+                f"DenoiseAccuracy/train", avg_train_acc, epoch
+            )
+            writer.add_scalar(
+                f"DenoiseAccuracy/test", avg_test_acc, epoch
+            )
 
             print()  # Empty line for readability
 
@@ -1261,15 +1276,14 @@ def main():
         dropout=0.1,
         # Data parameters
         seq_len=200,
-        vocab_size=10,
+        vocab_size=11,
         # Denoising evaluation parameters
         eval_denoise_epoch_interval=1,
-        eval_denoise_gamma=[0.0, 0.5, 0.75, 1.0],
-        eval_denoise_mu=0.3,
-        eval_denoise_eta=0.003,
+        eval_denoise_mu=0,
+        eval_denoise_eta=1,
         eval_denoise_num_iterations=2000,
         # Training parameters
-        num_epochs=200,
+        num_epochs=40,
         batch_size=128,
         learning_rate=1e-3,
         # Optional: Load existing model to continue training
