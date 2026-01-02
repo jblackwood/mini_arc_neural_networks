@@ -22,6 +22,7 @@ class Config:
     # Dataset creation parameters
     data_dir: Path
     output_dir: Path
+    checkpoint_root_dir: Path
     test_ratio: float
     random_seed: int
     max_augmentations: int
@@ -69,7 +70,7 @@ class Config:
         if not self.model_save_path:
             self.model_save_path = f"{self.model_save_dir}/{self.timestamp}_model.pt"
         if not self.checkpoint_dir:
-            self.checkpoint_dir = f"{self.output_dir}/checkpoints"
+            self.checkpoint_dir = f"{self.checkpoint_root_dir}/checkpoints"
         if not self.train_data_dir:
             self.train_data_dir = f"{self.output_dir}/train"
         if not self.test_data_dir:
@@ -1117,6 +1118,7 @@ def main():
         # Dataset creation parameters
         data_dir=Path("data/MINI-ARC"),
         output_dir=Path("output/mini_arc_acc"),
+        checkpoint_root_dir=Path("data/MINI-ARC"),
         test_ratio=0.2,
         random_seed=42,
         max_augmentations=500,
