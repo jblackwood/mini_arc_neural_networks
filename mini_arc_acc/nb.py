@@ -1116,7 +1116,7 @@ def main():
         num_epochs=40,
         batch_size=128,
         learning_rate=1e-3,
-        num_iterations=5,
+        num_iterations=10,
         # Noising parameters
         last_grid_masking_ratio=0.25,
         # Optional: Load existing model to continue training
