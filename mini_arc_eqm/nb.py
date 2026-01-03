@@ -926,9 +926,13 @@ def compute_loss_for_batch(
     # Create noisy input
     xg = x.clone()
 
-    # First 175 tokens: replace with ~5/175 probability (average of 5 tokens, middle of 0-10 range)
-    replace_prob = 5.0 / 175.0
-    replace_mask = torch.rand(batch_size, 175, device=device) < replace_prob
+    # First 175 tokens: uniformly sample 0-10 tokens to replace per batch item
+    num_tokens_to_replace_first = torch.randint(0, 11, (batch_size,), device=device)  # 0-10 inclusive
+    
+    # Generate random priorities and use ranks to select positions
+    random_priorities_first = torch.rand(batch_size, 175, device=device)
+    ranks_first = torch.argsort(torch.argsort(random_priorities_first, dim=1), dim=1)
+    replace_mask = ranks_first < num_tokens_to_replace_first.unsqueeze(1)
     
     # Generate random tokens: ~80% mask token (10), ~20% random (0-9)
     rand = torch.rand(batch_size, 175, device=device)
