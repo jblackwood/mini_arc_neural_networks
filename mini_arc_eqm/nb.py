@@ -7,7 +7,7 @@ import zipfile
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Set, Tuple
+from typing import Dict, List, Literal, Optional, Set, Tuple, cast
 
 import numpy as np
 import torch
@@ -1039,6 +1039,8 @@ def train(config: Config):
     # Set device
     if torch.cuda.is_available():
         device = torch.device("cuda")
+        # Enable TF32 for faster matmul on Ampere+ GPUs
+        torch.set_float32_matmul_precision("high")
     elif torch.backends.mps.is_available():
         device = torch.device("mps")
     else:
@@ -1074,6 +1076,10 @@ def train(config: Config):
         vocab_size=config.vocab_size,
         dropout=config.dropout,
     ).to(device)
+
+    # Compile model for better performance (PyTorch 2.0+)
+    print("Compiling model with torch.compile...")
+    model = cast(TransformerModel, torch.compile(model))
 
     # Count parameters
     model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
