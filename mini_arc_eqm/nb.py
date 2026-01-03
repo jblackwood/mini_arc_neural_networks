@@ -943,9 +943,13 @@ def compute_loss_for_batch(
         xg[:, :175, :]
     )
     
-    # Last 25 tokens: replace with ~12.5/25 probability (average of 12.5 tokens, middle of 0-25 range)
-    replace_prob_last = 12.5 / 25.0
-    replace_mask_last = torch.rand(batch_size, 25, device=device) < replace_prob_last
+    # Last 25 tokens: uniformly sample 0-25 tokens to replace per batch item
+    num_tokens_to_replace = torch.randint(0, 26, (batch_size,), device=device)  # 0-25 inclusive
+    
+    # Generate random priorities and use ranks to select positions
+    random_priorities = torch.rand(batch_size, 25, device=device)
+    ranks = torch.argsort(torch.argsort(random_priorities, dim=1), dim=1)
+    replace_mask_last = ranks < num_tokens_to_replace.unsqueeze(1)
     
     # Generate random tokens: ~80% mask token (10), ~20% random (0-9)
     rand = torch.rand(batch_size, 25, device=device)
