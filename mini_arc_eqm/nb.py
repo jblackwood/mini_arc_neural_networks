@@ -108,12 +108,14 @@ class DenoisingResult:
         predicted_grids: Optional tensor of shape (batch_size, 5, 5) with predicted output grids
         optimized_output_tokens: Optional tensor of shape (batch_size, 25, d_model) with optimized output tokens
         best_grad_norm: Optional tensor of shape (batch_size,) with best gradient norm for each task
+        best_iteration: Optional tensor of shape (batch_size,) with iteration of best grad norm for each task
     """
 
     accuracies: Optional[torch.Tensor] = None
     predicted_grids: Optional[torch.Tensor] = None
     optimized_output_tokens: Optional[torch.Tensor] = None
     best_grad_norm: Optional[torch.Tensor] = None
+    best_iteration: Optional[torch.Tensor] = None
 
 
 def parse_arc_json(file_path: Path) -> ARCTask:
@@ -729,6 +731,7 @@ def optimize_output_grid(
 
         # Track best grid and gradient norm per sample in batch
         best_grad_norm = torch.full((batch_size,), float("inf"), device=x_input.device)
+        best_iteration = torch.zeros((batch_size,), dtype=torch.long, device=x_input.device)
         best_x = x.clone()
 
         for iteration in range(num_iterations):
@@ -753,6 +756,9 @@ def optimize_output_grid(
             # Update best_grad_norm for improved samples
             best_grad_norm = torch.where(improved_mask, grad_norm_per_sample, best_grad_norm)
             
+            # Update best_iteration for improved samples
+            best_iteration = torch.where(improved_mask, torch.tensor(iteration, device=x_input.device), best_iteration)
+            
             # Update best_x for improved samples
             # Expand mask to match x dimensions: (batch_size, 200, d_model)
             improved_mask_expanded = improved_mask.view(batch_size, 1, 1).expand_as(x)
@@ -765,6 +771,7 @@ def optimize_output_grid(
     return DenoisingResult(
         optimized_output_tokens=x[:, -25:, :],
         best_grad_norm=best_grad_norm,
+        best_iteration=best_iteration,
     )
 
 
@@ -1204,12 +1211,18 @@ def train(config: Config):
             avg_train_acc = np.mean(train_accuracies) if len(train_accuracies) > 0 else 0.0
             avg_test_acc = np.mean(test_accuracies) if len(test_accuracies) > 0 else 0.0
 
+            # Get max iteration across all samples
+            assert train_result.best_iteration is not None
+            assert test_result.best_iteration is not None
+            max_train_iter = train_result.best_iteration.max().item()
+            max_test_iter = test_result.best_iteration.max().item()
+
             # Calculate evaluation time
             eval_time = time.time() - eval_start_time
 
             # Print to terminal
             print(
-                f"  Train Accuracy: {avg_train_acc * 100:.2f}%, Test Accuracy: {avg_test_acc * 100:.2f}%, Time: {eval_time:.2f}s"
+                f"  Train Accuracy: {avg_train_acc * 100:.2f}% (max iter: {max_train_iter}), Test Accuracy: {avg_test_acc * 100:.2f}% (max iter: {max_test_iter}), Time: {eval_time:.2f}s"
             )
 
             # Log to tensorboard
