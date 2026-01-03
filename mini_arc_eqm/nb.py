@@ -38,6 +38,7 @@ class Config:
     batch_size: int
     num_epochs: int
     learning_rate: float
+    is_running_learning_rate_test: bool
 
     # Data parameters
     seq_len: int
@@ -1036,6 +1037,52 @@ def test_epoch(
     return total_loss / num_batches
 
 
+def learning_rate_test(
+    model: nn.Module,
+    train_loader: DataLoader,
+    device: torch.device,
+):
+    """Test learning rate by starting at 1e-7 and doubling every batch.
+
+    Args:
+        model: The transformer model
+        train_loader: Training data loader
+        device: Device to train on
+    """
+    # Start learning rate test
+    print("\nStarting learning rate test...")
+    lr = 1e-7
+    model.train()
+
+    batch_count = 0
+    for batch in train_loader:
+        if batch_count >= 20:
+            break
+
+        # Create optimizer with current learning rate
+        opt = torch.optim.Adam(model.parameters(), lr=lr)
+
+        # Randomly shift examples in each task
+        batch = random_shift_examples(batch, device)
+
+        # Compute loss
+        loss = compute_loss_for_batch(model, batch, device)
+
+        # Backward pass
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+        # Print learning rate and loss
+        print(f"Batch {batch_count + 1}: LR = {lr:.2e}, Loss = {loss.item():.6f}")
+
+        # Double learning rate for next batch
+        lr *= 2
+        batch_count += 1
+
+    print("\nLearning rate test complete!")
+
+
 def train(config: Config):
     """Train transformer model on ARC tasks.
 
@@ -1091,6 +1138,11 @@ def train(config: Config):
     # Count parameters
     model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model has {model_params:,} trainable parameters")
+
+    # Check if running learning rate test
+    if config.is_running_learning_rate_test:
+        learning_rate_test(model, train_loader, device)
+        return
 
     # Create optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
@@ -1310,6 +1362,7 @@ def main():
         num_epochs=40,
         batch_size=32,
         learning_rate=2.5e-5,
+        is_running_learning_rate_test=False,
         # Optional: Load existing model to continue training
         load_model_path=None,
     )
