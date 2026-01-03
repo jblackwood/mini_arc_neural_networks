@@ -1270,21 +1270,6 @@ def train(config: Config):
         learning_rate_test(model, train_loader, device, config.weight_decay)
         return
 
-    # Check if running evaluation mode
-    if config.mode == "eval":
-        print("\nRunning evaluation mode...")
-        evaluate_denoising(
-            model=model,
-            train_dataset=train_dataset,
-            test_dataset=test_dataset,
-            device=device,
-            vocab_size=config.vocab_size,
-            eval_denoise_mu=config.eval_denoise_mu,
-            eval_denoise_eta=config.eval_denoise_eta,
-            eval_denoise_num_iterations=config.eval_denoise_num_iterations,
-        )
-        return
-
     # Create optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
@@ -1306,6 +1291,21 @@ def train(config: Config):
             print(
                 f"\nWarning: Model path {config.load_model_path} does not exist. Starting from scratch."
             )
+
+    # Check if running evaluation mode (after model loading)
+    if config.mode == "eval":
+        print("\nRunning evaluation mode...")
+        evaluate_denoising(
+            model=model,
+            train_dataset=train_dataset,
+            test_dataset=test_dataset,
+            device=device,
+            vocab_size=config.vocab_size,
+            eval_denoise_mu=config.eval_denoise_mu,
+            eval_denoise_eta=config.eval_denoise_eta,
+            eval_denoise_num_iterations=config.eval_denoise_num_iterations,
+        )
+        return
 
     # Create tensorboard writer
     Path(config.tensorboard_log_dir).mkdir(parents=True, exist_ok=True)
