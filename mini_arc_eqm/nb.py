@@ -948,8 +948,8 @@ def compute_loss_for_batch(
                 xg[i, random_positions[torch.arange(n_random)], random_tokens] = 1
                 eps[i, random_positions[torch.arange(n_random)], random_tokens] = 1
 
-    # Create target as (eps - x) without any gamma scaling
-    target = eps - x
+    # Create target as (xg - x)
+    target = xg - x
 
     # Forward pass
     output = model(xg)  # (batch_size, 200, vocab_size)
