@@ -1361,7 +1361,7 @@ def main():
         # Training parameters
         num_epochs=40,
         batch_size=32,
-        learning_rate=2.5e-5,
+        learning_rate=5e-5,
         is_running_learning_rate_test=False,
         # Optional: Load existing model to continue training
         load_model_path=None,
