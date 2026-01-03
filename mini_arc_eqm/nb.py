@@ -1,5 +1,6 @@
 import json
 import os
+import pprint
 import random
 import time
 import urllib.request
@@ -1439,6 +1440,11 @@ def main():
         # Optional: Load existing model to continue training
         load_model_path=None,
     )
+
+    # Print configuration
+    print("Configuration:")
+    pprint.pprint(asdict(config), width=100, sort_dicts=False)
+    print()
 
     # Download dataset
     download_mini_arc(config.data_dir)
