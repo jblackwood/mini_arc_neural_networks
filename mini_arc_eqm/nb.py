@@ -39,7 +39,7 @@ class Config:
     num_epochs: int
     learning_rate: float
     weight_decay: float
-    is_running_learning_rate_test: bool
+    mode: Literal["train", "learning_rate_test", "eval"]
 
     # Data parameters
     seq_len: int
@@ -1087,6 +1087,128 @@ def learning_rate_test(
     print("\nLearning rate test complete!")
 
 
+def evaluate_denoising(
+    model: nn.Module,
+    train_dataset: ARCTaskDataset,
+    test_dataset: ARCTaskDataset,
+    device: torch.device,
+    vocab_size: int,
+    eval_denoise_mu: float,
+    eval_denoise_eta: float,
+    eval_denoise_num_iterations: int,
+    writer: Optional[SummaryWriter] = None,
+    epoch: Optional[int] = None,
+) -> Tuple[float, float]:
+    """Evaluate denoising accuracy on original tasks.
+
+    Args:
+        model: The transformer model
+        train_dataset: Training dataset
+        test_dataset: Test dataset
+        device: Device to evaluate on
+        vocab_size: Number of possible cell values
+        eval_denoise_mu: Momentum parameter for gradient computation
+        eval_denoise_eta: Learning rate for optimization
+        eval_denoise_num_iterations: Number of optimization iterations
+        writer: Optional tensorboard writer for logging
+        epoch: Optional epoch number for logging
+
+    Returns:
+        Tuple of (average_train_accuracy, average_test_accuracy)
+    """
+    # Filter for original tasks in train dataset
+    train_original_tasks = [
+        (idx, file_path)
+        for idx, file_path in enumerate(train_dataset.task_files)
+        if file_path.name.endswith("original.json")
+    ]
+    assert len(train_original_tasks) > 10 and len(train_original_tasks) < 200, "Expected between 10 and 200 original tasks in train dataset"
+
+    # Filter for original tasks in test dataset
+    test_original_tasks = [
+        (idx, file_path)
+        for idx, file_path in enumerate(test_dataset.task_files)
+        if file_path.name.endswith("original.json")
+    ]
+    assert len(test_original_tasks) > 10 and len(test_original_tasks) < 50, "Expected between 10 and 50 original tasks in test dataset"
+
+    # Evaluate denoising accuracy
+    eval_start_time = time.time()
+
+    # Evaluate train tasks in batch
+    model.eval()
+    with torch.no_grad():
+        # Load all train tasks into a batch
+        train_batch = torch.stack([
+            train_dataset[task_idx].to(device)
+            for task_idx, _ in train_original_tasks
+        ])
+
+        train_result = evaluate_denoising_accuracy(
+            model=model,
+            x_clean=train_batch,
+            vocab_size=vocab_size,
+            mu=eval_denoise_mu,
+            eta=eval_denoise_eta,
+            num_iterations=eval_denoise_num_iterations,
+        )
+
+        assert train_result.accuracies is not None
+        train_accuracies = train_result.accuracies.cpu().numpy()
+
+        # Load all test tasks into a batch
+        test_batch = torch.stack([
+            test_dataset[task_idx].to(device)
+            for task_idx, _ in test_original_tasks
+        ])
+
+        test_result = evaluate_denoising_accuracy(
+            model=model,
+            x_clean=test_batch,
+            vocab_size=vocab_size,
+            mu=eval_denoise_mu,
+            eta=eval_denoise_eta,
+            num_iterations=eval_denoise_num_iterations,
+        )
+
+        assert test_result.accuracies is not None
+        test_accuracies = test_result.accuracies.cpu().numpy()
+
+    # Compute average accuracies
+    avg_train_acc = np.mean(train_accuracies) if len(train_accuracies) > 0 else 0.0
+    avg_test_acc = np.mean(test_accuracies) if len(test_accuracies) > 0 else 0.0
+
+    # Get max iteration across all samples
+    assert train_result.best_iteration is not None
+    assert test_result.best_iteration is not None
+    max_train_iter = train_result.best_iteration.max().item()
+    max_test_iter = test_result.best_iteration.max().item()
+
+    # Calculate evaluation time
+    eval_time = time.time() - eval_start_time
+
+    # Print to terminal
+    if epoch is not None:
+        print(
+            f"  Train Accuracy: {avg_train_acc * 100:.2f}% (max iter: {max_train_iter}), Test Accuracy: {avg_test_acc * 100:.2f}% (max iter: {max_test_iter}), Time: {eval_time:.2f}s"
+        )
+    else:
+        print(
+            f"Train Accuracy: {avg_train_acc * 100:.2f}% (max iter: {max_train_iter}), Test Accuracy: {avg_test_acc * 100:.2f}% (max iter: {max_test_iter}), Time: {eval_time:.2f}s"
+        )
+
+    # Log to tensorboard if writer provided
+    if writer is not None and epoch is not None:
+        writer.add_scalar(
+            f"DenoiseAccuracy/train", avg_train_acc, epoch
+        )
+        writer.add_scalar(
+            f"DenoiseAccuracy/test", avg_test_acc, epoch
+        )
+
+    return float(avg_train_acc), float(avg_test_acc)
+
+
 def train(config: Config):
     """Train transformer model on ARC tasks.
 
@@ -1144,8 +1266,23 @@ def train(config: Config):
     print(f"Model has {model_params:,} trainable parameters")
 
     # Check if running learning rate test
-    if config.is_running_learning_rate_test:
+    if config.mode == "learning_rate_test":
         learning_rate_test(model, train_loader, device, config.weight_decay)
+        return
+
+    # Check if running evaluation mode
+    if config.mode == "eval":
+        print("\nRunning evaluation mode...")
+        evaluate_denoising(
+            model=model,
+            train_dataset=train_dataset,
+            test_dataset=test_dataset,
+            device=device,
+            vocab_size=config.vocab_size,
+            eval_denoise_mu=config.eval_denoise_mu,
+            eval_denoise_eta=config.eval_denoise_eta,
+            eval_denoise_num_iterations=config.eval_denoise_num_iterations,
+        )
         return
 
     # Create optimizer
@@ -1207,88 +1344,17 @@ def train(config: Config):
         if (epoch + 1) % config.eval_denoise_epoch_interval == 0:
             print(f"\nEvaluating denoising accuracy at epoch {epoch + 1}...")
 
-            # Filter for original tasks in train dataset
-            train_original_tasks = [
-                (idx, file_path)
-                for idx, file_path in enumerate(train_dataset.task_files)
-                if file_path.name.endswith("original.json")
-            ]
-            assert len(train_original_tasks) > 10 and len(train_original_tasks) < 200, "Expected between 10 and 200 original tasks in train dataset"
-
-            # Filter for original tasks in test dataset
-            test_original_tasks = [
-                (idx, file_path)
-                for idx, file_path in enumerate(test_dataset.task_files)
-                if file_path.name.endswith("original.json")
-            ]
-            assert len(test_original_tasks) > 10 and len(test_original_tasks) < 50, "Expected between 10 and 50 original tasks in test dataset"
-
-            # Evaluate denoising accuracy
-            eval_start_time = time.time()
-
-            # Evaluate train tasks in batch
-            model.eval()
-            with torch.no_grad():
-                # Load all train tasks into a batch
-                train_batch = torch.stack([
-                    train_dataset[task_idx].to(device)
-                    for task_idx, _ in train_original_tasks
-                ])
-
-                train_result = evaluate_denoising_accuracy(
-                    model=model,
-                    x_clean=train_batch,
-                    vocab_size=config.vocab_size,
-                    mu=config.eval_denoise_mu,
-                    eta=config.eval_denoise_eta,
-                    num_iterations=config.eval_denoise_num_iterations,
-                )
-
-                assert train_result.accuracies is not None
-                train_accuracies = train_result.accuracies.cpu().numpy()
-
-                # Load all test tasks into a batch
-                test_batch = torch.stack([
-                    test_dataset[task_idx].to(device)
-                    for task_idx, _ in test_original_tasks
-                ])
-
-                test_result = evaluate_denoising_accuracy(
-                    model=model,
-                    x_clean=test_batch,
-                    vocab_size=config.vocab_size,
-                    mu=config.eval_denoise_mu,
-                    eta=config.eval_denoise_eta,
-                    num_iterations=config.eval_denoise_num_iterations,
-                )
-
-                assert test_result.accuracies is not None
-                test_accuracies = test_result.accuracies.cpu().numpy()
-
-            # Compute average accuracies
-            avg_train_acc = np.mean(train_accuracies) if len(train_accuracies) > 0 else 0.0
-            avg_test_acc = np.mean(test_accuracies) if len(test_accuracies) > 0 else 0.0
-
-            # Get max iteration across all samples
-            assert train_result.best_iteration is not None
-            assert test_result.best_iteration is not None
-            max_train_iter = train_result.best_iteration.max().item()
-            max_test_iter = test_result.best_iteration.max().item()
-
-            # Calculate evaluation time
-            eval_time = time.time() - eval_start_time
-
-            # Print to terminal
-            print(
-                f"  Train Accuracy: {avg_train_acc * 100:.2f}% (max iter: {max_train_iter}), Test Accuracy: {avg_test_acc * 100:.2f}% (max iter: {max_test_iter}), Time: {eval_time:.2f}s"
-            )
-
-            # Log to tensorboard
-            writer.add_scalar(
-                f"DenoiseAccuracy/train", avg_train_acc, epoch
-            )
-            writer.add_scalar(
-                f"DenoiseAccuracy/test", avg_test_acc, epoch
+            evaluate_denoising(
+                model=model,
+                train_dataset=train_dataset,
+                test_dataset=test_dataset,
+                device=device,
+                vocab_size=config.vocab_size,
+                eval_denoise_mu=config.eval_denoise_mu,
+                eval_denoise_eta=config.eval_denoise_eta,
+                eval_denoise_num_iterations=config.eval_denoise_num_iterations,
+                writer=writer,
+                epoch=epoch,
             )
 
             print()  # Empty line for readability
@@ -1369,7 +1435,7 @@ def main():
         batch_size=32,
         learning_rate=5e-5,
         weight_decay=0.1,
-        is_running_learning_rate_test=False,
+        mode="train",
         # Optional: Load existing model to continue training
         load_model_path=None,
     )
