@@ -943,13 +943,22 @@ def compute_loss_for_batch(
         xg[:, :175, :]
     )
     
-    # Last 25 tokens: replace all with random tokens, ~80% mask token (10)
+    # Last 25 tokens: replace with ~12.5/25 probability (average of 12.5 tokens, middle of 0-25 range)
+    replace_prob_last = 12.5 / 25.0
+    replace_mask_last = torch.rand(batch_size, 25, device=device) < replace_prob_last
+    
+    # Generate random tokens: ~80% mask token (10), ~20% random (0-9)
     rand = torch.rand(batch_size, 25, device=device)
     tokens = torch.where(rand < 0.8,
                         torch.tensor(10, device=device),
                         torch.randint(0, 10, (batch_size, 25), device=device))
     
-    xg[:, 175:, :] = torch.nn.functional.one_hot(tokens, num_classes=11).float()
+    # Apply noise where replace_mask_last is True
+    xg[:, 175:, :] = torch.where(
+        replace_mask_last.unsqueeze(-1),
+        torch.nn.functional.one_hot(tokens, num_classes=11).float(),
+        xg[:, 175:, :]
+    )
 
     # Create target as (xg - x)
     target = xg - x
