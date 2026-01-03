@@ -1305,7 +1305,7 @@ def main():
         eval_denoise_epoch_interval=1,
         eval_denoise_mu=0,
         eval_denoise_eta=1,
-        eval_denoise_num_iterations=2000,
+        eval_denoise_num_iterations=25,
         # Training parameters
         num_epochs=40,
         batch_size=512,
