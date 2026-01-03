@@ -38,6 +38,7 @@ class Config:
     batch_size: int
     num_epochs: int
     learning_rate: float
+    weight_decay: float
     is_running_learning_rate_test: bool
 
     # Data parameters
@@ -1041,6 +1042,7 @@ def learning_rate_test(
     model: nn.Module,
     train_loader: DataLoader,
     device: torch.device,
+    weight_decay: float,
 ):
     """Test learning rate by starting at 1e-7 and doubling every batch.
 
@@ -1060,7 +1062,9 @@ def learning_rate_test(
             break
 
         # Create optimizer with current learning rate
-        opt = torch.optim.Adam(model.parameters(), lr=lr)
+        opt = torch.optim.AdamW(
+            model.parameters(), lr=lr, weight_decay=weight_decay
+        )
 
         # Randomly shift examples in each task
         batch = random_shift_examples(batch, device)
@@ -1141,11 +1145,13 @@ def train(config: Config):
 
     # Check if running learning rate test
     if config.is_running_learning_rate_test:
-        learning_rate_test(model, train_loader, device)
+        learning_rate_test(model, train_loader, device, config.weight_decay)
         return
 
     # Create optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
+    )
 
     # Load existing model if specified
     start_epoch = 0
@@ -1362,6 +1368,7 @@ def main():
         num_epochs=40,
         batch_size=32,
         learning_rate=5e-5,
+        weight_decay=0.1,
         is_running_learning_rate_test=False,
         # Optional: Load existing model to continue training
         load_model_path=None,
