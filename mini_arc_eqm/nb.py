@@ -1280,10 +1280,10 @@ def main():
         random_seed=42,
         max_augmentations=500,
         # Model parameters
-        d_model=128,
-        nhead=4,
-        num_layers=3,
-        dim_feedforward=512,
+        d_model=256,
+        nhead=8,
+        num_layers=8,
+        dim_feedforward=1024,
         dropout=0.1,
         # Data parameters
         seq_len=200,
