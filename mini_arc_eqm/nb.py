@@ -1189,11 +1189,23 @@ def evaluate_denoising(
     avg_train_acc = np.mean(train_accuracies) if len(train_accuracies) > 0 else 0.0
     avg_test_acc = np.mean(test_accuracies) if len(test_accuracies) > 0 else 0.0
 
+    # Compute % of grids with 100% accuracy
+    train_perfect_pct = (np.sum(train_accuracies == 1.0) / len(train_accuracies) * 100) if len(train_accuracies) > 0 else 0.0
+    test_perfect_pct = (np.sum(test_accuracies == 1.0) / len(test_accuracies) * 100) if len(test_accuracies) > 0 else 0.0
+
     # Get max iteration across all samples
     assert train_result.best_iteration is not None
     assert test_result.best_iteration is not None
     max_train_iter = train_result.best_iteration.max().item()
     max_test_iter = test_result.best_iteration.max().item()
+
+    # Compute average and std of best iteration
+    train_best_iterations = train_result.best_iteration.cpu().numpy()
+    test_best_iterations = test_result.best_iteration.cpu().numpy()
+    avg_train_iter = np.mean(train_best_iterations) if len(train_best_iterations) > 0 else 0.0
+    std_train_iter = np.std(train_best_iterations) if len(train_best_iterations) > 0 else 0.0
+    avg_test_iter = np.mean(test_best_iterations) if len(test_best_iterations) > 0 else 0.0
+    std_test_iter = np.std(test_best_iterations) if len(test_best_iterations) > 0 else 0.0
 
     # Calculate evaluation time
     eval_time = time.time() - eval_start_time
@@ -1201,11 +1213,23 @@ def evaluate_denoising(
     # Print to terminal
     if epoch is not None:
         print(
-            f"  Train Accuracy: {avg_train_acc * 100:.2f}% (max iter: {max_train_iter}), Test Accuracy: {avg_test_acc * 100:.2f}% (max iter: {max_test_iter}), Time: {eval_time:.2f}s"
+            f"  Train Accuracy: {avg_train_acc * 100:.2f}% (100% acc: {train_perfect_pct:.1f}%), "
+            f"Test Accuracy: {avg_test_acc * 100:.2f}% (100% acc: {test_perfect_pct:.1f}%)"
+        )
+        print(
+            f"  Train Best Iter: {avg_train_iter:.1f}±{std_train_iter:.1f} (max: {max_train_iter}), "
+            f"Test Best Iter: {avg_test_iter:.1f}±{std_test_iter:.1f} (max: {max_test_iter}), "
+            f"Time: {eval_time:.2f}s"
         )
     else:
         print(
-            f"Train Accuracy: {avg_train_acc * 100:.2f}% (max iter: {max_train_iter}), Test Accuracy: {avg_test_acc * 100:.2f}% (max iter: {max_test_iter}), Time: {eval_time:.2f}s"
+            f"Train Accuracy: {avg_train_acc * 100:.2f}% (100% acc: {train_perfect_pct:.1f}%), "
+            f"Test Accuracy: {avg_test_acc * 100:.2f}% (100% acc: {test_perfect_pct:.1f}%)"
+        )
+        print(
+            f"Train Best Iter: {avg_train_iter:.1f}±{std_train_iter:.1f} (max: {max_train_iter}), "
+            f"Test Best Iter: {avg_test_iter:.1f}±{std_test_iter:.1f} (max: {max_test_iter}), "
+            f"Time: {eval_time:.2f}s"
         )
 
     # Log to tensorboard if writer provided
