@@ -2,6 +2,7 @@ import json
 import os
 import pprint
 import random
+import shutil
 import time
 import urllib.request
 import zipfile
@@ -41,6 +42,7 @@ class Config:
     learning_rate: float
     weight_decay: float
     mode: Literal["train", "learning_rate_test", "eval"]
+    checkpoint_save_interval: int
 
     # Data parameters
     seq_len: int
@@ -54,6 +56,9 @@ class Config:
 
     # Optional model loading
     load_model_path: Optional[str] = None
+
+    # Google Drive location for Colab
+    google_drive_dir: str = "/content/drive/MyDrive/sparse_arc"
 
     # Paths (computed)
     timestamp: str = ""
@@ -1384,8 +1389,8 @@ def train(config: Config):
 
             print()  # Empty line for readability
 
-        # Save checkpoint every 20 epochs
-        if (epoch + 1) % 20 == 0:
+        # Save checkpoint every N epochs (configurable)
+        if (epoch + 1) % config.checkpoint_save_interval == 0:
             checkpoint_path = f"{config.checkpoint_dir}/{config.timestamp}_epoch_{epoch + 1}_checkpoint.pt"
             torch.save(
                 {
@@ -1407,6 +1412,12 @@ def train(config: Config):
                 checkpoint_path,
             )
             print(f"Saved checkpoint to {checkpoint_path}")
+            
+            # Copy checkpoint to Google Drive if the directory exists
+            if os.path.exists(config.google_drive_dir):
+                gdrive_checkpoint_path = f"{config.google_drive_dir}/{config.timestamp}_epoch_{epoch + 1}_checkpoint.pt"
+                shutil.copy2(checkpoint_path, gdrive_checkpoint_path)
+                print(f"Copied checkpoint to Google Drive: {gdrive_checkpoint_path}")
 
     writer.close()
     print("\nTraining complete!")
@@ -1456,11 +1467,12 @@ def main():
         eval_denoise_eta=1,
         eval_denoise_num_iterations=500,
         # Training parameters
-        num_epochs=400,
+        num_epochs=300,
         batch_size=32,
         learning_rate=5e-5,
         weight_decay=0.1,
         mode="train",
+        checkpoint_save_interval=30,
         # Optional: Load existing model to continue training
         load_model_path=None,
     )
