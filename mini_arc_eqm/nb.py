@@ -926,47 +926,37 @@ def compute_loss_for_batch(
     # Create noisy input
     xg = x.clone()
 
-    # First 175 tokens: uniformly sample 0-10 tokens to replace per batch item
-    num_tokens_to_replace_first = torch.randint(0, 11, (batch_size,), device=device)  # 0-10 inclusive
+    # Sample number of mask tokens (0-195) and random tokens (0-5) for each batch item
+    num_mask_tokens = torch.randint(0, 196, (batch_size,), device=device)  # 0-195
+    num_random_tokens = torch.randint(0, 6, (batch_size,), device=device)  # 0-5
     
-    # Generate random priorities and use ranks to select positions
-    random_priorities_first = torch.rand(batch_size, 175, device=device)
-    ranks_first = torch.argsort(torch.argsort(random_priorities_first, dim=1), dim=1)
-    replace_mask = ranks_first < num_tokens_to_replace_first.unsqueeze(1)
-    
-    # Generate random tokens: ~80% mask token (10), ~20% random (0-9)
-    rand = torch.rand(batch_size, 175, device=device)
-    tokens = torch.where(rand < 0.8,
-                        torch.tensor(10, device=device),
-                        torch.randint(0, 10, (batch_size, 175), device=device))
-    
-    # Apply noise where replace_mask is True
-    xg[:, :175, :] = torch.where(
-        replace_mask.unsqueeze(-1),
-        torch.nn.functional.one_hot(tokens, num_classes=11).float(),
-        xg[:, :175, :]
-    )
-    
-    # Last 25 tokens: uniformly sample 0-25 tokens to replace per batch item
-    num_tokens_to_replace = torch.randint(0, 26, (batch_size,), device=device)  # 0-25 inclusive
-    
-    # Generate random priorities and use ranks to select positions
-    random_priorities = torch.rand(batch_size, 25, device=device)
-    ranks = torch.argsort(torch.argsort(random_priorities, dim=1), dim=1)
-    replace_mask_last = ranks < num_tokens_to_replace.unsqueeze(1)
-    
-    # Generate random tokens: ~80% mask token (10), ~20% random (0-9)
-    rand = torch.rand(batch_size, 25, device=device)
-    tokens = torch.where(rand < 0.8,
-                        torch.tensor(10, device=device),
-                        torch.randint(0, 10, (batch_size, 25), device=device))
-    
-    # Apply noise where replace_mask_last is True
-    xg[:, 175:, :] = torch.where(
-        replace_mask_last.unsqueeze(-1),
-        torch.nn.functional.one_hot(tokens, num_classes=11).float(),
-        xg[:, 175:, :]
-    )
+    # Initialize eps as zeros (one-hot encoded noise)
+    eps = torch.zeros_like(x)  # (batch_size, 200, vocab_size)
+
+    # For each batch item, select random positions and apply masking
+    for i in range(batch_size):
+        n_mask = num_mask_tokens[i].item()
+        n_random = num_random_tokens[i].item()
+        total_noise = n_mask + n_random
+        
+        if total_noise > 0:
+            # Select random positions to corrupt
+            positions = torch.randperm(200, device=device)[:total_noise]
+            
+            # First n_mask positions get mask token (index 10)
+            if n_mask > 0:
+                mask_positions = positions[:n_mask]
+                xg[i, mask_positions, :] = 0
+                xg[i, mask_positions, 10] = 1
+                eps[i, mask_positions, 10] = 1
+            
+            # Next n_random positions get random tokens (0-9)
+            if n_random > 0:
+                random_positions = positions[n_mask:]
+                random_tokens = torch.randint(0, 10, (int(n_random),), device=device)
+                xg[i, random_positions, :] = 0
+                xg[i, random_positions[torch.arange(n_random)], random_tokens] = 1
+                eps[i, random_positions[torch.arange(n_random)], random_tokens] = 1
 
     # Create target as (xg - x)
     target = xg - x
