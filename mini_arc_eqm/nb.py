@@ -1442,7 +1442,7 @@ def main():
         eval_denoise_eta=1,
         eval_denoise_num_iterations=500,
         # Training parameters
-        num_epochs=40,
+        num_epochs=200,
         batch_size=32,
         learning_rate=5e-5,
         weight_decay=0.1,
