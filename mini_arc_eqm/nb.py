@@ -910,10 +910,49 @@ def random_shift_examples(batch: torch.Tensor, device: torch.device) -> torch.Te
     return shifted_batch.view(batch_size, seq_len, vocab_size)
 
 
+def random_shift_first_three_examples(batch: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Randomly shift the order of the first 3 examples while keeping the last example unchanged.
+    
+    Each task has 4 examples. This function only shifts the first 3 examples (150 tokens),
+    leaving the last example (last 50 tokens) unchanged.
+    
+    Args:
+        batch: Batch tensor of shape (batch_size, 200, vocab_size)
+        device: Device to perform operations on
+    
+    Returns:
+        Shifted batch tensor of same shape
+    """
+    batch_size, seq_len, vocab_size = batch.shape
+    
+    # Split into first 150 tokens (3 examples) and last 50 tokens (1 example)
+    first_three = batch[:, :150, :]  # (batch_size, 150, vocab_size)
+    last_one = batch[:, 150:, :]     # (batch_size, 50, vocab_size)
+    
+    # Reshape first 3 examples to (batch_size, 3 examples, 50 cells per example, vocab_size)
+    first_three_reshaped = first_three.view(batch_size, 3, 50, vocab_size)
+    
+    # Randomly choose shift amount for each item in batch (0, 1, or 2 example shifts)
+    # We use 0-2 because we have 3 examples. Shifting by 0 means no shift.
+    shift_amounts = torch.randint(0, 3, (batch_size,), device=device)
+    
+    # Create shifted batch using torch.roll for each batch item
+    shifted_first_three = torch.zeros_like(first_three_reshaped)
+    for i in range(batch_size):
+        shifted_first_three[i] = torch.roll(first_three_reshaped[i], shifts=int(shift_amounts[i].item()), dims=0)
+    
+    # Reshape first three back to (batch_size, 150, vocab_size)
+    shifted_first_three = shifted_first_three.view(batch_size, 150, vocab_size)
+    
+    # Concatenate shifted first 3 examples with unchanged last example
+    return torch.cat([shifted_first_three, last_one], dim=1)
+
+
 def compute_loss_for_batch(
     model: nn.Module,
     batch: torch.Tensor,
     device: torch.device,
+    only_first_175_tokens: bool,
 ) -> torch.Tensor:
     """Compute loss for a single batch.
 
@@ -921,6 +960,7 @@ def compute_loss_for_batch(
         model: The transformer model
         batch: Batch of one-hot encoded cell values, shape (batch_size, 200, vocab_size)
         device: Device to compute on
+        only_first_175_tokens: If True, only compute loss on first 175 tokens
 
     Returns:
         Loss tensor (scalar)
@@ -969,8 +1009,11 @@ def compute_loss_for_batch(
     # Forward pass
     output = model(xg)  # (batch_size, 200, vocab_size)
 
-    # Compute loss on all tokens
-    loss = ((output - target) ** 2).mean()
+    # Compute loss on all tokens or only first 175
+    if only_first_175_tokens:
+        loss = ((output[:, :175, :] - target[:, :175, :]) ** 2).mean()
+    else:
+        loss = ((output - target) ** 2).mean()
 
     return loss
 
@@ -1001,7 +1044,7 @@ def train_epoch(
         batch = random_shift_examples(batch, device)
         
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, device)
+        loss = compute_loss_for_batch(model, batch, device, only_first_175_tokens=False)
 
         # Backward pass
         optimizer.zero_grad()
@@ -1017,6 +1060,7 @@ def train_epoch(
 def test_epoch(
     model: nn.Module,
     test_loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
     device: torch.device,
 ) -> float:
     """Evaluate on test set.
@@ -1024,11 +1068,32 @@ def test_epoch(
     Args:
         model: The transformer model
         test_loader: Test data loader
+        optimizer: Optimizer for training on first 175 tokens
         device: Device to evaluate on
 
     Returns:
         Average test loss
     """
+    # Training section: train on first 175 tokens with last grid masked
+    model.train()
+    for batch in test_loader:
+        # Mask the last grid (last 25 tokens) with mask token (index 10)
+        batch_masked = batch.clone()
+        batch_masked[:, -25:, :] = 0
+        batch_masked[:, -25:, 10] = 1
+        
+        # Randomly shift first 3 examples while keeping last example unchanged
+        batch_masked = random_shift_first_three_examples(batch_masked, device)
+        
+        # Compute loss on first 175 tokens only
+        loss = compute_loss_for_batch(model, batch_masked, device, only_first_175_tokens=True)
+        
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    
+    # Evaluation section
     model.eval()
     total_loss = 0.0
     num_batches = 0
@@ -1036,7 +1101,7 @@ def test_epoch(
     with torch.no_grad():
         for batch in test_loader:
             # Compute loss
-            loss = compute_loss_for_batch(model, batch, device)
+            loss = compute_loss_for_batch(model, batch, device, only_first_175_tokens=False)
 
             total_loss += loss.item()
             num_batches += 1
@@ -1076,7 +1141,7 @@ def learning_rate_test(
         batch = random_shift_examples(batch, device)
 
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, device)
+        loss = compute_loss_for_batch(model, batch, device, only_first_175_tokens=False)
 
         # Backward pass
         opt.zero_grad()
@@ -1353,7 +1418,7 @@ def train(config: Config):
         train_loss = train_epoch(model, train_loader, optimizer, device)
 
         # Test
-        test_loss = test_epoch(model, test_loader, device)
+        test_loss = test_epoch(model, test_loader, optimizer, device)
 
         # Calculate epoch time
         epoch_time = time.time() - epoch_start_time
