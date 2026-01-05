@@ -1300,6 +1300,24 @@ def evaluate_denoising(
         writer.add_scalar(
             f"DenoiseAccuracy/test", avg_test_acc, epoch
         )
+        writer.add_scalar(
+            f"DenoisePerfect/train", train_perfect_pct, epoch
+        )
+        writer.add_scalar(
+            f"DenoisePerfect/test", test_perfect_pct, epoch
+        )
+        writer.add_scalar(
+            f"DenoiseBestIter/train_mean", avg_train_iter, epoch
+        )
+        writer.add_scalar(
+            f"DenoiseBestIter/train_std", std_train_iter, epoch
+        )
+        writer.add_scalar(
+            f"DenoiseBestIter/test_mean", avg_test_iter, epoch
+        )
+        writer.add_scalar(
+            f"DenoiseBestIter/test_std", std_test_iter, epoch
+        )
 
     return float(avg_train_acc), float(avg_test_acc)
 
