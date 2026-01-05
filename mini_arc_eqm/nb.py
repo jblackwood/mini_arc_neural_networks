@@ -54,11 +54,11 @@ class Config:
     eval_denoise_eta: float
     eval_denoise_num_iterations: int
 
+    # Google Drive location for Colab
+    google_drive_dir: str
+
     # Optional model loading
     load_model_path: Optional[str] = None
-
-    # Google Drive location for Colab
-    google_drive_dir: str = "/content/drive/MyDrive/sparse_arc"
 
     # Paths (computed)
     timestamp: str = ""
@@ -1538,6 +1538,8 @@ def main():
         weight_decay=0.1,
         mode="train",
         checkpoint_save_interval=30,
+        # Google Drive location for Colab
+        google_drive_dir="/content/drive/MyDrive/sparse_arc",
         # Optional: Load existing model to continue training
         load_model_path=None,
     )
