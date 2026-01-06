@@ -688,11 +688,13 @@ class TransformerModel(nn.Module):
         # Linear output projection (d_model -> vocab_size)
         self.output_proj = nn.Linear(d_model, vocab_size)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, src_key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Forward pass.
 
         Args:
             x: Input tensor of shape (batch_size, seq_len, vocab_size) - one-hot encoded
+            src_key_padding_mask: Optional mask of shape (batch_size, seq_len) where True means ignore.
+                                   Prevents attention to masked positions.
 
         Returns:
             Output tensor of shape (batch_size, 25, vocab_size) - gradient for last 25 tokens only
@@ -703,8 +705,8 @@ class TransformerModel(nn.Module):
         # Add positional embedding
         x = x + self.pos_embedding.unsqueeze(0)  # (batch_size, seq_len, d_model)
 
-        # Apply transformer encoder
-        x = self.transformer_encoder(x)  # (batch_size, seq_len, d_model)
+        # Apply transformer encoder with attention mask
+        x = self.transformer_encoder(x, src_key_padding_mask=src_key_padding_mask)  # (batch_size, seq_len, d_model)
 
         # Apply output projection only to last 25 tokens
         x = self.output_proj(x[:, -25:, :])  # (batch_size, 25, vocab_size)
@@ -981,6 +983,7 @@ def compute_loss_for_batch(
     model: nn.Module,
     batch: torch.Tensor,
     device: torch.device,
+    attention_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute loss for a single batch.
 
@@ -988,6 +991,7 @@ def compute_loss_for_batch(
         model: The transformer model
         batch: Batch of one-hot encoded cell values, shape (batch_size, 200, vocab_size)
         device: Device to compute on
+        attention_mask: Optional attention mask of shape (batch_size, 200) where True means ignore
 
     Returns:
         Loss tensor (scalar)
@@ -1001,7 +1005,7 @@ def compute_loss_for_batch(
     target = xg[:, -25:, :] - x[:, -25:, :]  # (batch_size, 25, vocab_size)
 
     # Forward pass - model now outputs (batch_size, 25, vocab_size)
-    output = model(xg)  # (batch_size, 25, vocab_size)
+    output = model(xg, src_key_padding_mask=attention_mask)  # (batch_size, 25, vocab_size)
 
     # Compute loss
     loss = ((output - target) ** 2).mean()
@@ -1037,13 +1041,19 @@ def train_epoch(
         # For ~50% of samples, mask the first 50 tokens
         batch_size = batch.shape[0]
         mask_first_50 = torch.rand(batch_size, device=device) < 0.5
+        
+        # Create attention mask (True means ignore)
+        attention_mask = torch.zeros(batch_size, 200, dtype=torch.bool, device=device)
+        
         for i in range(batch_size):
             if mask_first_50[i]:
                 batch[i, :50, :] = 0
                 batch[i, :50, 10] = 1
+                # Prevent attention to first 50 tokens when they are masked
+                attention_mask[i, :50] = True
         
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, device)
+        loss = compute_loss_for_batch(model, batch, device, attention_mask=attention_mask)
 
         # Backward pass
         optimizer.zero_grad()
@@ -1088,8 +1098,13 @@ def test_epoch(
         # Randomly shift last 3 examples (positions 50-199)
         batch_masked = random_shift_last_three_examples(batch_masked, device)
         
+        # Create attention mask to prevent attention to first 50 tokens
+        batch_size = batch_masked.shape[0]
+        attention_mask = torch.zeros(batch_size, 200, dtype=torch.bool, device=device)
+        attention_mask[:, :50] = True  # Ignore first 50 tokens
+        
         # Compute loss
-        loss = compute_loss_for_batch(model, batch_masked, device)
+        loss = compute_loss_for_batch(model, batch_masked, device, attention_mask=attention_mask)
         
         # Backward pass
         optimizer.zero_grad()
