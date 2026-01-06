@@ -666,6 +666,9 @@ class TransformerModel(nn.Module):
         """
         super().__init__()
 
+        # Store vocab_size for later use
+        self.vocab_size = vocab_size
+
         # Linear input projection (vocab_size -> d_model)
         self.input_proj = nn.Linear(vocab_size, d_model, bias=False)
 
@@ -692,7 +695,7 @@ class TransformerModel(nn.Module):
             x: Input tensor of shape (batch_size, seq_len, vocab_size) - one-hot encoded
 
         Returns:
-            Output tensor of shape (batch_size, seq_len, vocab_size)
+            Output tensor of shape (batch_size, 25, vocab_size) - gradient for last 25 tokens only
         """
         # Apply input projection
         x = self.input_proj(x)  # (batch_size, seq_len, d_model)
@@ -703,8 +706,8 @@ class TransformerModel(nn.Module):
         # Apply transformer encoder
         x = self.transformer_encoder(x)  # (batch_size, seq_len, d_model)
 
-        # Apply output projection
-        x = self.output_proj(x)  # (batch_size, seq_len, vocab_size)
+        # Apply output projection only to last 25 tokens
+        x = self.output_proj(x[:, -25:, :])  # (batch_size, 25, vocab_size)
 
         # Apply hard tanh to clamp values between -1 and 1
         x = torch.nn.functional.hardtanh(x, min_val=-1.0, max_val=1.0)
@@ -735,7 +738,7 @@ def optimize_output_grid(
 
     with torch.no_grad():
         x = x_input.clone()
-        grad = model(x)
+        grad = model(x)  # grad shape: (batch_size, 25, vocab_size)
 
         # Track best grid and gradient norm per sample in batch
         best_grad_norm = torch.full((batch_size,), float("inf"), device=x_input.device)
@@ -745,17 +748,13 @@ def optimize_output_grid(
         for iteration in range(num_iterations):
             x_last = x.clone()
 
-            # Zero out gradient for first 175 tokens
-            grad[:, :175, :] = 0
-
-            # Update x
-            x = x - eta * grad
+            # Update x - only update last 25 tokens
+            x[:, -25:, :] = x[:, -25:, :] - eta * grad
 
             # Compute gradient
-            grad = model(x + mu * (x - x_last))
+            grad = model(x + mu * (x - x_last))  # grad shape: (batch_size, 25, vocab_size)
 
             # Calculate gradient norm per sample in batch
-            # grad shape: (batch_size, 200, d_model)
             grad_norm_per_sample = torch.norm(grad.view(batch_size, -1), dim=1)  # Shape: (batch_size,)
 
             # Update best grid for each sample if current gradient norm is lower
@@ -768,7 +767,7 @@ def optimize_output_grid(
             best_iteration = torch.where(improved_mask, torch.tensor(iteration, device=x_input.device), best_iteration)
             
             # Update best_x for improved samples
-            # Expand mask to match x dimensions: (batch_size, 200, d_model)
+            # Expand mask to match x dimensions: (batch_size, 200, vocab_size)
             improved_mask_expanded = improved_mask.view(batch_size, 1, 1).expand_as(x)
             best_x = torch.where(improved_mask_expanded, x, best_x)
 
@@ -836,10 +835,8 @@ def evaluate_denoising_accuracy(
         DenoisingResult containing accuracies and predicted grids
     """
 
-    # Create noised input - mask all final 25 tokens with mask token (index 10)
-    x_i = x_clean.clone()
-    x_i[:, -25:, :] = 0
-    x_i[:, -25:, 10] = 1
+    # Create noised input by noising last 25 tokens
+    x_i = noise_last_25_tokens(x_clean, x_clean.device)
 
     # Perform optimization to denoise
     opt_result = optimize_output_grid(
@@ -910,11 +907,11 @@ def random_shift_examples(batch: torch.Tensor, device: torch.device) -> torch.Te
     return shifted_batch.view(batch_size, seq_len, vocab_size)
 
 
-def random_shift_first_three_examples(batch: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """Randomly shift the order of the first 3 examples while keeping the last example unchanged.
+def random_shift_last_three_examples(batch: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Randomly shift the order of the last 3 examples while keeping the first example unchanged.
     
-    Each task has 4 examples. This function only shifts the first 3 examples (150 tokens),
-    leaving the last example (last 50 tokens) unchanged.
+    Each task has 4 examples. This function only shifts the last 3 examples (last 150 tokens),
+    leaving the first example (first 50 tokens) unchanged.
     
     Args:
         batch: Batch tensor of shape (batch_size, 200, vocab_size)
@@ -925,34 +922,65 @@ def random_shift_first_three_examples(batch: torch.Tensor, device: torch.device)
     """
     batch_size, seq_len, vocab_size = batch.shape
     
-    # Split into first 150 tokens (3 examples) and last 50 tokens (1 example)
-    first_three = batch[:, :150, :]  # (batch_size, 150, vocab_size)
-    last_one = batch[:, 150:, :]     # (batch_size, 50, vocab_size)
+    # Split into first 50 tokens (1 example) and last 150 tokens (3 examples)
+    first_one = batch[:, :50, :]      # (batch_size, 50, vocab_size)
+    last_three = batch[:, 50:, :]     # (batch_size, 150, vocab_size)
     
-    # Reshape first 3 examples to (batch_size, 3 examples, 50 cells per example, vocab_size)
-    first_three_reshaped = first_three.view(batch_size, 3, 50, vocab_size)
+    # Reshape last 3 examples to (batch_size, 3 examples, 50 cells per example, vocab_size)
+    last_three_reshaped = last_three.view(batch_size, 3, 50, vocab_size)
     
     # Randomly choose shift amount for each item in batch (0, 1, or 2 example shifts)
     # We use 0-2 because we have 3 examples. Shifting by 0 means no shift.
     shift_amounts = torch.randint(0, 3, (batch_size,), device=device)
     
     # Create shifted batch using torch.roll for each batch item
-    shifted_first_three = torch.zeros_like(first_three_reshaped)
+    shifted_last_three = torch.zeros_like(last_three_reshaped)
     for i in range(batch_size):
-        shifted_first_three[i] = torch.roll(first_three_reshaped[i], shifts=int(shift_amounts[i].item()), dims=0)
+        shifted_last_three[i] = torch.roll(last_three_reshaped[i], shifts=int(shift_amounts[i].item()), dims=0)
     
-    # Reshape first three back to (batch_size, 150, vocab_size)
-    shifted_first_three = shifted_first_three.view(batch_size, 150, vocab_size)
+    # Reshape last three back to (batch_size, 150, vocab_size)
+    shifted_last_three = shifted_last_three.view(batch_size, 150, vocab_size)
     
-    # Concatenate shifted first 3 examples with unchanged last example
-    return torch.cat([shifted_first_three, last_one], dim=1)
+    # Concatenate unchanged first example with shifted last 3 examples
+    return torch.cat([first_one, shifted_last_three], dim=1)
+
+
+def noise_last_25_tokens(batch: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Noise the last 25 tokens by randomly replacing 0-25 of them with random values.
+    
+    Args:
+        batch: Batch tensor of shape (batch_size, 200, vocab_size)
+        device: Device to perform operations on
+    
+    Returns:
+        Noised batch tensor of same shape
+    """
+    batch_size = batch.shape[0]
+    noised_batch = batch.clone()
+    
+    # Sample number of tokens to randomly replace in last 25 tokens (0-25) for each batch item
+    num_random_tokens = torch.randint(0, 26, (batch_size,), device=device)  # 0-25
+
+    # For each batch item, select random positions in last 25 tokens and replace with random values
+    for i in range(batch_size):
+        n_random = num_random_tokens[i].item()
+        
+        if n_random > 0:
+            # Select random positions in last 25 tokens (indices 175-199)
+            positions = torch.randperm(25, device=device)[:n_random] + 175
+            
+            # Replace with random tokens (0-10, where 10 is mask token)
+            random_tokens = torch.randint(0, 11, (int(n_random),), device=device)
+            noised_batch[i, positions, :] = 0
+            noised_batch[i, positions, random_tokens] = 1
+    
+    return noised_batch
 
 
 def compute_loss_for_batch(
     model: nn.Module,
     batch: torch.Tensor,
     device: torch.device,
-    only_first_175_tokens: bool,
 ) -> torch.Tensor:
     """Compute loss for a single batch.
 
@@ -960,60 +988,23 @@ def compute_loss_for_batch(
         model: The transformer model
         batch: Batch of one-hot encoded cell values, shape (batch_size, 200, vocab_size)
         device: Device to compute on
-        only_first_175_tokens: If True, only compute loss on first 175 tokens
 
     Returns:
         Loss tensor (scalar)
     """
     x = batch.to(device)  # (batch_size, 200, vocab_size)
-    batch_size = x.size(0)
 
-    # Create noisy input
-    xg = x.clone()
+    # Create noisy input by noising last 25 tokens
+    xg = noise_last_25_tokens(x, device)
 
-    # Sample number of mask tokens (0-195) and random tokens (0-5) for each batch item
-    num_mask_tokens = torch.randint(0, 196, (batch_size,), device=device)  # 0-195
-    num_random_tokens = torch.randint(0, 6, (batch_size,), device=device)  # 0-5
-    
-    # Initialize eps as zeros (one-hot encoded noise)
-    eps = torch.zeros_like(x)  # (batch_size, 200, vocab_size)
+    # Create target as difference for last 25 tokens only
+    target = xg[:, -25:, :] - x[:, -25:, :]  # (batch_size, 25, vocab_size)
 
-    # For each batch item, select random positions and apply masking
-    for i in range(batch_size):
-        n_mask = num_mask_tokens[i].item()
-        n_random = num_random_tokens[i].item()
-        total_noise = n_mask + n_random
-        
-        if total_noise > 0:
-            # Select random positions to corrupt
-            positions = torch.randperm(200, device=device)[:total_noise]
-            
-            # First n_mask positions get mask token (index 10)
-            if n_mask > 0:
-                mask_positions = positions[:n_mask]
-                xg[i, mask_positions, :] = 0
-                xg[i, mask_positions, 10] = 1
-                eps[i, mask_positions, 10] = 1
-            
-            # Next n_random positions get random tokens (0-9)
-            if n_random > 0:
-                random_positions = positions[n_mask:]
-                random_tokens = torch.randint(0, 10, (int(n_random),), device=device)
-                xg[i, random_positions, :] = 0
-                xg[i, random_positions[torch.arange(n_random)], random_tokens] = 1
-                eps[i, random_positions[torch.arange(n_random)], random_tokens] = 1
+    # Forward pass - model now outputs (batch_size, 25, vocab_size)
+    output = model(xg)  # (batch_size, 25, vocab_size)
 
-    # Create target as (xg - x)
-    target = xg - x
-
-    # Forward pass
-    output = model(xg)  # (batch_size, 200, vocab_size)
-
-    # Compute loss on all tokens or only first 175
-    if only_first_175_tokens:
-        loss = ((output[:, :175, :] - target[:, :175, :]) ** 2).mean()
-    else:
-        loss = ((output - target) ** 2).mean()
+    # Compute loss
+    loss = ((output - target) ** 2).mean()
 
     return loss
 
@@ -1043,8 +1034,16 @@ def train_epoch(
         # Randomly shift examples in each task
         batch = random_shift_examples(batch, device)
         
+        # For ~50% of samples, mask the first 50 tokens
+        batch_size = batch.shape[0]
+        mask_first_50 = torch.rand(batch_size, device=device) < 0.5
+        for i in range(batch_size):
+            if mask_first_50[i]:
+                batch[i, :50, :] = 0
+                batch[i, :50, 10] = 1
+        
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, device, only_first_175_tokens=False)
+        loss = compute_loss_for_batch(model, batch, device)
 
         # Backward pass
         optimizer.zero_grad()
@@ -1068,25 +1067,29 @@ def test_epoch(
     Args:
         model: The transformer model
         test_loader: Test data loader
-        optimizer: Optimizer for training on first 175 tokens
+        optimizer: Optimizer for training on last 25 tokens
         device: Device to evaluate on
 
     Returns:
         Average test loss
     """
-    # Training section: train on first 175 tokens with last grid masked
+    # Training section: train on first three examples with first 50 tokens masked
     model.train()
     for batch in test_loader:
-        # Mask the last grid (last 25 tokens) with mask token (index 10)
         batch_masked = batch.clone()
-        batch_masked[:, -25:, :] = 0
-        batch_masked[:, -25:, 10] = 1
         
-        # Randomly shift first 3 examples while keeping last example unchanged
-        batch_masked = random_shift_first_three_examples(batch_masked, device)
+        # Copy first 150 tokens to last 150 tokens
+        batch_masked[:, 50:, :] = batch[:, :150, :]
         
-        # Compute loss on first 175 tokens only
-        loss = compute_loss_for_batch(model, batch_masked, device, only_first_175_tokens=True)
+        # Mask the first 50 tokens
+        batch_masked[:, :50, :] = 0
+        batch_masked[:, :50, 10] = 1
+        
+        # Randomly shift last 3 examples (positions 50-199)
+        batch_masked = random_shift_last_three_examples(batch_masked, device)
+        
+        # Compute loss
+        loss = compute_loss_for_batch(model, batch_masked, device)
         
         # Backward pass
         optimizer.zero_grad()
@@ -1101,7 +1104,7 @@ def test_epoch(
     with torch.no_grad():
         for batch in test_loader:
             # Compute loss
-            loss = compute_loss_for_batch(model, batch, device, only_first_175_tokens=False)
+            loss = compute_loss_for_batch(model, batch, device)
 
             total_loss += loss.item()
             num_batches += 1
@@ -1141,7 +1144,7 @@ def learning_rate_test(
         batch = random_shift_examples(batch, device)
 
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, device, only_first_175_tokens=False)
+        loss = compute_loss_for_batch(model, batch, device)
 
         # Backward pass
         opt.zero_grad()
