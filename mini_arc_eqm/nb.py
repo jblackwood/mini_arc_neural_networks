@@ -1101,8 +1101,36 @@ def test_epoch(
     return total_loss / num_batches
 
 
+def get_optimizer_param_groups(
+    model: TransformerModel,
+    weight_decay: float,
+) -> List[Dict]:
+    """Create optimizer parameter groups with embeddings excluded from weight decay.
+    
+    Args:
+        model: The transformer model
+        weight_decay: Weight decay parameter for non-embedding parameters
+    
+    Returns:
+        List of parameter groups for optimizer initialization
+    """
+    # Exclude task_embedding and pos_embedding from weight decay
+    no_decay = {model.task_embedding.weight, model.pos_embedding}
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for p in model.parameters() if p not in no_decay],
+            "weight_decay": weight_decay,
+        },
+        {
+            "params": no_decay,
+            "weight_decay": 0.0,
+        },
+    ]
+    return optimizer_grouped_parameters
+
+
 def learning_rate_test(
-    model: nn.Module,
+    model: TransformerModel,
     train_loader: DataLoader,
     device: torch.device,
     weight_decay: float,
@@ -1128,8 +1156,10 @@ def learning_rate_test(
             break
 
         # Create optimizer with current learning rate
+        # Exclude task_embedding and pos_embedding from weight decay
+        optimizer_grouped_parameters = get_optimizer_param_groups(model, weight_decay)
         opt = torch.optim.AdamW(
-            model.parameters(), lr=lr, weight_decay=weight_decay
+            optimizer_grouped_parameters, lr=lr
         )
 
         # Prepare batch
@@ -1450,9 +1480,11 @@ def train(config: Config):
         learning_rate_test(model, train_loader, device, config.weight_decay, task_id_to_index)
         return
 
-    # Create optimizer
+    # Create optimizer with separate parameter groups
+    # Exclude task_embedding and pos_embedding from weight decay
+    optimizer_grouped_parameters = get_optimizer_param_groups(model, config.weight_decay)
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
+        optimizer_grouped_parameters, lr=config.learning_rate
     )
 
     # Load existing model if specified
