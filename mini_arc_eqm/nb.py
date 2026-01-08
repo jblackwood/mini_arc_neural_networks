@@ -1126,7 +1126,7 @@ def get_optimizer_param_groups(
             "weight_decay": weight_decay,
         },
         {
-            "params": no_decay,
+            "params": list(no_decay),
             "weight_decay": 0.0,
         },
     ]
