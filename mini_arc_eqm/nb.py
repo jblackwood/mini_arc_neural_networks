@@ -1647,7 +1647,7 @@ def main():
         output_dir=Path("output/mini_arc_eqm5"),
         test_ratio=0.2,
         random_seed=42,
-        max_augmentations=500,
+        max_augmentations=50,
         # Model parameters
         d_model=256,
         nhead=8,
@@ -1661,7 +1661,7 @@ def main():
         eval_denoise_epoch_interval=1,
         eval_denoise_mu=0,
         eval_denoise_eta=1,
-        eval_denoise_num_iterations=100,
+        eval_denoise_num_iterations=500,
         # Training parameters
         num_epochs=300,
         batch_size=8,
