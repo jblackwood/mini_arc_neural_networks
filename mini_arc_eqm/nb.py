@@ -988,14 +988,18 @@ def compute_loss_for_batch(
     x = batch.to(device)  # (batch_size, 50, vocab_size)
     task_indices = task_indices.to(device)  # (batch_size,)
 
-    # Create noisy input by noising last 25 tokens
+    # Stack x 5 times to duplicate each sample 5 times
+    x = x.repeat(5, 1, 1)  # (batch_size * 5, 50, vocab_size)
+    task_indices = task_indices.repeat(5)  # (batch_size * 5,)
+
+    # Create noisy input by noising last 25 tokens (each duplicate gets different noise)
     xg = noise_last_25_tokens(x, device)
 
     # Create target as difference for last 25 tokens only
-    target = xg[:, -25:, :] - x[:, -25:, :]  # (batch_size, 25, vocab_size)
+    target = xg[:, -25:, :] - x[:, -25:, :]  # (batch_size * 5, 25, vocab_size)
 
-    # Forward pass - model now outputs (batch_size, 25, vocab_size)
-    output = model(xg, task_indices)  # (batch_size, 25, vocab_size)
+    # Forward pass - model now outputs (batch_size * 5, 25, vocab_size)
+    output = model(xg, task_indices)  # (batch_size * 5, 25, vocab_size)
 
     # Compute loss
     loss = ((output - target) ** 2).mean()
