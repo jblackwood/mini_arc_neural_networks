@@ -988,18 +988,18 @@ def compute_loss_for_batch(
     x = batch.to(device)  # (batch_size, 50, vocab_size)
     task_indices = task_indices.to(device)  # (batch_size,)
 
-    # Stack x 5 times to duplicate each sample 5 times
-    x = x.repeat(5, 1, 1)  # (batch_size * 5, 50, vocab_size)
-    task_indices = task_indices.repeat(5)  # (batch_size * 5,)
+    # Stack x 100 times to duplicate each sample 100 times
+    x = x.repeat(100, 1, 1)  # (batch_size * 100, 50, vocab_size)
+    task_indices = task_indices.repeat(100)  # (batch_size * 100,)
 
     # Create noisy input by noising last 25 tokens (each duplicate gets different noise)
     xg = noise_last_25_tokens(x, device)
 
     # Create target as difference for last 25 tokens only
-    target = xg[:, -25:, :] - x[:, -25:, :]  # (batch_size * 5, 25, vocab_size)
+    target = xg[:, -25:, :] - x[:, -25:, :]  # (batch_size * 100, 25, vocab_size)
 
-    # Forward pass - model now outputs (batch_size * 5, 25, vocab_size)
-    output = model(xg, task_indices)  # (batch_size * 5, 25, vocab_size)
+    # Forward pass - model now outputs (batch_size * 100, 25, vocab_size)
+    output = model(xg, task_indices)  # (batch_size * 100, 25, vocab_size)
 
     # Compute loss
     loss = ((output - target) ** 2).mean()
@@ -1647,7 +1647,7 @@ def main():
         output_dir=Path("output/mini_arc_eqm5"),
         test_ratio=0.2,
         random_seed=42,
-        max_augmentations=50,
+        max_augmentations=3,
         # Model parameters
         d_model=256,
         nhead=8,
