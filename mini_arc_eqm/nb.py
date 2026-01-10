@@ -918,11 +918,8 @@ class TransformerModel(nn.Module):
         positive_logits = self.output_proj_positive(x)  # (batch_size, 25, vocab_size+1)
         negative_logits = self.output_proj_negative(x)  # (batch_size, 25, vocab_size+1)
         
-        # Apply Gumbel softmax
-        positive_output = torch.nn.functional.gumbel_softmax(positive_logits, tau=temperature, hard=True)
-        negative_output = torch.nn.functional.gumbel_softmax(negative_logits, tau=temperature, hard=True)
-
-        return positive_output, negative_output
+        # Return raw logits for training (cross-entropy expects logits)
+        return positive_logits, negative_logits
 
 
 def optimize_output_grid(
@@ -952,8 +949,12 @@ def optimize_output_grid(
     with torch.no_grad():
         x = x_input.clone()
         
-        # Get dual-head output from model
-        positive_output, negative_output = model(x, task_indices)
+        # Get dual-head output from model (returns logits)
+        positive_logits, negative_logits = model(x, task_indices)
+        
+        # Use Gumbel softmax for sampling to get probabilities
+        positive_output = torch.nn.functional.gumbel_softmax(positive_logits, tau=1.0, hard=True)
+        negative_output = torch.nn.functional.gumbel_softmax(negative_logits, tau=1.0, hard=True)
         
         # Convert to gradient: positive probs - negative probs for each vocab index
         # Shape: (batch_size, 25, vocab_size+1) -> (batch_size, 25, vocab_size)
@@ -971,7 +972,9 @@ def optimize_output_grid(
             x[:, -25:, :] = x[:, -25:, :] - eta * grad
 
             # Compute gradient
-            positive_output, negative_output = model(x + mu * (x - x_last), task_indices)
+            positive_logits, negative_logits = model(x + mu * (x - x_last), task_indices)
+            positive_output = torch.nn.functional.gumbel_softmax(positive_logits, tau=1.0, hard=True)
+            negative_output = torch.nn.functional.gumbel_softmax(negative_logits, tau=1.0, hard=True)
             grad = positive_output[:, :, :vocab_size] - negative_output[:, :, :vocab_size]
 
             # Calculate gradient norm per sample in batch
@@ -1173,16 +1176,16 @@ def compute_loss_for_batch(
     has_negative = (target == -1.0).any(dim=2)  # (batch_size, 25)
     negative_target[~has_negative] = vocab_size
 
-    # Forward pass - model now outputs two tensors (batch_size, 25, vocab_size+1) each
-    positive_output, negative_output = model(xg, task_indices)
+    # Forward pass - model returns logits (batch_size, 25, vocab_size+1) each
+    positive_logits, negative_logits = model(xg, task_indices)
 
-    # Compute cross-entropy loss on both heads
+    # Compute cross-entropy loss on both heads (expects logits)
     loss_positive = torch.nn.functional.cross_entropy(
-        positive_output.view(-1, vocab_size + 1), 
+        positive_logits.view(-1, vocab_size + 1), 
         positive_target.view(-1)
     )
     loss_negative = torch.nn.functional.cross_entropy(
-        negative_output.view(-1, vocab_size + 1), 
+        negative_logits.view(-1, vocab_size + 1), 
         negative_target.view(-1)
     )
 
