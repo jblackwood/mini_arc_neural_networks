@@ -41,7 +41,7 @@ class Config:
     num_epochs: int
     learning_rate: float
     weight_decay: float
-    mode: Literal["train", "learning_rate_test", "eval"]
+    mode: Literal["train", "learning_rate_test", "weight_decay_test", "eval"]
     checkpoint_save_interval: int
 
     # Data parameters
@@ -1350,6 +1350,66 @@ def learning_rate_test(
     print("\nLearning rate test complete!")
 
 
+def weight_decay_test(
+    model: nn.Module,
+    train_loader: DataLoader,
+    device: torch.device,
+    learning_rate: float,
+    task_id_to_index: Dict[str, int],
+):
+    """Test weight decay by starting at 1e-7 and doubling every batch.
+
+    Args:
+        model: The transformer model
+        train_loader: Training data loader
+        device: Device to train on
+        learning_rate: Learning rate parameter
+        task_id_to_index: Mapping from task_id strings to integer indices
+    """
+    # Start weight decay test
+    print("\nStarting weight decay test...")
+    wd = 1e-7
+    model.train()
+
+    batch_count = 0
+    for examples in train_loader:
+        if batch_count >= 30:
+            break
+
+        # Create optimizer with current weight decay
+        opt = torch.optim.AdamW(
+            model.parameters(), lr=learning_rate, weight_decay=wd
+        )
+
+        # Prepare batch
+        batch_tensors = []
+        task_ids = []
+        for example in examples:
+            concatenated = torch.cat([example["input_grid"], example["output_grid"]], dim=0)
+            batch_tensors.append(concatenated)
+            task_ids.append(example["task_id"])
+        
+        batch = torch.stack(batch_tensors, dim=0)
+        task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
+
+        # Compute loss
+        loss = compute_loss_for_batch(model, batch, task_indices, device)
+
+        # Backward pass
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+        # Print weight decay and loss
+        print(f"Batch {batch_count + 1}: WD = {wd:.2e}, Loss = {loss.item():.6f}")
+
+        # Double weight decay for next batch
+        wd *= 2
+        batch_count += 1
+
+    print("\nWeight decay test complete!")
+
+
 def evaluate_denoising(
     model: nn.Module,
     train_dataset: ARCTaskDataset,
@@ -1637,6 +1697,11 @@ def train(config: Config):
     # Check if running learning rate test
     if config.mode == "learning_rate_test":
         learning_rate_test(model, train_loader, device, config.weight_decay, task_id_to_index)
+        return
+
+    # Check if running weight decay test
+    if config.mode == "weight_decay_test":
+        weight_decay_test(model, train_loader, device, config.learning_rate, task_id_to_index)
         return
 
     # Create optimizer
