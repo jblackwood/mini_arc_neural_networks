@@ -1916,14 +1916,15 @@ def main():
     # # Train model
     train(config)
 
-    # Shut down Google Colab runtime if running in Colab
-    try:
-        from google.colab import runtime # type: ignore
-        print("\nShutting down Google Colab runtime...")
-        runtime.unassign()
-    except ImportError:
-        # Not running in Colab, skip shutdown
-        pass
+    # Shut down Google Colab runtime if running in Colab (only in train mode)
+    if config.mode == "train":
+        try:
+            from google.colab import runtime # type: ignore
+            print("\nShutting down Google Colab runtime...")
+            runtime.unassign()
+        except ImportError:
+            # Not running in Colab, skip shutdown
+            pass
 
 
 if __name__ == "__main__":
