@@ -988,18 +988,14 @@ def compute_loss_for_batch(
     x = batch.to(device)  # (batch_size, 50, vocab_size)
     task_indices = task_indices.to(device)  # (batch_size,)
 
-    # Stack x 50 times to duplicate each sample 50 times
-    x = x.repeat(50, 1, 1)  # (batch_size * 50, 50, vocab_size)
-    task_indices = task_indices.repeat(50)  # (batch_size * 50,)
-
-    # Create noisy input by noising last 25 tokens (each duplicate gets different noise)
+    # Create noisy input by noising last 25 tokens
     xg = noise_last_25_tokens(x, device)
 
     # Create target as difference for last 25 tokens only
-    target = xg[:, -25:, :] - x[:, -25:, :]  # (batch_size * 50, 25, vocab_size)
+    target = xg[:, -25:, :] - x[:, -25:, :]  # (batch_size, 25, vocab_size)
 
-    # Forward pass - model now outputs (batch_size * 50, 25, vocab_size)
-    output = model(xg, task_indices)  # (batch_size * 50, 25, vocab_size)
+    # Forward pass - model now outputs (batch_size, 25, vocab_size)
+    output = model(xg, task_indices)  # (batch_size, 25, vocab_size)
 
     # Compute loss
     loss = ((output - target) ** 2).mean()
@@ -1105,36 +1101,8 @@ def test_epoch(
     return total_loss / num_batches
 
 
-def get_optimizer_param_groups(
-    model: TransformerModel,
-    weight_decay: float,
-) -> List[Dict]:
-    """Create optimizer parameter groups with embeddings excluded from weight decay.
-    
-    Args:
-        model: The transformer model
-        weight_decay: Weight decay parameter for non-embedding parameters
-    
-    Returns:
-        List of parameter groups for optimizer initialization
-    """
-    # Exclude task_embedding and pos_embedding from weight decay
-    no_decay = {model.task_embedding.weight, model.pos_embedding}
-    optimizer_grouped_parameters = [
-        {
-            "params": [p for p in model.parameters() if p not in no_decay],
-            "weight_decay": weight_decay,
-        },
-        {
-            "params": list(no_decay),
-            "weight_decay": 0.0,
-        },
-    ]
-    return optimizer_grouped_parameters
-
-
 def learning_rate_test(
-    model: TransformerModel,
+    model: nn.Module,
     train_loader: DataLoader,
     device: torch.device,
     weight_decay: float,
@@ -1160,10 +1128,8 @@ def learning_rate_test(
             break
 
         # Create optimizer with current learning rate
-        # Exclude task_embedding and pos_embedding from weight decay
-        optimizer_grouped_parameters = get_optimizer_param_groups(model, weight_decay)
         opt = torch.optim.AdamW(
-            optimizer_grouped_parameters, lr=lr
+            model.parameters(), lr=lr, weight_decay=weight_decay
         )
 
         # Prepare batch
@@ -1484,11 +1450,9 @@ def train(config: Config):
         learning_rate_test(model, train_loader, device, config.weight_decay, task_id_to_index)
         return
 
-    # Create optimizer with separate parameter groups
-    # Exclude task_embedding and pos_embedding from weight decay
-    optimizer_grouped_parameters = get_optimizer_param_groups(model, config.weight_decay)
+    # Create optimizer
     optimizer = torch.optim.AdamW(
-        optimizer_grouped_parameters, lr=config.learning_rate
+        model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
     )
 
     # Load existing model if specified
@@ -1647,7 +1611,7 @@ def main():
         output_dir=Path("output/mini_arc_eqm5"),
         test_ratio=0.2,
         random_seed=42,
-        max_augmentations=3,
+        max_augmentations=500,
         # Model parameters
         d_model=256,
         nhead=8,
@@ -1664,8 +1628,8 @@ def main():
         eval_denoise_num_iterations=500,
         # Training parameters
         num_epochs=300,
-        batch_size=8,
-        learning_rate=1.2e-5,
+        batch_size=32,
+        learning_rate=2.5e-5,
         weight_decay=0.1,
         mode="train",
         checkpoint_save_interval=30,
