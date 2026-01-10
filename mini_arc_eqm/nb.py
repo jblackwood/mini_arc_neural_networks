@@ -873,8 +873,12 @@ class TransformerModel(nn.Module):
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
 
-        # Linear output projection (d_model -> vocab_size)
-        self.output_proj = nn.Linear(d_model, vocab_size)
+        # Two linear output projection layers with transpose
+        # First: (batch_size, 51, d_model) -> (batch_size, 51, 25)
+        # Transpose: (batch_size, 51, 25) -> (batch_size, 25, 51)
+        # Second: (batch_size, 25, 51) -> (batch_size, 25, vocab_size)
+        self.output_proj_1 = nn.Linear(d_model, 25)
+        self.output_proj_2 = nn.Linear(51, vocab_size)
 
     def forward(self, x: torch.Tensor, task_indices: torch.Tensor) -> torch.Tensor:
         """Forward pass.
@@ -903,8 +907,10 @@ class TransformerModel(nn.Module):
         # Apply transformer encoder
         x = self.transformer_encoder(x)  # (batch_size, 51, d_model)
 
-        # Apply output projection only to last 25 tokens (output grid)
-        x = self.output_proj(x[:, -25:, :])  # (batch_size, 25, vocab_size)
+        # Apply two output projections with transpose to use all 51 tokens
+        x = self.output_proj_1(x)  # (batch_size, 51, 25)
+        x = x.transpose(1, 2)  # (batch_size, 25, 51)
+        x = self.output_proj_2(x)  # (batch_size, 25, vocab_size)
 
         # Apply hard tanh to clamp values between -1 and 1
         x = torch.nn.functional.hardtanh(x, min_val=-1.0, max_val=1.0)
