@@ -1886,7 +1886,7 @@ def main():
         # Training parameters
         num_epochs=300,
         batch_size=32,
-        learning_rate=5e-3,
+        learning_rate=1e-4,
         weight_decay=0.1,
         mode="train",
         checkpoint_save_interval=30,
