@@ -686,6 +686,143 @@ def arc_collate_fn(batch: List[List[ARCTaskExample]]) -> List[ARCTaskExample]:
     return result
 
 
+class RoPE2D(nn.Module):
+    """2D Rotary Position Embeddings for grid-based data.
+    
+    Applies rotary embeddings based on 2D positions (row, col) in the grid.
+    For 5x5 grids, we have positions from (0,0) to (4,4).
+    """
+    
+    inv_freq: torch.Tensor
+    sin_cached: torch.Tensor
+    cos_cached: torch.Tensor
+
+    def __init__(self, d_model: int, max_grid_size: int = 5):
+        """Initialize 2D RoPE.
+        
+        Args:
+            d_model: Model dimension (must be divisible by 4 for 2D RoPE)
+            max_grid_size: Maximum grid size (default 5 for 5x5 grids)
+        """
+        super().__init__()
+        assert d_model % 4 == 0, "d_model must be divisible by 4 for 2D RoPE"
+        
+        self.d_model = d_model
+        self.max_grid_size = max_grid_size
+        
+        # Split dimensions: half for x-axis, half for y-axis
+        self.d_rope = d_model // 2  # Dimension per axis
+        
+        # Compute frequency bands
+        # For each axis, use d_rope/2 frequency bands
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, self.d_rope, 2).float() / self.d_rope))
+        self.register_buffer('inv_freq', inv_freq)
+        
+        # Precompute position encodings for all possible 2D positions
+        # Position 0: task token at (0, 0)
+        # Positions 1-25: input grid (row-major order)
+        # Positions 26-50: output grid (row-major order)
+        self._cache_rope_embeddings()
+    
+    def _cache_rope_embeddings(self):
+        """Precompute RoPE embeddings for all 51 positions."""
+        positions = []
+        
+        # Position 0: task token at (0, 0)
+        positions.append((0, 0))
+        
+        # Positions 1-25: input grid (row-major)
+        for row in range(self.max_grid_size):
+            for col in range(self.max_grid_size):
+                positions.append((row, col))
+        
+        # Positions 26-50: output grid (row-major)
+        for row in range(self.max_grid_size):
+            for col in range(self.max_grid_size):
+                positions.append((row, col))
+        
+        # Convert to tensors
+        rows = torch.tensor([p[0] for p in positions], dtype=torch.float32)
+        cols = torch.tensor([p[1] for p in positions], dtype=torch.float32)
+        
+        # Compute sin/cos for each axis
+        # Shape: (seq_len, d_rope/2)
+        row_emb = torch.outer(rows, self.inv_freq)
+        col_emb = torch.outer(cols, self.inv_freq)
+        
+        # Combine: (seq_len, d_rope/2) -> (seq_len, d_rope) for each axis
+        row_sin = torch.sin(row_emb)
+        row_cos = torch.cos(row_emb)
+        col_sin = torch.sin(col_emb)
+        col_cos = torch.cos(col_emb)
+        
+        # Stack to create full embedding: (seq_len, d_model)
+        # Interleave sin/cos for each dimension
+        sin_emb = torch.zeros(len(positions), self.d_model)
+        cos_emb = torch.zeros(len(positions), self.d_model)
+        
+        # First half: row embeddings
+        for i in range(self.d_rope // 2):
+            sin_emb[:, 4*i] = row_sin[:, i]
+            sin_emb[:, 4*i + 1] = row_sin[:, i]
+            cos_emb[:, 4*i] = row_cos[:, i]
+            cos_emb[:, 4*i + 1] = row_cos[:, i]
+        
+        # Second half: column embeddings
+        for i in range(self.d_rope // 2):
+            sin_emb[:, 4*i + 2] = col_sin[:, i]
+            sin_emb[:, 4*i + 3] = col_sin[:, i]
+            cos_emb[:, 4*i + 2] = col_cos[:, i]
+            cos_emb[:, 4*i + 3] = col_cos[:, i]
+        
+        self.register_buffer('sin_cached', sin_emb)
+        self.register_buffer('cos_cached', cos_emb)
+    
+    def apply_rope(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply rotary position embeddings to input.
+        
+        Args:
+            x: Input tensor of shape (batch_size, seq_len, d_model)
+        
+        Returns:
+            Tensor with RoPE applied, same shape as input
+        """
+        # Reshape for rotation: (batch_size, seq_len, d_model/2, 2)
+        x_rope = x.reshape(x.shape[0], x.shape[1], -1, 2)
+        
+        # Get sin/cos: (seq_len, d_model)
+        sin = self.sin_cached.unsqueeze(0)  # (1, seq_len, d_model)
+        cos = self.cos_cached.unsqueeze(0)  # (1, seq_len, d_model)
+        
+        # Reshape sin/cos: (1, seq_len, d_model/2, 2)
+        sin = sin.reshape(1, sin.shape[1], -1, 2)
+        cos = cos.reshape(1, cos.shape[1], -1, 2)
+        
+        # Apply rotation: x' = x * cos + rotate_half(x) * sin
+        # rotate_half swaps the two elements and negates the first
+        x1, x2 = x_rope[..., 0], x_rope[..., 1]
+        
+        # Rotation formula
+        x_rotated = torch.stack([
+            x1 * cos[..., 0] - x2 * sin[..., 0],
+            x2 * cos[..., 1] + x1 * sin[..., 1]
+        ], dim=-1)
+        
+        # Reshape back to (batch_size, seq_len, d_model)
+        return x_rotated.reshape(x.shape[0], x.shape[1], self.d_model)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+        
+        Args:
+            x: Input tensor of shape (batch_size, seq_len, d_model)
+        
+        Returns:
+            Tensor with RoPE applied
+        """
+        return self.apply_rope(x)
+
+
 class TransformerModel(nn.Module):
     """Non-causal transformer encoder for ARC tasks."""
 
@@ -723,8 +860,8 @@ class TransformerModel(nn.Module):
         # Linear input projection (vocab_size -> d_model)
         self.input_proj = nn.Linear(vocab_size, d_model, bias=False)
 
-        # Positional embedding (learnable)
-        self.pos_embedding = nn.Parameter(torch.randn(seq_len, d_model))
+        # 2D Rotary Position Embeddings
+        self.rope = RoPE2D(d_model=d_model, max_grid_size=5)
 
         # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
@@ -760,8 +897,8 @@ class TransformerModel(nn.Module):
         # Concatenate task embedding with grid tokens
         x = torch.cat([task_emb, x], dim=1)  # (batch_size, 51, d_model)
 
-        # Add positional embedding
-        x = x + self.pos_embedding.unsqueeze(0)  # (batch_size, 51, d_model)
+        # Apply 2D rotary position embeddings
+        x = self.rope(x)  # (batch_size, 51, d_model)
 
         # Apply transformer encoder
         x = self.transformer_encoder(x)  # (batch_size, 51, d_model)
@@ -1437,7 +1574,7 @@ def train(config: Config):
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     
     embedding_params = sum(p.numel() for p in model.task_embedding.parameters() if p.requires_grad)
-    embedding_params += model.pos_embedding.numel()
+    embedding_params += sum(p.numel() for p in model.rope.parameters() if p.requires_grad)
     
     other_params = total_params - embedding_params
     
