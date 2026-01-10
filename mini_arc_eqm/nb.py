@@ -1042,8 +1042,14 @@ def evaluate_denoising_accuracy(
         DenoisingResult containing accuracies and predicted grids
     """
 
-    # Create noised input by noising last 25 tokens
-    x_i = noise_last_25_tokens(x_clean, x_clean.device)
+    # Create noised input by replacing all last 25 tokens with random noise
+    x_i = x_clean.clone()
+    batch_size = x_i.shape[0]
+    # Generate random tokens (0-10, where 10 is mask token) for all last 25 positions
+    random_tokens = torch.randint(0, 11, (batch_size, 25), device=x_clean.device)
+    # Set all last 25 tokens to one-hot encoded random values
+    x_i[:, -25:, :] = 0
+    x_i[:, -25:, :].scatter_(2, random_tokens.unsqueeze(-1), 1)
 
     # Perform optimization to denoise
     opt_result = optimize_output_grid(
