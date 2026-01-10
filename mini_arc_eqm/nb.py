@@ -876,19 +876,22 @@ class TransformerModel(nn.Module):
         # Two linear output projection layers with transpose
         # First: (batch_size, 51, d_model) -> (batch_size, 51, 25)
         # Transpose: (batch_size, 51, 25) -> (batch_size, 25, 51)
-        # Second: (batch_size, 25, 51) -> (batch_size, 25, vocab_size)
+        # Dual heads: (batch_size, 25, 51) -> (batch_size, 25, vocab_size+1) each
         self.output_proj_1 = nn.Linear(d_model, 25)
-        self.output_proj_2 = nn.Linear(51, vocab_size)
+        self.output_proj_positive = nn.Linear(51, vocab_size + 1)  # +1 for "no change" index
+        self.output_proj_negative = nn.Linear(51, vocab_size + 1)  # +1 for "no change" index
 
-    def forward(self, x: torch.Tensor, task_indices: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, task_indices: torch.Tensor, temperature: float = 1.0) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass.
 
         Args:
             x: Input tensor of shape (batch_size, 50, vocab_size) - one-hot encoded grid tokens
             task_indices: Task indices of shape (batch_size,) - integer indices for task embeddings
+            temperature: Temperature for Gumbel softmax (default 1.0)
 
         Returns:
-            Output tensor of shape (batch_size, 25, vocab_size) - gradient for last 25 tokens only
+            Tuple of (positive_output, negative_output), each of shape (batch_size, 25, vocab_size+1)
+            These are Gumbel softmax outputs indicating where +1 and -1 should be in the target
         """
         
         # Get task embeddings
@@ -907,15 +910,19 @@ class TransformerModel(nn.Module):
         # Apply transformer encoder
         x = self.transformer_encoder(x)  # (batch_size, 51, d_model)
 
-        # Apply two output projections with transpose to use all 51 tokens
+        # Apply first output projection and transpose
         x = self.output_proj_1(x)  # (batch_size, 51, 25)
         x = x.transpose(1, 2)  # (batch_size, 25, 51)
-        x = self.output_proj_2(x)  # (batch_size, 25, vocab_size)
+        
+        # Dual heads for positive and negative
+        positive_logits = self.output_proj_positive(x)  # (batch_size, 25, vocab_size+1)
+        negative_logits = self.output_proj_negative(x)  # (batch_size, 25, vocab_size+1)
+        
+        # Apply Gumbel softmax
+        positive_output = torch.nn.functional.gumbel_softmax(positive_logits, tau=temperature, hard=True)
+        negative_output = torch.nn.functional.gumbel_softmax(negative_logits, tau=temperature, hard=True)
 
-        # Apply hard tanh to clamp values between -1 and 1
-        x = torch.nn.functional.hardtanh(x, min_val=-1.0, max_val=1.0)
-
-        return x
+        return positive_output, negative_output
 
 
 def optimize_output_grid(
@@ -940,10 +947,17 @@ def optimize_output_grid(
         DenoisingResult with optimized_output_tokens and best_grad_norm fields populated
     """
     batch_size = x_input.shape[0]
+    vocab_size = x_input.shape[2]
 
     with torch.no_grad():
         x = x_input.clone()
-        grad = model(x, task_indices)  # grad shape: (batch_size, 25, vocab_size)
+        
+        # Get dual-head output from model
+        positive_output, negative_output = model(x, task_indices)
+        
+        # Convert to gradient: positive probs - negative probs for each vocab index
+        # Shape: (batch_size, 25, vocab_size+1) -> (batch_size, 25, vocab_size)
+        grad = positive_output[:, :, :vocab_size] - negative_output[:, :, :vocab_size]
 
         # Track best grid and gradient norm per sample in batch
         best_grad_norm = torch.full((batch_size,), float("inf"), device=x_input.device)
@@ -957,7 +971,8 @@ def optimize_output_grid(
             x[:, -25:, :] = x[:, -25:, :] - eta * grad
 
             # Compute gradient
-            grad = model(x + mu * (x - x_last), task_indices)  # grad shape: (batch_size, 25, vocab_size)
+            positive_output, negative_output = model(x + mu * (x - x_last), task_indices)
+            grad = positive_output[:, :, :vocab_size] - negative_output[:, :, :vocab_size]
 
             # Calculate gradient norm per sample in batch
             grad_norm_per_sample = torch.norm(grad.view(batch_size, -1), dim=1)  # Shape: (batch_size,)
@@ -972,7 +987,7 @@ def optimize_output_grid(
             best_iteration = torch.where(improved_mask, torch.tensor(iteration, device=x_input.device), best_iteration)
             
             # Update best_x for improved samples
-            # Expand mask to match x dimensions: (batch_size, 200, vocab_size)
+            # Expand mask to match x dimensions: (batch_size, 50, vocab_size)
             improved_mask_expanded = improved_mask.view(batch_size, 1, 1).expand_as(x)
             best_x = torch.where(improved_mask_expanded, x, best_x)
 
@@ -1136,6 +1151,7 @@ def compute_loss_for_batch(
     """
     x = batch.to(device)  # (batch_size, 50, vocab_size)
     task_indices = task_indices.to(device)  # (batch_size,)
+    vocab_size = x.shape[2]
 
     # Create noisy input by noising last 25 tokens
     xg = noise_last_25_tokens(x, device)
@@ -1143,11 +1159,35 @@ def compute_loss_for_batch(
     # Create target as difference for last 25 tokens only
     target = xg[:, -25:, :] - x[:, -25:, :]  # (batch_size, 25, vocab_size)
 
-    # Forward pass - model now outputs (batch_size, 25, vocab_size)
-    output = model(xg, task_indices)  # (batch_size, 25, vocab_size)
+    # Create positive and negative targets (class indices) - vectorized
+    # Positive target: index where target is 1 (or vocab_size if all zeros)
+    # Negative target: index where target is -1 (or vocab_size if all zeros)
+    
+    # For positive target: find index of 1.0 in each position
+    positive_target = torch.argmax((target == 1.0).long(), dim=2)  # (batch_size, 25)
+    has_positive = (target == 1.0).any(dim=2)  # (batch_size, 25)
+    positive_target[~has_positive] = vocab_size
+    
+    # For negative target: find index of -1.0 in each position
+    negative_target = torch.argmax((target == -1.0).long(), dim=2)  # (batch_size, 25)
+    has_negative = (target == -1.0).any(dim=2)  # (batch_size, 25)
+    negative_target[~has_negative] = vocab_size
 
-    # Compute loss
-    loss = ((output - target) ** 2).mean()
+    # Forward pass - model now outputs two tensors (batch_size, 25, vocab_size+1) each
+    positive_output, negative_output = model(xg, task_indices)
+
+    # Compute cross-entropy loss on both heads
+    loss_positive = torch.nn.functional.cross_entropy(
+        positive_output.view(-1, vocab_size + 1), 
+        positive_target.view(-1)
+    )
+    loss_negative = torch.nn.functional.cross_entropy(
+        negative_output.view(-1, vocab_size + 1), 
+        negative_target.view(-1)
+    )
+
+    # Total loss is sum of both
+    loss = loss_positive + loss_negative
 
     return loss
 
