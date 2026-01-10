@@ -1313,7 +1313,7 @@ def learning_rate_test(
 
     batch_count = 0
     for examples in train_loader:
-        if batch_count >= 20:
+        if batch_count >= 30:
             break
 
         # Create optimizer with current learning rate
