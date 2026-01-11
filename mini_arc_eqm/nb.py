@@ -1885,8 +1885,8 @@ def main():
         eval_denoise_num_iterations=500,
         # Training parameters
         num_epochs=300,
-        batch_size=8,
-        learning_rate=2.5e-5,
+        batch_size=32,
+        learning_rate=1e-4,
         weight_decay=0.1,
         mode="train",
         checkpoint_save_interval=30,
