@@ -1874,7 +1874,7 @@ def main():
         nhead=8,
         num_layers=8,
         dim_feedforward=1024,
-        dropout=0.1,
+        dropout=0.3,
         # Data parameters
         seq_len=51,
         vocab_size=11,
@@ -1885,9 +1885,9 @@ def main():
         eval_denoise_num_iterations=500,
         # Training parameters
         num_epochs=300,
-        batch_size=32,
-        learning_rate=1e-4,
-        weight_decay=0.1,
+        batch_size=16,
+        learning_rate=5e-5,
+        weight_decay=1.0,
         mode="train",
         checkpoint_save_interval=30,
         # Google Drive location for Colab
