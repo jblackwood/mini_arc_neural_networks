@@ -1874,7 +1874,7 @@ def main():
         nhead=8,
         num_layers=8,
         dim_feedforward=1024,
-        dropout=0.3,
+        dropout=0.1,
         # Data parameters
         seq_len=51,
         vocab_size=11,
