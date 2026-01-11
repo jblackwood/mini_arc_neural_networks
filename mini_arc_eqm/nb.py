@@ -1887,7 +1887,7 @@ def main():
         num_epochs=300,
         batch_size=16,
         learning_rate=5e-5,
-        weight_decay=1.0,
+        weight_decay=0.1,
         mode="train",
         checkpoint_save_interval=30,
         # Google Drive location for Colab
