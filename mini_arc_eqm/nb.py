@@ -45,13 +45,10 @@ class Config:
     checkpoint_save_interval: int
 
     # Data parameters
-    seq_len: int
     vocab_size: int
 
     # Denoising evaluation parameters
     eval_denoise_epoch_interval: int
-    eval_denoise_mu: float
-    eval_denoise_eta: float
     eval_denoise_num_iterations: int
 
     # Google Drive location for Colab
@@ -108,9 +105,9 @@ class ARCTask:
 
 
 class ARCTaskExample(TypedDict):
-    """Typed dict for a single ARC example with one-hot encoded grids."""
-    input_grid: torch.Tensor  # Shape: (25, 10)
-    output_grid: torch.Tensor  # Shape: (25, 10)
+    """Typed dict for a single ARC example with token sequences."""
+    input_grid: torch.Tensor  # Shape: (25,) - token values
+    output_grid: torch.Tensor  # Shape: (25,) - token values
     example_type: Literal["train", "test"]
     task_id: str
 
@@ -122,8 +119,8 @@ class DenoisingResult:
     Attributes:
         accuracies: Optional tensor of shape (batch_size,) with accuracy for each task
         predicted_grids: Optional tensor of shape (batch_size, 5, 5) with predicted output grids
-        optimized_output_tokens: Optional tensor of shape (batch_size, 25, d_model) with optimized output tokens
-        best_grad_norm: Optional tensor of shape (batch_size,) with best gradient norm for each task
+        optimized_output_tokens: Optional tensor of shape (batch_size, 25) with optimized output token values
+        best_grad_norm: Optional tensor of shape (batch_size,) with number of changed tokens for each task
         best_iteration: Optional tensor of shape (batch_size,) with iteration of best grad norm for each task
     """
 
@@ -573,8 +570,8 @@ class ARCTaskDataset(Dataset):
     """PyTorch dataset that loads ARC tasks and returns list of example dicts.
 
     Each task returns a list of dicts, where each dict contains:
-    - input_grid: (25, 10) one-hot encoded input grid
-    - output_grid: (25, 10) one-hot encoded output grid
+    - input_grid: (25,) token values for the flattened input grid
+    - output_grid: (25,) token values for the flattened output grid
     - example_type: 'train' or 'test' indicating which set the example came from
     """
 
@@ -642,28 +639,23 @@ class ARCTaskDataset(Dataset):
                     f"Output grid must be 5x5, but got {output_height}x{output_width} in task {task_file.name}"
                 )
 
-            # Flatten input grid
+            # Flatten input grid into token sequence
             input_cells = []
             for row in example.input:
                 input_cells.extend(row)
             
-            # Flatten output grid
+            # Flatten output grid into token sequence
             output_cells = []
             for row in example.output:
                 output_cells.extend(row)
 
-            # Convert to one-hot encoding
-            input_one_hot = torch.zeros(25, self.vocab_size, dtype=torch.float32)
-            for i, cell_value in enumerate(input_cells):
-                input_one_hot[i, cell_value] = 1.0
-            
-            output_one_hot = torch.zeros(25, self.vocab_size, dtype=torch.float32)
-            for i, cell_value in enumerate(output_cells):
-                output_one_hot[i, cell_value] = 1.0
+            # Convert to tensors of token values (not one-hot)
+            input_tokens = torch.tensor(input_cells, dtype=torch.long)
+            output_tokens = torch.tensor(output_cells, dtype=torch.long)
 
             result.append(ARCTaskExample(
-                input_grid=input_one_hot,
-                output_grid=output_one_hot,
+                input_grid=input_tokens,
+                output_grid=output_tokens,
                 example_type=example_type,
                 task_id=task_id,
             ))
@@ -832,7 +824,6 @@ class TransformerModel(nn.Module):
         nhead: int,
         num_layers: int,
         dim_feedforward: int,
-        seq_len: int,
         vocab_size: int,
         dropout: float,
         num_tasks: int,
@@ -844,8 +835,7 @@ class TransformerModel(nn.Module):
             nhead: Number of attention heads
             num_layers: Number of transformer layers
             dim_feedforward: Dimension of feedforward network
-            seq_len: Sequence length (51 positions: 1 task token + 50 grid tokens)
-            vocab_size: Number of possible cell values (10 for ARC)
+            vocab_size: Number of possible cell values (11 for ARC: 0-9 colors + mask token)
             dropout: Dropout rate
             num_tasks: Number of unique tasks for task embedding
         """
@@ -857,8 +847,8 @@ class TransformerModel(nn.Module):
         # Task embedding layer
         self.task_embedding = nn.Embedding(num_tasks, d_model)
 
-        # Linear input projection (vocab_size -> d_model)
-        self.input_proj = nn.Linear(vocab_size, d_model, bias=False)
+        # Token embedding layer (vocab_size -> d_model)
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
 
         # 2D Rotary Position Embeddings
         self.rope = RoPE2D(d_model=d_model, max_grid_size=5)
@@ -878,26 +868,25 @@ class TransformerModel(nn.Module):
         # Transpose: (batch_size, 51, 25) -> (batch_size, 25, 51)
         # Second: (batch_size, 25, 51) -> (batch_size, 25, vocab_size+1)
         self.output_proj_1 = nn.Linear(d_model, 25)
-        self.output_proj_2 = nn.Linear(51, vocab_size + 1)  # +1 for "no change" index
+        self.output_proj_2 = nn.Linear(51, vocab_size + 1)  # +1 for "no change" token
 
-    def forward(self, x: torch.Tensor, task_indices: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, task_indices: torch.Tensor) -> torch.Tensor:
         """Forward pass.
 
         Args:
-            x: Input tensor of shape (batch_size, 50, vocab_size) - one-hot encoded grid tokens
+            x: Input tensor of shape (batch_size, 50) - tokens for input and output grids
             task_indices: Task indices of shape (batch_size,) - integer indices for task embeddings
-            temperature: Temperature for Gumbel softmax (default 1.0)
 
         Returns:
-            Tensor of shape (batch_size, 25, vocab_size+1) with logits for negative gradient
+            Tensor of shape (batch_size, 25, vocab_size+1) with logits for token change prediction
         """
         
         # Get task embeddings
         task_emb = self.task_embedding(task_indices)  # (batch_size, d_model)
         task_emb = task_emb.unsqueeze(1)  # (batch_size, 1, d_model)
         
-        # Apply input projection to grid tokens
-        x = self.input_proj(x)  # (batch_size, 50, d_model)
+        # Apply token embedding to grid tokens
+        x = self.token_embedding(x)  # (batch_size, 50, d_model)
         
         # Concatenate task embedding with grid tokens
         x = torch.cat([task_emb, x], dim=1)  # (batch_size, 51, d_model)
@@ -913,97 +902,69 @@ class TransformerModel(nn.Module):
         x = x.transpose(1, 2)  # (batch_size, 25, 51)
         
         # Second output projection
-        negative_logits = self.output_proj_2(x)  # (batch_size, 25, vocab_size+1)
+        logits = self.output_proj_2(x)  # (batch_size, 25, vocab_size+1)
         
         # Return raw logits for training (cross-entropy expects logits)
-        return negative_logits
+        return logits
 
 
 def optimize_output_grid(
-    model,
+    model: TransformerModel,
     x_input: torch.Tensor,
     task_indices: torch.Tensor,
-    mu: float,
-    eta: float,
     num_iterations: int,
 ) -> DenoisingResult:
-    """Optimize the output grid using gradient descent.
+    """Optimize the output grid using iterative token prediction.
 
     Args:
-        model: The transformer model to use for computing gradients
-        x_input: Input tensor of shape (batch_size, 50, vocab_size)
+        model: The transformer model to use for computing token predictions
+        x_input: Input tensor of shape (batch_size, 50) - tokens
         task_indices: Task indices of shape (batch_size,)
-        mu: Momentum parameter for gradient computation
-        eta: Learning rate for optimization
         num_iterations: Number of optimization iterations
 
     Returns:
         DenoisingResult with optimized_output_tokens and best_grad_norm fields populated
     """
     batch_size = x_input.shape[0]
-    vocab_size = x_input.shape[2]
+    vocab_size = model.vocab_size
+    no_change_token = vocab_size  # The "no change" token
 
     with torch.no_grad():
         x = x_input.clone()
-        
-        # Get negative gradient from model (returns logits)
-        negative_logits = model(x, task_indices)
-        
-        # Use Gumbel softmax for sampling to get probabilities
-        negative_grad = torch.nn.functional.gumbel_softmax(negative_logits, tau=1.0, hard=True)
-        
-        # Derive positive gradient based on negative_grad and current values
-        # Current values (last 25 tokens): x[:, -25:, :vocab_size]
-        # Shape: (batch_size, 25, vocab_size)
-        current_values = x[:, -25:, :vocab_size]
-        
-        # Check if "no change" is selected in negative_grad (last column)
-        # Shape: (batch_size, 25)
-        no_change_selected = negative_grad[:, :, vocab_size]
-        
-        # Create positive_grad base with current_values and zero "no change" column
-        positive_grad = torch.cat([current_values, torch.zeros(batch_size, 25, 1, device=x.device)], dim=2)
-        
-        # Where no_change is selected, zero out all vocab indices and set "no change" to 1
-        no_change_mask = no_change_selected.unsqueeze(-1)  # (batch_size, 25, 1)
-        positive_grad[:, :, :vocab_size] = positive_grad[:, :, :vocab_size] * (1 - no_change_mask)
-        positive_grad[:, :, vocab_size] = no_change_selected
-        
-        # Convert to gradient: positive probs - negative probs for each vocab index
-        # Shape: (batch_size, 25, vocab_size+1) -> (batch_size, 25, vocab_size)
-        grad = positive_grad[:, :, :vocab_size] - negative_grad[:, :, :vocab_size]
 
-        # Track best grid and gradient norm per sample in batch
+        # Track best grid and number of changes per sample in batch
         best_grad_norm = torch.full((batch_size,), float("inf"), device=x_input.device)
         best_iteration = torch.zeros((batch_size,), dtype=torch.long, device=x_input.device)
         best_x = x.clone()
 
         for iteration in range(num_iterations):
-            x_last = x.clone()
-
-            # Update x - only update last 25 tokens
-            x[:, -25:, :] = x[:, -25:, :] - eta * grad
-
-            # Compute gradient
-            x_momentum = x + mu * (x - x_last)
-            negative_logits = model(x_momentum, task_indices)
-            negative_grad = torch.nn.functional.gumbel_softmax(negative_logits, tau=1.0, hard=True)
+            # Get logits from model
+            logits = model(x, task_indices)  # (batch_size, 25, vocab_size+1)
             
-            # Derive positive gradient from current values
-            current_values = x_momentum[:, -25:, :vocab_size]
-            no_change_selected = negative_grad[:, :, vocab_size]
-            positive_grad = torch.cat([current_values, torch.zeros(batch_size, 25, 1, device=x.device)], dim=2)
-            no_change_mask = no_change_selected.unsqueeze(-1)
-            positive_grad[:, :, :vocab_size] = positive_grad[:, :, :vocab_size] * (1 - no_change_mask)
-            positive_grad[:, :, vocab_size] = no_change_selected
+            # Use Gumbel softmax for sampling to get hard one-hot predictions
+            one_hot_predictions = torch.nn.functional.gumbel_softmax(logits, tau=1.0, hard=True)
             
-            grad = positive_grad[:, :, :vocab_size] - negative_grad[:, :, :vocab_size]
+            # Convert one-hot to tokens
+            token_change_predictions = torch.argmax(one_hot_predictions, dim=2)  # (batch_size, 25)
+            
+            # Update x: where token_change_predictions is no_change_token, keep x's token unchanged
+            # Where it's not no_change_token, replace x's token with the predicted token
+            is_no_change = (token_change_predictions == no_change_token)  # (batch_size, 25)
+            
+            # Get current output tokens
+            current_output = x[:, -25:]  # (batch_size, 25)
+            
+            # New output: keep current where no_change, otherwise use prediction
+            new_output = torch.where(is_no_change, current_output, token_change_predictions)
+            
+            # Update x with new output tokens
+            x[:, -25:] = new_output
+            
+            # Calculate grad_norm_per_sample as count of tokens that are not no_change_token
+            grad_norm_per_sample = (~is_no_change).sum(dim=1).float()  # (batch_size,)
 
-            # Calculate gradient norm per sample in batch
-            grad_norm_per_sample = torch.norm(grad.view(batch_size, -1), dim=1)  # Shape: (batch_size,)
-
-            # Update best grid for each sample if current gradient norm is lower
-            improved_mask = grad_norm_per_sample < best_grad_norm  # Shape: (batch_size,)
+            # Update best grid for each sample if current "grad norm" (change count) is lower
+            improved_mask = grad_norm_per_sample < best_grad_norm  # (batch_size,)
             
             # Update best_grad_norm for improved samples
             best_grad_norm = torch.where(improved_mask, grad_norm_per_sample, best_grad_norm)
@@ -1012,31 +973,31 @@ def optimize_output_grid(
             best_iteration = torch.where(improved_mask, torch.tensor(iteration, device=x_input.device), best_iteration)
             
             # Update best_x for improved samples
-            # Expand mask to match x dimensions: (batch_size, 50, vocab_size)
-            improved_mask_expanded = improved_mask.view(batch_size, 1, 1).expand_as(x)
+            # Expand mask to match x dimensions: (batch_size, 50)
+            improved_mask_expanded = improved_mask.view(batch_size, 1).expand_as(x)
             best_x = torch.where(improved_mask_expanded, x, best_x)
 
-        # Use the best x (with lowest gradient norm) as final result
+        # Use the best x (with lowest change count) as final result
         x = best_x
 
-    # Return DenoisingResult with optimized tokens and best grad norm per sample
+    # Return DenoisingResult with optimized tokens and best change count per sample
     return DenoisingResult(
-        optimized_output_tokens=x[:, -25:, :],
+        optimized_output_tokens=x[:, -25:],
         best_grad_norm=best_grad_norm,
         best_iteration=best_iteration,
     )
 
 
 def decode_grids(tokens: torch.Tensor, vocab_size: int) -> torch.Tensor:
-    """Decode grid tokens to integer values using vectorized operations.
+    """Decode grid tokens to 5x5 grid format.
 
     Args:
-        tokens: Tensor of shape (batch_size, num_tokens, vocab_size) containing grid tokens
+        tokens: Tensor of shape (batch_size, num_tokens) containing one-hot encoded token values,
                 where num_tokens should be a multiple of 25 (for 5x5 grids)
-        vocab_size: Number of possible cell values
+        vocab_size: Number of possible cell values (unused, kept for API compatibility)
 
     Returns:
-        Tensor of shape (batch_size, num_grids, 5, 5) with decoded integer values
+        Tensor of shape (batch_size, num_grids, 5, 5) with token values reshaped as grids
         where num_grids = num_tokens // 25
     """
     batch_size = tokens.shape[0]
@@ -1048,56 +1009,44 @@ def decode_grids(tokens: torch.Tensor, vocab_size: int) -> torch.Tensor:
 
     num_grids = num_tokens // 25
 
-    # Take argmax of all dimensions for all tokens at once
-    # Shape: (batch_size, num_tokens)
-    decoded_values = torch.argmax(tokens[:, :, :vocab_size], dim=2)
-    
     # Reshape to (batch_size, num_grids, 5, 5)
-    decoded_grids = decoded_values.view(batch_size, num_grids, 5, 5)
+    decoded_grids = tokens.view(batch_size, num_grids, 5, 5)
     
     return decoded_grids
 
 
 def evaluate_denoising_accuracy(
-    model,
+    model: TransformerModel,
     x_clean: torch.Tensor,
     task_indices: torch.Tensor,
-    vocab_size: int,
-    mu: float,
-    eta: float,
     num_iterations: int,
 ) -> DenoisingResult:
     """Evaluate denoising accuracy by corrupting and denoising output grids.
 
     Args:
         model: The transformer model to use for computing gradients
-        x_clean: Clean input tensor of shape (batch_size, 50, vocab_size)
+        x_clean: Clean input tensor of shape (batch_size, 50) - tokens
         task_indices: Task indices of shape (batch_size,)
-        vocab_size: Number of possible cell values
-        mu: Momentum parameter for gradient computation
-        eta: Learning rate for optimization
         num_iterations: Number of optimization iterations
 
     Returns:
         DenoisingResult containing accuracies and predicted grids
     """
+    vocab_size = model.vocab_size
 
     # Create noised input by replacing all last 25 tokens with random noise
     x_i = x_clean.clone()
     batch_size = x_i.shape[0]
     # Generate random tokens (0-10, where 10 is mask token) for all last 25 positions
     random_tokens = torch.randint(0, 11, (batch_size, 25), device=x_clean.device)
-    # Set all last 25 tokens to one-hot encoded random values
-    x_i[:, -25:, :] = 0
-    x_i[:, -25:, :].scatter_(2, random_tokens.unsqueeze(-1), 1)
+    # Set all last 25 tokens to random values
+    x_i[:, -25:] = random_tokens
 
     # Perform optimization to denoise
     opt_result = optimize_output_grid(
         model=model,
         x_input=x_i,
         task_indices=task_indices,
-        mu=mu,
-        eta=eta,
         num_iterations=num_iterations,
     )
 
@@ -1109,7 +1058,7 @@ def evaluate_denoising_accuracy(
     predicted_grids = predicted_grids[:, 0, :, :]  # Shape: (batch_size, 5, 5)
 
     # Decode the true output grids (last 25 tokens)
-    true_output_tokens = x_clean[:, -25:, :]  # Shape: (batch_size, 25, vocab_size)
+    true_output_tokens = x_clean[:, -25:]  # Shape: (batch_size, 25)
     true_grids = decode_grids(true_output_tokens, vocab_size)  # Shape: (batch_size, 1, 5, 5)
     true_grids = true_grids[:, 0, :, :]  # Shape: (batch_size, 5, 5)
 
@@ -1125,12 +1074,13 @@ def evaluate_denoising_accuracy(
     )
 
 
-def noise_last_25_tokens(batch: torch.Tensor, device: torch.device) -> torch.Tensor:
+def noise_last_25_tokens(batch: torch.Tensor, device: torch.device, vocab_size: int) -> torch.Tensor:
     """Noise the last 25 tokens by randomly replacing 0-25 of them with random values.
     
     Args:
-        batch: Batch tensor of shape (batch_size, 50, vocab_size)
+        batch: Batch tensor of shape (batch_size, 50) - tokens
         device: Device to perform operations on
+        vocab_size: Size of vocabulary for random token generation
     
     Returns:
         Noised batch tensor of same shape
@@ -1149,16 +1099,15 @@ def noise_last_25_tokens(batch: torch.Tensor, device: torch.device) -> torch.Ten
             # Select random positions in last 25 tokens (indices 25-49)
             positions = torch.randperm(25, device=device)[:n_random] + 25
             
-            # Replace with random tokens (0-10, where 10 is mask token)
-            random_tokens = torch.randint(0, 11, (int(n_random),), device=device)
-            noised_batch[i, positions, :] = 0
-            noised_batch[i, positions, random_tokens] = 1
+            # Replace with random tokens (0 to vocab_size-1)
+            random_tokens = torch.randint(0, vocab_size, (int(n_random),), device=device)
+            noised_batch[i, positions] = random_tokens
     
     return noised_batch
 
 
 def compute_loss_for_batch(
-    model: nn.Module,
+    model: TransformerModel,
     batch: torch.Tensor,
     task_indices: torch.Tensor,
     device: torch.device,
@@ -1167,45 +1116,46 @@ def compute_loss_for_batch(
 
     Args:
         model: The transformer model
-        batch: Batch of one-hot encoded cell values, shape (batch_size, 50, vocab_size)
+        batch: Batch of tokens, shape (batch_size, 50)
         task_indices: Task indices of shape (batch_size,)
         device: Device to compute on
 
     Returns:
         Loss tensor (scalar)
     """
-    x = batch.to(device)  # (batch_size, 50, vocab_size)
+    x = batch.to(device)  # (batch_size, 50)
     task_indices = task_indices.to(device)  # (batch_size,)
-    vocab_size = x.shape[2]
+    vocab_size = model.vocab_size
+    
+    # no_change_token is the largest token value (vocab_size)
+    no_change_token = vocab_size
 
     # Create noisy input by noising last 25 tokens
-    xg = noise_last_25_tokens(x, device)
+    xg = noise_last_25_tokens(x, device, vocab_size)
 
-    # Create target as difference for last 25 tokens only
-    target = xg[:, -25:, :] - x[:, -25:, :]  # (batch_size, 25, vocab_size)
-
-    # Create negative target (class indices) - vectorized
-    # Negative target: index where target is -1 (or vocab_size if all zeros)
+    # Create target: vocab_size (no_change_token) if xg and x have same token, else x's token
+    # Shape: (batch_size, 25)
+    x_output = x[:, -25:]  # (batch_size, 25) - clean output tokens
+    xg_output = xg[:, -25:]  # (batch_size, 25) - noised output tokens
     
-    # For negative target: find index of -1.0 in each position
-    negative_target = torch.argmax((target == -1.0).long(), dim=2)  # (batch_size, 25)
-    has_negative = (target == -1.0).any(dim=2)  # (batch_size, 25)
-    negative_target[~has_negative] = vocab_size
+    # Where tokens are the same, target is no_change_token; otherwise target is x's token
+    same_mask = (x_output == xg_output)  # (batch_size, 25)
+    target = torch.where(same_mask, no_change_token, x_output)  # (batch_size, 25)
 
     # Forward pass - model returns logits (batch_size, 25, vocab_size+1)
-    negative_logits = model(xg, task_indices)
+    logits = model(xg, task_indices)
 
     # Compute cross-entropy loss (expects logits)
     loss = torch.nn.functional.cross_entropy(
-        negative_logits.view(-1, vocab_size + 1), 
-        negative_target.view(-1)
+        logits.view(-1, vocab_size + 1), 
+        target.view(-1)
     )
 
     return loss
 
 
 def train_epoch(
-    model: nn.Module,
+    model: TransformerModel,
     train_loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
@@ -1228,16 +1178,16 @@ def train_epoch(
     num_batches = 0
 
     for examples in train_loader:
-        # Concat input and output grids into (50, 10) tensors
+        # Concat input and output grids into (50,) token tensors
         batch_tensors = []
         task_ids = []
         for example in examples:
-            concatenated = torch.cat([example["input_grid"], example["output_grid"]], dim=0)  # (50, 10)
+            concatenated = torch.cat([example["input_grid"], example["output_grid"]], dim=0)  # (50,)
             batch_tensors.append(concatenated)
             task_ids.append(example["task_id"])
         
         # Stack into batch
-        batch = torch.stack(batch_tensors, dim=0)  # (batch_size, 50, 10)
+        batch = torch.stack(batch_tensors, dim=0)  # (batch_size, 50)
         
         # Convert task_ids to indices
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
@@ -1257,7 +1207,7 @@ def train_epoch(
 
 
 def test_epoch(
-    model: nn.Module,
+    model: TransformerModel,
     test_loader: DataLoader,
     device: torch.device,
     task_id_to_index: Dict[str, int],
@@ -1279,16 +1229,16 @@ def test_epoch(
 
     with torch.no_grad():
         for examples in test_loader:
-            # Concat input and output grids into (50, 10) tensors
+            # Concat input and output grids into (50,) token tensors
             batch_tensors = []
             task_ids = []
             for example in examples:
-                concatenated = torch.cat([example["input_grid"], example["output_grid"]], dim=0)  # (50, 10)
+                concatenated = torch.cat([example["input_grid"], example["output_grid"]], dim=0)  # (50,)
                 batch_tensors.append(concatenated)
                 task_ids.append(example["task_id"])
             
             # Stack into batch
-            batch = torch.stack(batch_tensors, dim=0)  # (batch_size, 50, 10)
+            batch = torch.stack(batch_tensors, dim=0)  # (batch_size, 50)
             
             # Convert task_ids to indices
             task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
@@ -1303,7 +1253,7 @@ def test_epoch(
 
 
 def learning_rate_test(
-    model: nn.Module,
+    model: TransformerModel,
     train_loader: DataLoader,
     device: torch.device,
     weight_decay: float,
@@ -1337,11 +1287,11 @@ def learning_rate_test(
         batch_tensors = []
         task_ids = []
         for example in examples:
-            concatenated = torch.cat([example["input_grid"], example["output_grid"]], dim=0)
+            concatenated = torch.cat([example["input_grid"], example["output_grid"]], dim=0)  # (50,)
             batch_tensors.append(concatenated)
             task_ids.append(example["task_id"])
         
-        batch = torch.stack(batch_tensors, dim=0)
+        batch = torch.stack(batch_tensors, dim=0)  # (batch_size, 50)
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
 
         # Compute loss
@@ -1363,7 +1313,7 @@ def learning_rate_test(
 
 
 def weight_decay_test(
-    model: nn.Module,
+    model: TransformerModel,
     train_loader: DataLoader,
     device: torch.device,
     learning_rate: float,
@@ -1397,11 +1347,11 @@ def weight_decay_test(
         batch_tensors = []
         task_ids = []
         for example in examples:
-            concatenated = torch.cat([example["input_grid"], example["output_grid"]], dim=0)
+            concatenated = torch.cat([example["input_grid"], example["output_grid"]], dim=0)  # (50,)
             batch_tensors.append(concatenated)
             task_ids.append(example["task_id"])
         
-        batch = torch.stack(batch_tensors, dim=0)
+        batch = torch.stack(batch_tensors, dim=0)  # (batch_size, 50)
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
 
         # Compute loss
@@ -1423,13 +1373,10 @@ def weight_decay_test(
 
 
 def evaluate_denoising(
-    model: nn.Module,
+    model: TransformerModel,
     train_dataset: ARCTaskDataset,
     test_dataset: ARCTaskDataset,
     device: torch.device,
-    vocab_size: int,
-    eval_denoise_mu: float,
-    eval_denoise_eta: float,
     eval_denoise_num_iterations: int,
     task_id_to_index: Dict[str, int],
     writer: Optional[SummaryWriter] = None,
@@ -1442,9 +1389,6 @@ def evaluate_denoising(
         train_dataset: Training dataset
         test_dataset: Test dataset
         device: Device to evaluate on
-        vocab_size: Number of possible cell values
-        eval_denoise_mu: Momentum parameter for gradient computation
-        eval_denoise_eta: Learning rate for optimization
         eval_denoise_num_iterations: Number of optimization iterations
         task_id_to_index: Mapping from task_id strings to integer indices
         writer: Optional tensorboard writer for logging
@@ -1481,21 +1425,18 @@ def evaluate_denoising(
         for task_idx, _ in train_original_tasks:
             examples = train_dataset[task_idx]
             for example in examples:
-                # Concat input and output grids into (50, 10) tensor
+                # Concat input and output grids into (50,) token tensor
                 concatenated = torch.cat([example["input_grid"], example["output_grid"]], dim=0)
                 train_tensors.append(concatenated)
                 train_task_ids.append(example["task_id"])
         
-        train_batch = torch.stack(train_tensors, dim=0).to(device)  # (num_examples, 50, 10)
+        train_batch = torch.stack(train_tensors, dim=0).to(device)  # (num_examples, 50)
         train_task_indices = torch.tensor([task_id_to_index[tid] for tid in train_task_ids], dtype=torch.long, device=device)
 
         train_result = evaluate_denoising_accuracy(
             model=model,
             x_clean=train_batch,
             task_indices=train_task_indices,
-            vocab_size=vocab_size,
-            mu=eval_denoise_mu,
-            eta=eval_denoise_eta,
             num_iterations=eval_denoise_num_iterations,
         )
 
@@ -1508,21 +1449,18 @@ def evaluate_denoising(
         for task_idx, _ in test_original_tasks:
             examples = test_dataset[task_idx]
             for example in examples:
-                # Concat input and output grids into (50, 10) tensor
+                # Concat input and output grids into (50,) token tensor
                 concatenated = torch.cat([example["input_grid"], example["output_grid"]], dim=0)
                 test_tensors.append(concatenated)
                 test_task_ids.append(example["task_id"])
         
-        test_batch = torch.stack(test_tensors, dim=0).to(device)  # (num_examples, 50, 10)
+        test_batch = torch.stack(test_tensors, dim=0).to(device)  # (num_examples, 50)
         test_task_indices = torch.tensor([task_id_to_index[tid] for tid in test_task_ids], dtype=torch.long, device=device)
 
         test_result = evaluate_denoising_accuracy(
             model=model,
             x_clean=test_batch,
             task_indices=test_task_indices,
-            vocab_size=vocab_size,
-            mu=eval_denoise_mu,
-            eta=eval_denoise_eta,
             num_iterations=eval_denoise_num_iterations,
         )
 
@@ -1684,7 +1622,6 @@ def train(config: Config):
         nhead=config.nhead,
         num_layers=config.num_layers,
         dim_feedforward=config.dim_feedforward,
-        seq_len=config.seq_len,
         vocab_size=config.vocab_size,
         dropout=config.dropout,
         num_tasks=num_tasks,
@@ -1750,9 +1687,6 @@ def train(config: Config):
             train_dataset=train_dataset_eval,
             test_dataset=test_dataset_eval,
             device=device,
-            vocab_size=config.vocab_size,
-            eval_denoise_mu=config.eval_denoise_mu,
-            eval_denoise_eta=config.eval_denoise_eta,
             eval_denoise_num_iterations=config.eval_denoise_num_iterations,
             task_id_to_index=task_id_to_index,
         )
@@ -1804,9 +1738,6 @@ def train(config: Config):
                 train_dataset=train_dataset_eval,
                 test_dataset=test_dataset_eval,
                 device=device,
-                vocab_size=config.vocab_size,
-                eval_denoise_mu=config.eval_denoise_mu,
-                eval_denoise_eta=config.eval_denoise_eta,
                 eval_denoise_num_iterations=config.eval_denoise_num_iterations,
                 task_id_to_index=task_id_to_index,
                 writer=writer,
@@ -1830,7 +1761,6 @@ def train(config: Config):
                         "nhead": config.nhead,
                         "num_layers": config.num_layers,
                         "dim_feedforward": config.dim_feedforward,
-                        "seq_len": config.seq_len,
                         "vocab_size": config.vocab_size,
                         "dropout": config.dropout,
                     },
@@ -1859,7 +1789,6 @@ def train(config: Config):
                 "nhead": config.nhead,
                 "num_layers": config.num_layers,
                 "dim_feedforward": config.dim_feedforward,
-                "seq_len": config.seq_len,
                 "vocab_size": config.vocab_size,
                 "dropout": config.dropout,
             },
@@ -1885,12 +1814,9 @@ def main():
         dim_feedforward=1024,
         dropout=0.1,
         # Data parameters
-        seq_len=51,
         vocab_size=11,
         # Denoising evaluation parameters
         eval_denoise_epoch_interval=1,
-        eval_denoise_mu=0,
-        eval_denoise_eta=1,
         eval_denoise_num_iterations=500,
         # Training parameters
         num_epochs=300,
