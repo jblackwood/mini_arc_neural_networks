@@ -941,11 +941,8 @@ def optimize_output_grid(
             # Get logits from model
             logits = model(x, task_indices)  # (batch_size, 25, vocab_size+1)
             
-            # Use Gumbel softmax for sampling to get hard one-hot predictions
-            one_hot_predictions = torch.nn.functional.gumbel_softmax(logits, tau=1.0, hard=True)
-            
-            # Convert one-hot to tokens
-            token_change_predictions = torch.argmax(one_hot_predictions, dim=2)  # (batch_size, 25)
+            # Get the most likely token for each position
+            token_change_predictions = torch.argmax(logits, dim=2)  # (batch_size, 25)
             
             # Update x: where token_change_predictions is no_change_token, keep x's token unchanged
             # Where it's not no_change_token, replace x's token with the predicted token
