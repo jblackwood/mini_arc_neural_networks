@@ -679,10 +679,10 @@ def arc_collate_fn(batch: List[List[ARCTaskExample]]) -> List[ARCTaskExample]:
 
 
 class RoPE2D(nn.Module):
-    """2D Rotary Position Embeddings for grid-based data.
+    """2D Rotary Position Embeddings for 5x5 grids.
     
-    Applies rotary embeddings based on 2D positions (row, col) in the grid.
-    For 5x5 grids, we have positions from (0,0) to (4,4).
+    Applies rotary embeddings based on 2D positions (row, col) in a 5x5 grid.
+    Works with sequences of 25 tokens representing grid positions (0,0) to (4,4).
     """
     
     inv_freq: torch.Tensor
@@ -710,25 +710,17 @@ class RoPE2D(nn.Module):
         inv_freq = 1.0 / (10000 ** (torch.arange(0, self.d_rope, 2).float() / self.d_rope))
         self.register_buffer('inv_freq', inv_freq)
         
-        # Precompute position encodings for all possible 2D positions
-        # Position 0: task token at (0, 0)
-        # Positions 1-25: input grid (row-major order)
-        # Positions 26-50: output grid (row-major order)
+        # Precompute position encodings for 25 grid positions (row-major order)
         self._cache_rope_embeddings()
     
     def _cache_rope_embeddings(self):
-        """Precompute RoPE embeddings for all 51 positions."""
+        """Precompute RoPE embeddings for 25 grid positions.
+        
+        Positions 0-24: grid cells in row-major order, positions (0,0) to (4,4)
+        """
         positions = []
         
-        # Position 0: task token at (0, 0)
-        positions.append((0, 0))
-        
-        # Positions 1-25: input grid (row-major)
-        for row in range(self.max_grid_size):
-            for col in range(self.max_grid_size):
-                positions.append((row, col))
-        
-        # Positions 26-50: output grid (row-major)
+        # Positions 0-24: grid positions in row-major order
         for row in range(self.max_grid_size):
             for col in range(self.max_grid_size):
                 positions.append((row, col))
@@ -770,25 +762,27 @@ class RoPE2D(nn.Module):
         self.register_buffer('sin_cached', sin_emb)
         self.register_buffer('cos_cached', cos_emb)
     
-    def apply_rope(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply rotary position embeddings to input.
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply rotary position embeddings to a 5x5 grid.
         
         Args:
-            x: Input tensor of shape (batch_size, seq_len, d_model)
+            x: Input tensor of shape (batch_size, 25, d_model) representing a flattened 5x5 grid
         
         Returns:
             Tensor with RoPE applied, same shape as input
         """
-        # Reshape for rotation: (batch_size, seq_len, d_model/2, 2)
-        x_rope = x.reshape(x.shape[0], x.shape[1], -1, 2)
+        assert x.shape[1] == 25, f"Expected sequence length 25 for 5x5 grid, got {x.shape[1]}"
         
-        # Get sin/cos: (seq_len, d_model)
-        sin = self.sin_cached.unsqueeze(0)  # (1, seq_len, d_model)
-        cos = self.cos_cached.unsqueeze(0)  # (1, seq_len, d_model)
+        # Reshape for rotation: (batch_size, 25, d_model/2, 2)
+        x_rope = x.reshape(x.shape[0], 25, -1, 2)
         
-        # Reshape sin/cos: (1, seq_len, d_model/2, 2)
-        sin = sin.reshape(1, sin.shape[1], -1, 2)
-        cos = cos.reshape(1, cos.shape[1], -1, 2)
+        # Get sin/cos: (25, d_model)
+        sin = self.sin_cached.unsqueeze(0)  # (1, 25, d_model)
+        cos = self.cos_cached.unsqueeze(0)  # (1, 25, d_model)
+        
+        # Reshape sin/cos: (1, 25, d_model/2, 2)
+        sin = sin.reshape(1, 25, -1, 2)
+        cos = cos.reshape(1, 25, -1, 2)
         
         # Apply rotation: x' = x * cos + rotate_half(x) * sin
         # rotate_half swaps the two elements and negates the first
@@ -800,19 +794,8 @@ class RoPE2D(nn.Module):
             x2 * cos[..., 1] + x1 * sin[..., 1]
         ], dim=-1)
         
-        # Reshape back to (batch_size, seq_len, d_model)
-        return x_rotated.reshape(x.shape[0], x.shape[1], self.d_model)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
-        
-        Args:
-            x: Input tensor of shape (batch_size, seq_len, d_model)
-        
-        Returns:
-            Tensor with RoPE applied
-        """
-        return self.apply_rope(x)
+        # Reshape back to (batch_size, 25, d_model)
+        return x_rotated.reshape(x.shape[0], 25, self.d_model)
 
 
 class TransformerModel(nn.Module):
@@ -850,6 +833,11 @@ class TransformerModel(nn.Module):
         # Token embedding layer (vocab_size -> d_model)
         self.token_embedding = nn.Embedding(vocab_size, d_model)
 
+        # Learnable position embeddings for task token and grid types
+        self.task_embedding_position = nn.Parameter(torch.randn(d_model))
+        self.input_grid_embedding = nn.Parameter(torch.randn(d_model))
+        self.output_grid_embedding = nn.Parameter(torch.randn(d_model))
+
         # 2D Rotary Position Embeddings
         self.rope = RoPE2D(d_model=d_model, max_grid_size=5)
 
@@ -881,18 +869,28 @@ class TransformerModel(nn.Module):
             Tensor of shape (batch_size, 25, vocab_size+1) with logits for token change prediction
         """
         
-        # Get task embeddings
+        # Get task embeddings and add task position embedding
         task_emb = self.task_embedding(task_indices)  # (batch_size, d_model)
+        task_emb = task_emb + self.task_embedding_position  # Add task position embedding
         task_emb = task_emb.unsqueeze(1)  # (batch_size, 1, d_model)
         
         # Apply token embedding to grid tokens
         x = self.token_embedding(x)  # (batch_size, 50, d_model)
         
-        # Concatenate task embedding with grid tokens
-        x = torch.cat([task_emb, x], dim=1)  # (batch_size, 51, d_model)
-
-        # Apply 2D rotary position embeddings
-        x = self.rope(x)  # (batch_size, 51, d_model)
+        # Split into input and output grids
+        input_grid = x[:, :25, :]  # (batch_size, 25, d_model)
+        output_grid = x[:, 25:, :]  # (batch_size, 25, d_model)
+        
+        # Add grid type embeddings
+        input_grid = input_grid + self.input_grid_embedding  # (batch_size, 25, d_model)
+        output_grid = output_grid + self.output_grid_embedding  # (batch_size, 25, d_model)
+        
+        # Apply 2D rotary position embeddings separately to each grid
+        input_grid = self.rope(input_grid)  # (batch_size, 25, d_model)
+        output_grid = self.rope(output_grid)  # (batch_size, 25, d_model)
+        
+        # Concatenate: task token, input grid with RoPE, output grid with RoPE
+        x = torch.cat([task_emb, input_grid, output_grid], dim=1)  # (batch_size, 51, d_model)
 
         # Apply transformer encoder
         x = self.transformer_encoder(x)  # (batch_size, 51, d_model)
