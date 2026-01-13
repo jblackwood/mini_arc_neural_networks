@@ -1708,17 +1708,32 @@ def train(config: Config):
         # Calculate epoch time
         epoch_time = time.time() - epoch_start_time
 
+        # Calculate model weight norm (L2 norm of all parameters)
+        total_norm_sq = torch.tensor(0.0, device=device)
+        for p in model.parameters():
+            total_norm_sq += p.pow(2).sum()
+        model_weight_norm = torch.sqrt(total_norm_sq).item()
+
+        # Calculate logit scale (norm of output projection layer weights)
+        logit_scale = torch.sqrt(
+            model.output_proj_2.weight.pow(2).sum()
+        ).item()
+
         # Log to console
         print(
             f"Epoch {epoch + 1}/{start_epoch + config.num_epochs} - "
             f"Train Loss: {train_loss:.6f}, Test Loss: {test_loss:.6f}, "
-            f"Time: {epoch_time:.2f}s"
+            f"Time: {epoch_time:.2f}s, "
+            f"Weight Norm: {model_weight_norm:.4f}, "
+            f"Logit Scale: {logit_scale:.4f}"
         )
 
         # Log to tensorboard
         writer.add_scalar("Loss/train", train_loss, epoch)
         writer.add_scalar("Loss/test", test_loss, epoch)
         writer.add_scalar("Time/epoch", epoch_time, epoch)
+        writer.add_scalar("Model/weight_norm", model_weight_norm, epoch)
+        writer.add_scalar("Model/logit_scale", logit_scale, epoch)
 
         # Evaluate denoising accuracy periodically
         if (epoch + 1) % config.eval_denoise_epoch_interval == 0:
