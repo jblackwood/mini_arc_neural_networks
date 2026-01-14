@@ -38,6 +38,7 @@ class Config:
     task_emb_num_tokens: int
     codebook_size: int
     commitment_cost: float
+    group_lasso_weight: float
 
     # Training parameters
     batch_size: int
@@ -1195,6 +1196,7 @@ def compute_loss_for_batch(
     task_indices: torch.Tensor,
     device: torch.device,
     commitment_cost: float,
+    group_lasso_weight: float,
 ) -> torch.Tensor:
     """Compute loss for a single batch.
 
@@ -1204,6 +1206,7 @@ def compute_loss_for_batch(
         task_indices: Task indices of shape (batch_size,)
         device: Device to compute on
         commitment_cost: Weight for commitment loss (beta in VQVAE)
+        group_lasso_weight: Weight for group lasso regularization on task embeddings
 
     Returns:
         Loss tensor (scalar)
@@ -1236,8 +1239,18 @@ def compute_loss_for_batch(
         target.view(-1)
     )
     
-    # Combine losses: CE + codebook_loss + commitment_cost * commitment_loss
-    loss = ce_loss + codebook_loss + commitment_cost * commitment_loss
+    # Compute group lasso regularization on task embeddings
+    # Get task embeddings and reshape to (batch_size, task_emb_num_tokens, d_model)
+    task_emb_flat = model.task_embedding(task_indices)  # (batch_size, d_model * task_emb_num_tokens)
+    task_emb = task_emb_flat.view(-1, model.task_emb_num_tokens, model.d_model)  # (batch_size, task_emb_num_tokens, d_model)
+    
+    # For each token position, compute L2 norm across d_model dimension
+    token_norms = torch.norm(task_emb, p=2, dim=2)  # (batch_size, task_emb_num_tokens)
+    # Sum over tokens and average over batch
+    group_lasso_loss = token_norms.sum(dim=1).mean(dim=0)  # scalar
+    
+    # Combine losses: CE + codebook_loss + commitment_cost * commitment_loss + group_lasso_weight * group_lasso_loss
+    loss = ce_loss + codebook_loss + commitment_cost * commitment_loss + group_lasso_weight * group_lasso_loss
 
     return loss
 
@@ -1249,6 +1262,7 @@ def train_epoch(
     device: torch.device,
     task_id_to_index: Dict[str, int],
     commitment_cost: float,
+    group_lasso_weight: float,
 ) -> float:
     """Train for one epoch.
 
@@ -1259,6 +1273,7 @@ def train_epoch(
         device: Device to train on
         task_id_to_index: Mapping from task_id strings to integer indices
         commitment_cost: Weight for commitment loss (beta in VQVAE)
+        group_lasso_weight: Weight for group lasso regularization on task embeddings
 
     Returns:
         Average training loss
@@ -1283,7 +1298,7 @@ def train_epoch(
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
         
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, task_indices, device, commitment_cost)
+        loss = compute_loss_for_batch(model, batch, task_indices, device, commitment_cost, group_lasso_weight)
 
         # Backward pass
         optimizer.zero_grad()
@@ -1302,6 +1317,7 @@ def test_epoch(
     device: torch.device,
     task_id_to_index: Dict[str, int],
     commitment_cost: float,
+    group_lasso_weight: float,
 ) -> float:
     """Evaluate on test set.
 
@@ -1311,6 +1327,7 @@ def test_epoch(
         device: Device to evaluate on
         task_id_to_index: Mapping from task_id strings to integer indices
         commitment_cost: Weight for commitment loss (beta in VQVAE)
+        group_lasso_weight: Weight for group lasso regularization on task embeddings
 
     Returns:
         Average test loss
@@ -1336,7 +1353,7 @@ def test_epoch(
             task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
             
             # Compute loss
-            loss = compute_loss_for_batch(model, batch, task_indices, device, commitment_cost)
+            loss = compute_loss_for_batch(model, batch, task_indices, device, commitment_cost, group_lasso_weight)
 
             total_loss += loss.item()
             num_batches += 1
@@ -1351,6 +1368,7 @@ def learning_rate_test(
     weight_decay: float,
     task_id_to_index: Dict[str, int],
     commitment_cost: float,
+    group_lasso_weight: float,
 ):
     """Test learning rate by starting at 1e-7 and doubling every batch.
 
@@ -1360,6 +1378,8 @@ def learning_rate_test(
         device: Device to train on
         weight_decay: Weight decay parameter
         task_id_to_index: Mapping from task_id strings to integer indices
+        commitment_cost: Weight for commitment loss (beta in VQVAE)
+        group_lasso_weight: Weight for group lasso regularization on task embeddings
     """
     # Start learning rate test
     print("\nStarting learning rate test...")
@@ -1388,7 +1408,7 @@ def learning_rate_test(
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
 
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, task_indices, device, commitment_cost)
+        loss = compute_loss_for_batch(model, batch, task_indices, device, commitment_cost, group_lasso_weight)
 
         # Backward pass
         opt.zero_grad()
@@ -1412,6 +1432,7 @@ def weight_decay_test(
     learning_rate: float,
     task_id_to_index: Dict[str, int],
     commitment_cost: float,
+    group_lasso_weight: float,
 ):
     """Test weight decay by starting at 1e-7 and doubling every batch.
 
@@ -1421,6 +1442,8 @@ def weight_decay_test(
         device: Device to train on
         learning_rate: Learning rate parameter
         task_id_to_index: Mapping from task_id strings to integer indices
+        commitment_cost: Weight for commitment loss (beta in VQVAE)
+        group_lasso_weight: Weight for group lasso regularization on task embeddings
     """
     # Start weight decay test
     print("\nStarting weight decay test...")
@@ -1449,7 +1472,7 @@ def weight_decay_test(
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
 
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, task_indices, device, commitment_cost)
+        loss = compute_loss_for_batch(model, batch, task_indices, device, commitment_cost, group_lasso_weight)
 
         # Backward pass
         opt.zero_grad()
@@ -1741,12 +1764,12 @@ def train(config: Config):
 
     # Check if running learning rate test
     if config.mode == "learning_rate_test":
-        learning_rate_test(model, train_loader, device, config.weight_decay, task_id_to_index, config.commitment_cost)
+        learning_rate_test(model, train_loader, device, config.weight_decay, task_id_to_index, config.commitment_cost, config.group_lasso_weight)
         return
 
     # Check if running weight decay test
     if config.mode == "weight_decay_test":
-        weight_decay_test(model, train_loader, device, config.learning_rate, task_id_to_index, config.commitment_cost)
+        weight_decay_test(model, train_loader, device, config.learning_rate, task_id_to_index, config.commitment_cost, config.group_lasso_weight)
         return
 
     # Create optimizer
@@ -1801,10 +1824,10 @@ def train(config: Config):
         epoch_start_time = time.time()
 
         # Train
-        train_loss = train_epoch(model, train_loader, optimizer, device, task_id_to_index, config.commitment_cost)
+        train_loss = train_epoch(model, train_loader, optimizer, device, task_id_to_index, config.commitment_cost, config.group_lasso_weight)
 
         # Test
-        test_loss = test_epoch(model, test_loader, device, task_id_to_index, config.commitment_cost)
+        test_loss = test_epoch(model, test_loader, device, task_id_to_index, config.commitment_cost, config.group_lasso_weight)
 
         # Calculate epoch time
         epoch_time = time.time() - epoch_start_time
@@ -1966,6 +1989,7 @@ def main():
         task_emb_num_tokens=5,
         codebook_size=10,
         commitment_cost=0.25,
+        group_lasso_weight=0.01,
         # Data parameters
         vocab_size=11,
         # Denoising evaluation parameters
