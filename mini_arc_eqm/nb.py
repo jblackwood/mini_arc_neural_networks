@@ -892,17 +892,15 @@ class TransformerModel(nn.Module):
         # Concatenate: task token, input grid with RoPE, output grid with RoPE
         x = torch.cat([task_emb, input_grid, output_grid], dim=1)  # (batch_size, 51, d_model)
 
-        # Apply transformer encoder with input injection for 2 loops
-        z = self.transformer_encoder(x) # (batch_size, 51, d_model)
-        for _ in range(2):
-            z = self.transformer_encoder(z + x)  # (batch_size, 51, d_model)
+        # Apply transformer encoder
+        x = self.transformer_encoder(x)  # (batch_size, 51, d_model)
 
         # Apply first output projection and transpose
-        z = self.output_proj_1(z)  # (batch_size, 51, 25)
-        z = z.transpose(1, 2)  # (batch_size, 25, 51)
+        x = self.output_proj_1(x)  # (batch_size, 51, 25)
+        x = x.transpose(1, 2)  # (batch_size, 25, 51)
         
         # Second output projection
-        logits = self.output_proj_2(z)  # (batch_size, 25, vocab_size+1)
+        logits = self.output_proj_2(x)  # (batch_size, 25, vocab_size+1)
         
         # Return raw logits for training (cross-entropy expects logits)
         return logits
