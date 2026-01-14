@@ -98,6 +98,15 @@ class ARCTask:
     color_permutation: Optional[Dict[int, int]] = None
 
 
+@dataclass
+class EpochResult:
+    """Results from training or testing for one epoch."""
+
+    loss: float
+    accuracy: float
+    perfect_grid_percentage: float
+
+
 def parse_arc_json(file_path: Path) -> ARCTask:
     """Parse an ARC JSON file into an ARCTask dataclass.
 
@@ -819,7 +828,7 @@ def train_epoch(
     device: torch.device,
     num_iterations: int,
     last_grid_masking_ratio: float,
-) -> float:
+) -> EpochResult:
     """Train for one epoch.
 
     Each batch undergoes multiple iterations of optimization on the first 175 tokens,
@@ -834,11 +843,15 @@ def train_epoch(
         last_grid_masking_ratio: Unused parameter (kept for backward compatibility)
 
     Returns:
-        Average training loss across all batches (final iteration loss per batch)
+        EpochResult containing loss, accuracy, and perfect_grid_percentage
     """
     model.train()
     total_loss = 0.0
     num_batches = 0
+    total_correct_cells = 0
+    total_cells = 0
+    total_perfect_grids = 0
+    total_grids = 0
 
     for batch in train_loader:
         # Randomly shift examples in each task
@@ -887,10 +900,32 @@ def train_epoch(
         loss.backward()
         optimizer.step()
         
+        # Calculate accuracy on last 25 tokens (output grid)
+        predictions = torch.argmax(output[:, -25:, :], dim=-1)  # (batch_size, 25)
+        correct = (predictions == x[:, -25:]).float()
+        
+        # Cell-level accuracy
+        total_correct_cells += correct.sum().item()
+        total_cells += predictions.numel()
+        
+        # Grid-level accuracy (5x5 grids that are 100% correct)
+        per_grid_correct = correct.view(batch_size, 25).sum(dim=1)  # (batch_size,)
+        perfect_grids = (per_grid_correct == 25).sum().item()
+        total_perfect_grids += perfect_grids
+        total_grids += batch_size
+        
         total_loss += loss.item()
         num_batches += 1
 
-    return total_loss / num_batches
+    avg_loss = total_loss / num_batches
+    cell_accuracy = total_correct_cells / total_cells if total_cells > 0 else 0.0
+    perfect_grid_pct = (total_perfect_grids / total_grids * 100) if total_grids > 0 else 0.0
+    
+    return EpochResult(
+        loss=avg_loss,
+        accuracy=cell_accuracy,
+        perfect_grid_percentage=perfect_grid_pct,
+    )
 
 
 def test_epoch(
@@ -899,7 +934,7 @@ def test_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     num_iterations: int,
-) -> float:
+) -> EpochResult:
     """Evaluate on test set.
 
     Each batch undergoes multiple iterations with optimization on the first 175 tokens
@@ -914,10 +949,14 @@ def test_epoch(
         num_iterations: Number of iterations per batch on first 175 tokens
 
     Returns:
-        Average test loss across all batches (loss on last 25 tokens)
+        EpochResult containing loss, accuracy, and perfect_grid_percentage
     """
     total_loss = 0.0
     num_batches = 0
+    total_correct_cells = 0
+    total_cells = 0
+    total_perfect_grids = 0
+    total_grids = 0
 
     for batch in test_loader:
         x = batch.to(device)  # (batch_size, 200)
@@ -960,11 +999,33 @@ def test_epoch(
                 output[:, -25:, :].reshape(-1, output.size(-1)),  # (batch_size * 25, vocab_size)
                 x[:, -25:].reshape(-1),  # (batch_size * 25)
             )
+            
+            # Calculate accuracy on last 25 tokens (output grid)
+            predictions = torch.argmax(output[:, -25:, :], dim=-1)  # (batch_size, 25)
+            correct = (predictions == x[:, -25:]).float()
+            
+            # Cell-level accuracy
+            total_correct_cells += correct.sum().item()
+            total_cells += predictions.numel()
+            
+            # Grid-level accuracy (5x5 grids that are 100% correct)
+            per_grid_correct = correct.view(batch_size, 25).sum(dim=1)  # (batch_size,)
+            perfect_grids = (per_grid_correct == 25).sum().item()
+            total_perfect_grids += perfect_grids
+            total_grids += batch_size
         
         total_loss += loss.item()
         num_batches += 1
 
-    return total_loss / num_batches
+    avg_loss = total_loss / num_batches
+    cell_accuracy = total_correct_cells / total_cells if total_cells > 0 else 0.0
+    perfect_grid_pct = (total_perfect_grids / total_grids * 100) if total_grids > 0 else 0.0
+    
+    return EpochResult(
+        loss=avg_loss,
+        accuracy=cell_accuracy,
+        perfect_grid_percentage=perfect_grid_pct,
+    )
 
 
 def learning_rate_test(
@@ -1145,7 +1206,7 @@ def train(config: Config):
         epoch_start_time = time.time()
 
         # Train
-        train_loss = train_epoch(
+        train_result = train_epoch(
             model=model,
             train_loader=train_loader,
             optimizer=optimizer,
@@ -1155,7 +1216,7 @@ def train(config: Config):
         )
 
         # Test
-        test_loss = test_epoch(
+        test_result = test_epoch(
             model=model,
             test_loader=test_loader,
             optimizer=optimizer,
@@ -1169,13 +1230,19 @@ def train(config: Config):
         # Log to console
         print(
             f"Epoch {epoch + 1}/{start_epoch + config.num_epochs} - "
-            f"Train Loss: {train_loss:.6f}, Test Loss: {test_loss:.6f}, "
+            f"Train Loss: {train_result.loss:.6f}, Test Loss: {test_result.loss:.6f}, "
+            f"Train Acc: {train_result.accuracy * 100:.2f}% (100%: {train_result.perfect_grid_percentage:.1f}%), "
+            f"Test Acc: {test_result.accuracy * 100:.2f}% (100%: {test_result.perfect_grid_percentage:.1f}%), "
             f"Time: {epoch_time:.2f}s"
         )
 
         # Log to tensorboard
-        writer.add_scalar("Loss/train", train_loss, epoch)
-        writer.add_scalar("Loss/test", test_loss, epoch)
+        writer.add_scalar("Loss/train", train_result.loss, epoch)
+        writer.add_scalar("Loss/test", test_result.loss, epoch)
+        writer.add_scalar("Accuracy/train", train_result.accuracy, epoch)
+        writer.add_scalar("Accuracy/test", test_result.accuracy, epoch)
+        writer.add_scalar("PerfectGrids/train", train_result.perfect_grid_percentage, epoch)
+        writer.add_scalar("PerfectGrids/test", test_result.perfect_grid_percentage, epoch)
         writer.add_scalar("Time/epoch", epoch_time, epoch)
 
         # Save checkpoint every 20 epochs
@@ -1186,8 +1253,8 @@ def train(config: Config):
                     "epoch": epoch + 1,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
-                    "train_loss": train_loss,
-                    "test_loss": test_loss,
+                    "train_loss": train_result.loss,
+                    "test_loss": test_result.loss,
                     "config": {
                         "d_model": config.d_model,
                         "nhead": config.nhead,
