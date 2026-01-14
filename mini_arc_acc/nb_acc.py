@@ -39,6 +39,7 @@ class Config:
     num_epochs: int
     learning_rate: float
     num_iterations: int
+    mode: Literal["train", "learning_rate_test"]
 
     # Data parameters
     seq_len: int
@@ -623,7 +624,7 @@ class TransformerModel(nn.Module):
             nhead: Number of attention heads
             num_layers: Number of transformer layers
             dim_feedforward: Dimension of feedforward network
-            seq_len: Sequence length (200 positions)
+            seq_len: Sequence length (200 positions for data, 201 with type token)
             vocab_size: Number of possible cell values (10 for ARC)
             dropout: Dropout rate
         """
@@ -631,10 +632,14 @@ class TransformerModel(nn.Module):
         self.d_model = d_model
 
         # Embedding layer (vocab_size -> d_model)
-        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.embedding = nn.Embedding(vocab_size, d_model, max_norm=1.0)
 
-        # Positional embedding (learnable)
-        self.pos_embedding = nn.Parameter(torch.randn(seq_len, d_model))
+        # Type embeddings for first_175_tokens and last_25_tokens
+        self.type_emb_first_175 = nn.Parameter(torch.randn(d_model))
+        self.type_emb_last_25 = nn.Parameter(torch.randn(d_model))
+
+        # Positional embedding (learnable) - now 201 to account for type token
+        self.pos_embedding = nn.Parameter(torch.randn(seq_len + 1, d_model))
 
         # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
@@ -650,28 +655,50 @@ class TransformerModel(nn.Module):
         self.output_proj = nn.Linear(d_model, vocab_size)
 
     def forward(
-        self, x: torch.Tensor, z: torch.Tensor
+        self, x: torch.Tensor, z: torch.Tensor, pred_type: Literal["first_175_tokens", "last_25_tokens"]
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass.
 
         Args:
             x: Input tensor of shape (batch_size, seq_len) - integer indices
             z: Latent vector of shape (batch_size, seq_len, d_model)
+            pred_type: Type of prediction - "first_175_tokens" or "last_25_tokens"
 
         Returns:
             Output tensor of shape (batch_size, seq_len, vocab_size)
+            Latent tensor of shape (batch_size, seq_len, d_model)
         """
+        batch_size = x.shape[0]
+        
         # Apply embedding
         x = self.embedding(x)  # (batch_size, seq_len, d_model)
 
+        # Select type embedding based on pred_type
+        if pred_type == "first_175_tokens":
+            type_emb = self.type_emb_first_175
+        else:  # "last_25_tokens"
+            type_emb = self.type_emb_last_25
+        
+        # Prepend type embedding to sequence
+        type_token = type_emb.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1)  # (batch_size, 1, d_model)
+        x = torch.cat([type_token, x], dim=1)  # (batch_size, seq_len + 1, d_model)
+        
+        # Prepend zero to z as well to match dimensions
+        z_type_token = torch.zeros(batch_size, 1, self.d_model, device=x.device)
+        z = torch.cat([z_type_token, z], dim=1)  # (batch_size, seq_len + 1, d_model)
+
         # Add positional embedding
-        x = x + z + self.pos_embedding.unsqueeze(0)  # (batch_size, seq_len, d_model)
+        x = x + z + self.pos_embedding.unsqueeze(0)  # (batch_size, seq_len + 1, d_model)
 
         # Apply transformer encoder
-        z = self.transformer_encoder(x)  # (batch_size, seq_len, d_model)
+        z_full = self.transformer_encoder(x)  # (batch_size, seq_len + 1, d_model)
 
         # Apply output projection
-        x = self.output_proj(z)  # (batch_size, seq_len, vocab_size)
+        x_full = self.output_proj(z_full)  # (batch_size, seq_len + 1, vocab_size)
+        
+        # Remove the first token (type token) from output
+        x = x_full[:, 1:, :]  # (batch_size, seq_len, vocab_size)
+        z = z_full[:, 1:, :]  # (batch_size, seq_len, d_model)
 
         return x, z
 
@@ -829,8 +856,8 @@ def train_epoch(
         
         # Phase 1: num_iterations on first 175 tokens
         for _ in range(num_iterations):
-            # Forward pass
-            output, z = model(x_noisy, z)  # (batch_size, 200, vocab_size), (batch_size, 200, d_model)
+            # Forward pass with first_175_tokens type
+            output, z = model(x_noisy, z, "first_175_tokens")  # (batch_size, 200, vocab_size), (batch_size, 200, d_model)
             
             # Compute cross-entropy loss on first 175 tokens only
             loss = nn.functional.cross_entropy(
@@ -847,7 +874,7 @@ def train_epoch(
             z = z.detach()
         
         # Phase 2: One final iteration on last 25 tokens
-        output, z = model(x_noisy, z)  # (batch_size, 200, vocab_size), (batch_size, 200, d_model)
+        output, z = model(x_noisy, z, "last_25_tokens")  # (batch_size, 200, vocab_size), (batch_size, 200, d_model)
         
         # Compute cross-entropy loss on last 25 tokens only
         loss = nn.functional.cross_entropy(
@@ -906,8 +933,8 @@ def test_epoch(
         # Phase 1: num_iterations on first 175 tokens (WITH optimization)
         model.train()
         for _ in range(num_iterations):
-            # Forward pass
-            output, z = model(x_noisy, z)  # (batch_size, 200, vocab_size), (batch_size, 200, d_model)
+            # Forward pass with first_175_tokens type
+            output, z = model(x_noisy, z, "first_175_tokens")  # (batch_size, 200, vocab_size), (batch_size, 200, d_model)
             
             # Compute cross-entropy loss on first 175 tokens only
             loss = nn.functional.cross_entropy(
@@ -926,7 +953,7 @@ def test_epoch(
         # Phase 2: One final forward pass for evaluation on last 25 tokens (NO optimization)
         model.eval()
         with torch.no_grad():
-            output, z = model(x_noisy, z)  # (batch_size, 200, vocab_size), (batch_size, 200, d_model)
+            output, z = model(x_noisy, z, "last_25_tokens")  # (batch_size, 200, vocab_size), (batch_size, 200, d_model)
             
             # Compute cross-entropy loss on last 25 tokens only
             loss = nn.functional.cross_entropy(
@@ -938,6 +965,84 @@ def test_epoch(
         num_batches += 1
 
     return total_loss / num_batches
+
+
+def learning_rate_test(
+    model: TransformerModel,
+    train_loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    num_iterations: int,
+    last_grid_masking_ratio: float,
+):
+    """Test learning rate by starting at 1e-7 and doubling every batch.
+
+    Args:
+        model: The transformer model
+        train_loader: Training data loader
+        optimizer: Optimizer (unused, for compatibility)
+        device: Device to train on
+        num_iterations: Number of iterations per batch
+        last_grid_masking_ratio: Masking ratio for last grid
+    """
+    # Start learning rate test
+    print("\nStarting learning rate test...")
+    lr = 1e-7
+    model.train()
+
+    batch_count = 0
+    for batch in train_loader:
+        if batch_count >= 20:
+            break
+
+        # Create optimizer with current learning rate
+        opt = torch.optim.Adam(model.parameters(), lr=lr)
+
+        # Randomly shift examples in each task
+        batch = random_shift_examples(batch, device)
+        
+        x = batch.to(device)  # (batch_size, 200)
+        batch_size, seq_len = x.shape
+        
+        # Apply combined noising strategy
+        x_noisy = apply_combined_noising(x, device)
+        
+        # Create initial latent vector of zeros
+        d_model = model.d_model
+        z = torch.zeros((batch_size, seq_len, d_model), device=device)
+        
+        # Phase 1: num_iterations on first 175 tokens
+        for _ in range(num_iterations):
+            output, z = model(x_noisy, z, "first_175_tokens")
+            loss = nn.functional.cross_entropy(
+                output[:, :175, :].reshape(-1, output.size(-1)),
+                x[:, :175].reshape(-1),
+            )
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            z = z.detach()  # Detach to avoid backprop through previous iterations
+        
+        # Phase 2: One final iteration on last 25 tokens
+        output, z = model(x_noisy, z, "last_25_tokens")
+        loss = nn.functional.cross_entropy(
+            output[:, -25:, :].reshape(-1, output.size(-1)),
+            x[:, -25:].reshape(-1),
+        )
+        
+        # Backpropagation and optimization step
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+        # Print learning rate and loss
+        print(f"Batch {batch_count + 1}: LR = {lr:.2e}, Loss = {loss.item():.6f}")
+
+        # Double learning rate for next batch
+        lr *= 2
+        batch_count += 1
+
+    print("\nLearning rate test complete!")
 
 
 def train(config: Config):
@@ -997,6 +1102,15 @@ def train(config: Config):
 
     model = cast(TransformerModel, torch.compile(model))
     print("Model compiled for optimized execution")
+
+    # Check if running learning rate test
+    if config.mode == "learning_rate_test":
+        optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+        learning_rate_test(
+            model, train_loader, optimizer, device,
+            config.num_iterations, config.last_grid_masking_ratio
+        )
+        return
 
     # Create optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
@@ -1133,9 +1247,10 @@ def main():
         vocab_size=11,
         # Training parameters
         num_epochs=40,
-        batch_size=128,
-        learning_rate=1e-3,
+        batch_size=16,
+        learning_rate=1e-4,
         num_iterations=10,
+        mode="train",
         # Noising parameters
         last_grid_masking_ratio=0.25,
         # Optional: Load existing model to continue training
