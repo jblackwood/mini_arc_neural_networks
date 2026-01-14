@@ -23,13 +23,27 @@ from torch.utils.tensorboard import SummaryWriter
 def parse_epoch_line(line: str):
     """Parse an epoch summary line.
     
-    Example: "Epoch 1/300 - Train Loss: 0.045345, Test Loss: 0.031181, Time: 154.78s"
+    Example: "Epoch 1/300 - Train Loss: 0.045345, Test Loss: 0.031181, Time: 154.78s, Weight Norm: 378.6285, Logit Scale: 8.1446"
     
     Returns:
-        dict with keys: epoch, train_loss, test_loss, time (or None if no match)
+        dict with keys: epoch, train_loss, test_loss, time, weight_norm (optional), logit_scale (optional)
     """
-    pattern = r"Epoch (\d+)/\d+ - Train Loss: ([\d.]+), Test Loss: ([\d.]+), Time: ([\d.]+)s"
-    match = re.match(pattern, line)
+    # Try the new format with Weight Norm and Logit Scale
+    pattern_new = r"Epoch (\d+)/\d+ - Train Loss: ([\d.]+), Test Loss: ([\d.]+), Time: ([\d.]+)s, Weight Norm: ([\d.]+), Logit Scale: ([\d.]+)"
+    match = re.match(pattern_new, line)
+    if match:
+        return {
+            'epoch': int(match.group(1)),
+            'train_loss': float(match.group(2)),
+            'test_loss': float(match.group(3)),
+            'time': float(match.group(4)),
+            'weight_norm': float(match.group(5)),
+            'logit_scale': float(match.group(6))
+        }
+    
+    # Try the old format without Weight Norm and Logit Scale
+    pattern_old = r"Epoch (\d+)/\d+ - Train Loss: ([\d.]+), Test Loss: ([\d.]+), Time: ([\d.]+)s"
+    match = re.match(pattern_old, line)
     if match:
         return {
             'epoch': int(match.group(1)),
@@ -171,6 +185,12 @@ def write_to_tensorboard(metrics, log_dir: Path, model_name: str):
         writer.add_scalar("Loss/test", epoch_data['test_loss'], epoch)
         writer.add_scalar("Time/epoch", epoch_data['time'], epoch)
         
+        # Write model metrics if available
+        if 'weight_norm' in epoch_data:
+            writer.add_scalar("Model/weight_norm", epoch_data['weight_norm'], epoch)
+        if 'logit_scale' in epoch_data:
+            writer.add_scalar("Model/logit_scale", epoch_data['logit_scale'], epoch)
+        
         # Write denoising metrics if available (convert accuracy percentages to decimals)
         if 'train_acc' in epoch_data:
             writer.add_scalar("DenoiseAccuracy/train", epoch_data['train_acc'] / 100.0, epoch)
@@ -191,7 +211,7 @@ def write_to_tensorboard(metrics, log_dir: Path, model_name: str):
 
 def main():
     # ============ Configure these variables ============
-    md_file = "mini_arc_eqm/results/20260113_164321_epoch_180_checkpoint.md"
+    md_file = "mini_arc_eqm/results/result.md"
     log_dir = "output/mini_arc_eqm5/runs"
     # ===================================================
     

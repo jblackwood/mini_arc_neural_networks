@@ -1827,7 +1827,7 @@ def main():
         vocab_size=11,
         # Denoising evaluation parameters
         eval_denoise_epoch_interval=1,
-        eval_denoise_num_iterations=500,
+        eval_denoise_num_iterations=10,
         # Training parameters
         num_epochs=300,
         batch_size=32,
