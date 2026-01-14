@@ -828,10 +828,10 @@ class TransformerModel(nn.Module):
         self.vocab_size = vocab_size
 
         # Task embedding layer
-        self.task_embedding = nn.Embedding(num_tasks, d_model)
+        self.task_embedding = nn.Embedding(num_tasks, d_model, max_norm=1.0)
 
         # Token embedding layer (vocab_size -> d_model)
-        self.token_embedding = nn.Embedding(vocab_size, d_model)
+        self.token_embedding = nn.Embedding(vocab_size, d_model, max_norm=1.0)
 
         # Learnable position embeddings for task token and grid types
         self.task_embedding_position = nn.Parameter(torch.randn(d_model))
