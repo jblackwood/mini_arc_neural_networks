@@ -94,6 +94,27 @@ def parse_best_iter_line(line: str):
     return None
 
 
+def parse_layer_mean_squares_line(line: str):
+    """Parse a layer mean squares line.
+    
+    Example: "  Layer Mean Squares - Task Emb: 0.003909, Token Emb: 0.001299, Out Proj 1: 0.001515, Out Proj 2: 0.006631, Transformer: 0.001155"
+    
+    Returns:
+        dict with keys: task_emb, token_emb, out_proj_1, out_proj_2, transformer (or None if no match)
+    """
+    pattern = r"\s+Layer Mean Squares - Task Emb: ([\d.]+), Token Emb: ([\d.]+), Out Proj 1: ([\d.]+), Out Proj 2: ([\d.]+), Transformer: ([\d.]+)"
+    match = re.match(pattern, line)
+    if match:
+        return {
+            'task_emb': float(match.group(1)),
+            'token_emb': float(match.group(2)),
+            'out_proj_1': float(match.group(3)),
+            'out_proj_2': float(match.group(4)),
+            'transformer': float(match.group(5))
+        }
+    return None
+
+
 def extract_model_name(md_path: Path):
     """Extract model name from the checkpoint filename.
     
@@ -156,6 +177,12 @@ def parse_md_file(md_path: Path):
                 if best_iter_data:
                     current_epoch_data.update(best_iter_data)
                     continue
+                
+                # Try to parse layer mean squares
+                layer_mean_squares_data = parse_layer_mean_squares_line(line)
+                if layer_mean_squares_data:
+                    current_epoch_data.update(layer_mean_squares_data)
+                    continue
         
         # Don't forget the last epoch
         if current_epoch_data is not None:
@@ -204,6 +231,14 @@ def write_to_tensorboard(metrics, log_dir: Path, model_name: str):
             writer.add_scalar("DenoiseBestIter/train_std", epoch_data['train_std'], epoch)
             writer.add_scalar("DenoiseBestIter/test_mean", epoch_data['test_mean'], epoch)
             writer.add_scalar("DenoiseBestIter/test_std", epoch_data['test_std'], epoch)
+        
+        # Write layer mean squares if available
+        if 'task_emb' in epoch_data:
+            writer.add_scalar("LayerMeanSquare/task_embedding", epoch_data['task_emb'], epoch)
+            writer.add_scalar("LayerMeanSquare/token_embedding", epoch_data['token_emb'], epoch)
+            writer.add_scalar("LayerMeanSquare/output_proj_1", epoch_data['out_proj_1'], epoch)
+            writer.add_scalar("LayerMeanSquare/output_proj_2", epoch_data['out_proj_2'], epoch)
+            writer.add_scalar("LayerMeanSquare/transformer_avg", epoch_data['transformer'], epoch)
     
     writer.close()
     print(f"Successfully wrote {len(metrics)} epochs to TensorBoard logs at {full_log_dir}")
@@ -211,7 +246,7 @@ def write_to_tensorboard(metrics, log_dir: Path, model_name: str):
 
 def main():
     # ============ Configure these variables ============
-    md_file = "mini_arc_eqm/results/20260114_022612_epoch_270_checkpoint.md"
+    md_file = "mini_arc_eqm/results/20260114_032541_epoch_300_checkpoint.md"
     log_dir = "output/mini_arc_eqm5/runs"
     # ===================================================
     
