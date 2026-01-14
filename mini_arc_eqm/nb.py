@@ -1719,6 +1719,28 @@ def train(config: Config):
             model.output_proj_2.weight.pow(2).sum()
         ).item()
 
+        # Calculate layer-wise mean square using vectorized operations
+        # Embedding layers
+        task_emb_mean_sq = model.task_embedding.weight.pow(2).mean().item()
+        token_emb_mean_sq = model.token_embedding.weight.pow(2).mean().item()
+        
+        # Linear layers
+        output_proj_1_mean_sq = model.output_proj_1.weight.pow(2).mean().item()
+        output_proj_2_mean_sq = model.output_proj_2.weight.pow(2).mean().item()
+        
+        # Transformer layers (vectorized - concatenate all weights and compute mean)
+        transformer_weights: List[torch.Tensor] = []
+        for layer_module in model.transformer_encoder.layers:
+            encoder_layer = cast(nn.TransformerEncoderLayer, layer_module)
+            # Self-attention weights
+            if encoder_layer.self_attn.in_proj_weight is not None:
+                transformer_weights.append(encoder_layer.self_attn.in_proj_weight.flatten())
+            transformer_weights.append(encoder_layer.self_attn.out_proj.weight.flatten())
+            # Feedforward weights
+            transformer_weights.append(encoder_layer.linear1.weight.flatten())
+            transformer_weights.append(encoder_layer.linear2.weight.flatten())
+        transformer_mean_sq = torch.cat(transformer_weights).pow(2).mean().item()
+
         # Log to console
         print(
             f"Epoch {epoch + 1}/{start_epoch + config.num_epochs} - "
@@ -1727,6 +1749,12 @@ def train(config: Config):
             f"Weight Norm: {model_weight_norm:.4f}, "
             f"Logit Scale: {logit_scale:.4f}"
         )
+        print(
+            f"  Layer Mean Squares - "
+            f"Task Emb: {task_emb_mean_sq:.6f}, Token Emb: {token_emb_mean_sq:.6f}, "
+            f"Out Proj 1: {output_proj_1_mean_sq:.6f}, Out Proj 2: {output_proj_2_mean_sq:.6f}, "
+            f"Transformer: {transformer_mean_sq:.6f}"
+        )
 
         # Log to tensorboard
         writer.add_scalar("Loss/train", train_loss, epoch)
@@ -1734,6 +1762,13 @@ def train(config: Config):
         writer.add_scalar("Time/epoch", epoch_time, epoch)
         writer.add_scalar("Model/weight_norm", model_weight_norm, epoch)
         writer.add_scalar("Model/logit_scale", logit_scale, epoch)
+        
+        # Log layer-wise mean squares
+        writer.add_scalar("LayerMeanSquare/task_embedding", task_emb_mean_sq, epoch)
+        writer.add_scalar("LayerMeanSquare/token_embedding", token_emb_mean_sq, epoch)
+        writer.add_scalar("LayerMeanSquare/output_proj_1", output_proj_1_mean_sq, epoch)
+        writer.add_scalar("LayerMeanSquare/output_proj_2", output_proj_2_mean_sq, epoch)
+        writer.add_scalar("LayerMeanSquare/transformer_avg", transformer_mean_sq, epoch)
 
         # Evaluate denoising accuracy periodically
         if (epoch + 1) % config.eval_denoise_epoch_interval == 0:
