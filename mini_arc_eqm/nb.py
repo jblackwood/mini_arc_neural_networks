@@ -845,7 +845,7 @@ class TransformerModel(nn.Module):
         self.d_model = d_model
 
         # Sparse task embedding layer (size d_model * 5) with max_norm constraint
-        self.task_embedding = nn.Embedding(num_tasks, d_model * 5, max_norm=10.0)
+        self.task_embedding = nn.Embedding(num_tasks, d_model * 5)
         
         # Dictionary matrix to project sparse embeddings to d_model
         # Columns of the dictionary (rows of weight.T) will be normalized in forward pass
@@ -892,7 +892,7 @@ class TransformerModel(nn.Module):
         """
         
         # Get sparse task embeddings and project through dictionary
-        task_emb_sparse = self.task_embedding(task_indices)  # (batch_size, d_model*5)
+        task_emb_sparse = torch.sigmoid(self.task_embedding(task_indices))  # (batch_size, d_model*5)
         
         # Normalize dictionary columns (rows of weight) to have max_norm
         with torch.no_grad():
@@ -1180,8 +1180,8 @@ def compute_loss_for_batch(
         target.view(-1)
     )
     
-    # Compute L1 regularization on sparse task embeddings used in this batch
-    task_emb_sparse = model.task_embedding(task_indices)  # (batch_size, d_model*5)
+    # Compute L1 regularization on sparse task embeddings used in this batch (after sigmoid)
+    task_emb_sparse = torch.sigmoid(model.task_embedding(task_indices))  # (batch_size, d_model*5)
     l1_loss = torch.abs(task_emb_sparse).mean()  # L1 norm averaged over batch and features
     
     # Combine losses
