@@ -1881,7 +1881,7 @@ def main():
         num_layers=8,
         dim_feedforward=1024,
         dropout=0.1,
-        l1_weight=0.001,
+        l1_weight=0.01,
         # Data parameters
         vocab_size=11,
         # Denoising evaluation parameters
