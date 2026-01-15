@@ -115,6 +115,43 @@ def parse_layer_mean_squares_line(line: str):
     return None
 
 
+def parse_sparsity_line(line: str):
+    """Parse a sparsity line.
+    
+    Example: "  Task Embedding Sparsity: 0.38%"
+    
+    Returns:
+        dict with key: task_emb_sparsity (or None if no match)
+    """
+    pattern = r"\s+Task Embedding Sparsity: ([\d.]+)%"
+    match = re.match(pattern, line)
+    if match:
+        return {
+            'task_emb_sparsity': float(match.group(1))
+        }
+    return None
+
+
+def parse_loss_components_line(line: str):
+    """Parse a loss components line.
+    
+    Example: "  Loss Components - Train CE: 1.535273, Train L1: 0.223067, Test CE: 1.325884, Test L1: 0.222456"
+    
+    Returns:
+        dict with keys: train_ce, train_l1, test_ce, test_l1 (or None if no match)
+    """
+    pattern = r"\s+Loss Components - Train CE: ([\d.]+), Train L1: ([\d.]+), Test CE: ([\d.]+), Test L1: ([\d.]+)"
+    match = re.match(pattern, line)
+    if match:
+        return {
+            'train_ce': float(match.group(1)),
+            'train_l1': float(match.group(2)),
+            'test_ce': float(match.group(3)),
+            'test_l1': float(match.group(4))
+        }
+    return None
+
+
 def extract_model_name(md_path: Path):
     """Extract model name from the checkpoint filename.
     
@@ -183,6 +220,18 @@ def parse_md_file(md_path: Path):
                 if layer_mean_squares_data:
                     current_epoch_data.update(layer_mean_squares_data)
                     continue
+                
+                # Try to parse sparsity
+                sparsity_data = parse_sparsity_line(line)
+                if sparsity_data:
+                    current_epoch_data.update(sparsity_data)
+                    continue
+                
+                # Try to parse loss components
+                loss_components_data = parse_loss_components_line(line)
+                if loss_components_data:
+                    current_epoch_data.update(loss_components_data)
+                    continue
         
         # Don't forget the last epoch
         if current_epoch_data is not None:
@@ -239,6 +288,17 @@ def write_to_tensorboard(metrics, log_dir: Path, model_name: str):
             writer.add_scalar("LayerMeanSquare/output_proj_1", epoch_data['out_proj_1'], epoch)
             writer.add_scalar("LayerMeanSquare/output_proj_2", epoch_data['out_proj_2'], epoch)
             writer.add_scalar("LayerMeanSquare/transformer_avg", epoch_data['transformer'], epoch)
+        
+        # Write sparsity if available
+        if 'task_emb_sparsity' in epoch_data:
+            writer.add_scalar("Sparsity/task_embedding", epoch_data['task_emb_sparsity'], epoch)
+        
+        # Write loss components if available
+        if 'train_ce' in epoch_data:
+            writer.add_scalar("LossComponents/train_ce", epoch_data['train_ce'], epoch)
+            writer.add_scalar("LossComponents/train_l1", epoch_data['train_l1'], epoch)
+            writer.add_scalar("LossComponents/test_ce", epoch_data['test_ce'], epoch)
+            writer.add_scalar("LossComponents/test_l1", epoch_data['test_l1'], epoch)
     
     writer.close()
     print(f"Successfully wrote {len(metrics)} epochs to TensorBoard logs at {full_log_dir}")
@@ -246,7 +306,7 @@ def write_to_tensorboard(metrics, log_dir: Path, model_name: str):
 
 def main():
     # ============ Configure these variables ============
-    md_file = "mini_arc_eqm/results/20260114_032541_epoch_300_checkpoint.md"
+    md_file = "mini_arc_eqm/results/20260115_040306_epoch_150_checkpoint.pt.md"
     log_dir = "output/mini_arc_eqm5/runs"
     # ===================================================
     
