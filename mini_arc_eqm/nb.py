@@ -1775,6 +1775,12 @@ def train(config: Config):
             transformer_weights.append(encoder_layer.linear2.weight.flatten())
         transformer_mean_sq = torch.cat(transformer_weights).pow(2).mean().item()
 
+        # Calculate task embedding sparsity (percentage of near-zero values)
+        task_emb_weights = model.task_embedding.weight.abs()
+        # Consider values < 1e-3 as effectively zero
+        sparsity_threshold = 1e-3
+        task_emb_sparsity = (task_emb_weights < sparsity_threshold).float().mean().item() * 100
+
         # Log to console
         print(
             f"Epoch {epoch + 1}/{start_epoch + config.num_epochs} - "
@@ -1788,6 +1794,9 @@ def train(config: Config):
             f"Task Emb: {task_emb_mean_sq:.6f}, Token Emb: {token_emb_mean_sq:.6f}, "
             f"Out Proj 1: {output_proj_1_mean_sq:.6f}, Out Proj 2: {output_proj_2_mean_sq:.6f}, "
             f"Transformer: {transformer_mean_sq:.6f}"
+        )
+        print(
+            f"  Task Embedding Sparsity: {task_emb_sparsity:.2f}%"
         )
 
         # Log to tensorboard
@@ -1803,6 +1812,9 @@ def train(config: Config):
         writer.add_scalar("LayerMeanSquare/output_proj_1", output_proj_1_mean_sq, epoch)
         writer.add_scalar("LayerMeanSquare/output_proj_2", output_proj_2_mean_sq, epoch)
         writer.add_scalar("LayerMeanSquare/transformer_avg", transformer_mean_sq, epoch)
+        
+        # Log task embedding sparsity
+        writer.add_scalar("Sparsity/task_embedding", task_emb_sparsity, epoch)
 
         # Evaluate denoising accuracy periodically
         if (epoch + 1) % config.eval_denoise_epoch_interval == 0:
