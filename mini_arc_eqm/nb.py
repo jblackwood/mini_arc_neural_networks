@@ -41,8 +41,7 @@ class Config:
     batch_size: int
     num_epochs: int
     learning_rate: float
-    weight_decay: float
-    mode: Literal["train", "learning_rate_test", "weight_decay_test", "eval"]
+    mode: Literal["train", "learning_rate_test", "eval"]
     checkpoint_save_interval: int
 
     # Data parameters
@@ -846,6 +845,8 @@ class TransformerModel(nn.Module):
 
         # Sparse task embedding layer (size d_model * 5) with max_norm constraint
         self.task_embedding = nn.Embedding(num_tasks, d_model * 5)
+        # Initialize with small variance to prevent sigmoid saturation
+        nn.init.normal_(self.task_embedding.weight, mean=0.0, std=0.01)
         
         # Dictionary matrix to project sparse embeddings to d_model
         # Columns of the dictionary (rows of weight.T) will be normalized in forward pass
@@ -1312,7 +1313,6 @@ def learning_rate_test(
     model: TransformerModel,
     train_loader: DataLoader,
     device: torch.device,
-    weight_decay: float,
     task_id_to_index: Dict[str, int],
     l1_weight: float,
 ):
@@ -1322,7 +1322,6 @@ def learning_rate_test(
         model: The transformer model
         train_loader: Training data loader
         device: Device to train on
-        weight_decay: Weight decay parameter
         task_id_to_index: Mapping from task_id strings to integer indices
         l1_weight: Weight for L1 regularization on sparse task embeddings
     """
@@ -1337,8 +1336,8 @@ def learning_rate_test(
             break
 
         # Create optimizer with current learning rate
-        opt = torch.optim.AdamW(
-            model.parameters(), lr=lr, weight_decay=weight_decay
+        opt = torch.optim.Adam(
+            model.parameters(), lr=lr
         )
 
         # Prepare batch
@@ -1368,68 +1367,6 @@ def learning_rate_test(
         batch_count += 1
 
     print("\nLearning rate test complete!")
-
-
-def weight_decay_test(
-    model: TransformerModel,
-    train_loader: DataLoader,
-    device: torch.device,
-    learning_rate: float,
-    task_id_to_index: Dict[str, int],
-    l1_weight: float,
-):
-    """Test weight decay by starting at 1e-7 and doubling every batch.
-
-    Args:
-        model: The transformer model
-        train_loader: Training data loader
-        device: Device to train on
-        learning_rate: Learning rate parameter
-        task_id_to_index: Mapping from task_id strings to integer indices
-        l1_weight: Weight for L1 regularization on sparse task embeddings
-    """
-    # Start weight decay test
-    print("\nStarting weight decay test...")
-    wd = 1e-7
-    model.train()
-
-    batch_count = 0
-    for examples in train_loader:
-        if batch_count >= 30:
-            break
-
-        # Create optimizer with current weight decay
-        opt = torch.optim.AdamW(
-            model.parameters(), lr=learning_rate, weight_decay=wd
-        )
-
-        # Prepare batch
-        batch_tensors = []
-        task_ids = []
-        for example in examples:
-            concatenated = torch.cat([example["input_grid"], example["output_grid"]], dim=0)  # (50,)
-            batch_tensors.append(concatenated)
-            task_ids.append(example["task_id"])
-        
-        batch = torch.stack(batch_tensors, dim=0)  # (batch_size, 50)
-        task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
-
-        # Compute loss
-        loss_result = compute_loss_for_batch(model, batch, task_indices, device, l1_weight)
-
-        # Backward pass
-        opt.zero_grad()
-        loss_result.loss.backward()
-        opt.step()
-
-        # Print weight decay and loss
-        print(f"Batch {batch_count + 1}: WD = {wd:.2e}, Loss = {loss_result.loss.item():.6f}")
-
-        # Double weight decay for next batch
-        wd *= 2
-        batch_count += 1
-
-    print("\nWeight decay test complete!")
 
 
 def evaluate_denoising(
@@ -1705,18 +1642,18 @@ def train(config: Config):
 
     # Check if running learning rate test
     if config.mode == "learning_rate_test":
-        learning_rate_test(model, train_loader, device, config.weight_decay, task_id_to_index, config.l1_weight)
+        learning_rate_test(model, train_loader, device, task_id_to_index, config.l1_weight)
         return
 
-    # Check if running weight decay test
-    if config.mode == "weight_decay_test":
-        weight_decay_test(model, train_loader, device, config.learning_rate, task_id_to_index, config.l1_weight)
-        return
-
-    # Create optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
-    )
+    # Create optimizer with different learning rates for task embeddings
+    # Task embeddings need higher LR since they only update once per epoch (when that task appears)
+    # while other params update every batch (~1562 times per epoch with 50k tasks and batch_size=32)
+    task_embedding_lr_multiplier = 50.0  # Compensate for ~50x fewer updates per epoch
+    
+    optimizer = torch.optim.Adam([
+        {'params': model.task_embedding.parameters(), 'lr': config.learning_rate * task_embedding_lr_multiplier},
+        {'params': [p for n, p in model.named_parameters() if 'task_embedding' not in n], 'lr': config.learning_rate}
+    ])
 
     # Load existing model if specified
     start_epoch = 0
@@ -1943,7 +1880,7 @@ def main():
         num_layers=8,
         dim_feedforward=1024,
         dropout=0.1,
-        l1_weight=1,
+        l1_weight=100,
         # Data parameters
         vocab_size=11,
         # Denoising evaluation parameters
@@ -1953,7 +1890,6 @@ def main():
         num_epochs=150,
         batch_size=32,
         learning_rate=1e-4,
-        weight_decay=0.0,
         mode="train",
         checkpoint_save_interval=30,
         # Google Drive location for Colab
