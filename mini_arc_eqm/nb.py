@@ -132,6 +132,21 @@ class DenoisingResult:
     best_iteration: Optional[torch.Tensor] = None
 
 
+@dataclass
+class LossResult:
+    """Result from loss computation.
+
+    Attributes:
+        loss: Total loss (cross-entropy + L1 regularization)
+        ce_loss: Cross-entropy loss component
+        l1_loss: L1 regularization loss component
+    """
+
+    loss: torch.Tensor
+    ce_loss: torch.Tensor
+    l1_loss: torch.Tensor
+
+
 def parse_arc_json(file_path: Path) -> ARCTask:
     """Parse an ARC JSON file into an ARCTask dataclass.
 
@@ -1124,7 +1139,7 @@ def compute_loss_for_batch(
     task_indices: torch.Tensor,
     device: torch.device,
     l1_weight: float,
-) -> torch.Tensor:
+) -> LossResult:
     """Compute loss for a single batch.
 
     Args:
@@ -1135,7 +1150,7 @@ def compute_loss_for_batch(
         l1_weight: Weight for L1 regularization on sparse task embeddings
 
     Returns:
-        Loss tensor (scalar)
+        LossResult with total loss, cross-entropy loss, and L1 loss
     """
     x = batch.to(device)  # (batch_size, 50)
     task_indices = task_indices.to(device)  # (batch_size,)
@@ -1172,7 +1187,7 @@ def compute_loss_for_batch(
     # Combine losses
     loss = ce_loss + l1_weight * l1_loss
 
-    return loss
+    return LossResult(loss=loss, ce_loss=ce_loss, l1_loss=l1_loss)
 
 
 def train_epoch(
@@ -1182,7 +1197,7 @@ def train_epoch(
     device: torch.device,
     task_id_to_index: Dict[str, int],
     l1_weight: float,
-) -> float:
+) -> LossResult:
     """Train for one epoch.
 
     Args:
@@ -1194,10 +1209,12 @@ def train_epoch(
         l1_weight: Weight for L1 regularization on sparse task embeddings
 
     Returns:
-        Average training loss
+        LossResult with average losses over the epoch
     """
     model.train()
     total_loss = 0.0
+    total_ce_loss = 0.0
+    total_l1_loss = 0.0
     num_batches = 0
 
     for examples in train_loader:
@@ -1216,17 +1233,23 @@ def train_epoch(
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
         
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, task_indices, device, l1_weight)
+        loss_result = compute_loss_for_batch(model, batch, task_indices, device, l1_weight)
 
         # Backward pass
         optimizer.zero_grad()
-        loss.backward()
+        loss_result.loss.backward()
         optimizer.step()
 
-        total_loss += loss.item()
+        total_loss += loss_result.loss.item()
+        total_ce_loss += loss_result.ce_loss.item()
+        total_l1_loss += loss_result.l1_loss.item()
         num_batches += 1
 
-    return total_loss / num_batches
+    return LossResult(
+        loss=torch.tensor(total_loss / num_batches),
+        ce_loss=torch.tensor(total_ce_loss / num_batches),
+        l1_loss=torch.tensor(total_l1_loss / num_batches)
+    )
 
 
 def test_epoch(
@@ -1235,7 +1258,7 @@ def test_epoch(
     device: torch.device,
     task_id_to_index: Dict[str, int],
     l1_weight: float,
-) -> float:
+) -> LossResult:
     """Evaluate on test set.
 
     Args:
@@ -1246,10 +1269,12 @@ def test_epoch(
         l1_weight: Weight for L1 regularization on sparse task embeddings
 
     Returns:
-        Average test loss
+        LossResult with average losses over the test set
     """
     model.eval()
     total_loss = 0.0
+    total_ce_loss = 0.0
+    total_l1_loss = 0.0
     num_batches = 0
 
     with torch.no_grad():
@@ -1269,12 +1294,18 @@ def test_epoch(
             task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
             
             # Compute loss
-            loss = compute_loss_for_batch(model, batch, task_indices, device, l1_weight)
+            loss_result = compute_loss_for_batch(model, batch, task_indices, device, l1_weight)
 
-            total_loss += loss.item()
+            total_loss += loss_result.loss.item()
+            total_ce_loss += loss_result.ce_loss.item()
+            total_l1_loss += loss_result.l1_loss.item()
             num_batches += 1
 
-    return total_loss / num_batches
+    return LossResult(
+        loss=torch.tensor(total_loss / num_batches),
+        ce_loss=torch.tensor(total_ce_loss / num_batches),
+        l1_loss=torch.tensor(total_l1_loss / num_batches)
+    )
 
 
 def learning_rate_test(
@@ -1322,15 +1353,15 @@ def learning_rate_test(
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
 
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, task_indices, device, l1_weight)
+        loss_result = compute_loss_for_batch(model, batch, task_indices, device, l1_weight)
 
         # Backward pass
         opt.zero_grad()
-        loss.backward()
+        loss_result.loss.backward()
         opt.step()
 
         # Print learning rate and loss
-        print(f"Batch {batch_count + 1}: LR = {lr:.2e}, Loss = {loss.item():.6f}")
+        print(f"Batch {batch_count + 1}: LR = {lr:.2e}, Loss = {loss_result.loss.item():.6f}")
 
         # Double learning rate for next batch
         lr *= 2
@@ -1384,15 +1415,15 @@ def weight_decay_test(
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
 
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, task_indices, device, l1_weight)
+        loss_result = compute_loss_for_batch(model, batch, task_indices, device, l1_weight)
 
         # Backward pass
         opt.zero_grad()
-        loss.backward()
+        loss_result.loss.backward()
         opt.step()
 
         # Print weight decay and loss
-        print(f"Batch {batch_count + 1}: WD = {wd:.2e}, Loss = {loss.item():.6f}")
+        print(f"Batch {batch_count + 1}: WD = {wd:.2e}, Loss = {loss_result.loss.item():.6f}")
 
         # Double weight decay for next batch
         wd *= 2
@@ -1734,10 +1765,10 @@ def train(config: Config):
         epoch_start_time = time.time()
 
         # Train
-        train_loss = train_epoch(model, train_loader, optimizer, device, task_id_to_index, config.l1_weight)
+        train_result = train_epoch(model, train_loader, optimizer, device, task_id_to_index, config.l1_weight)
 
         # Test
-        test_loss = test_epoch(model, test_loader, device, task_id_to_index, config.l1_weight)
+        test_result = test_epoch(model, test_loader, device, task_id_to_index, config.l1_weight)
 
         # Calculate epoch time
         epoch_time = time.time() - epoch_start_time
@@ -1784,7 +1815,7 @@ def train(config: Config):
         # Log to console
         print(
             f"Epoch {epoch + 1}/{start_epoch + config.num_epochs} - "
-            f"Train Loss: {train_loss:.6f}, Test Loss: {test_loss:.6f}, "
+            f"Train Loss: {train_result.loss.item():.6f}, Test Loss: {test_result.loss.item():.6f}, "
             f"Time: {epoch_time:.2f}s, "
             f"Weight Norm: {model_weight_norm:.4f}, "
             f"Logit Scale: {logit_scale:.4f}"
@@ -1798,10 +1829,18 @@ def train(config: Config):
         print(
             f"  Task Embedding Sparsity: {task_emb_sparsity:.2f}%"
         )
+        print(
+            f"  Loss Components - Train CE: {train_result.ce_loss.item():.6f}, Train L1: {train_result.l1_loss.item():.6f}, "
+            f"Test CE: {test_result.ce_loss.item():.6f}, Test L1: {test_result.l1_loss.item():.6f}"
+        )
 
         # Log to tensorboard
-        writer.add_scalar("Loss/train", train_loss, epoch)
-        writer.add_scalar("Loss/test", test_loss, epoch)
+        writer.add_scalar("Loss/train", train_result.loss.item(), epoch)
+        writer.add_scalar("Loss/test", test_result.loss.item(), epoch)
+        writer.add_scalar("Loss/train_ce", train_result.ce_loss.item(), epoch)
+        writer.add_scalar("Loss/test_ce", test_result.ce_loss.item(), epoch)
+        writer.add_scalar("Loss/train_l1", train_result.l1_loss.item(), epoch)
+        writer.add_scalar("Loss/test_l1", test_result.l1_loss.item(), epoch)
         writer.add_scalar("Time/epoch", epoch_time, epoch)
         writer.add_scalar("Model/weight_norm", model_weight_norm, epoch)
         writer.add_scalar("Model/logit_scale", logit_scale, epoch)
@@ -1845,8 +1884,8 @@ def train(config: Config):
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "epoch": epoch + 1,
-                    "train_loss": train_loss,
-                    "test_loss": test_loss,
+                    "train_loss": train_result.loss.item(),
+                    "test_loss": test_result.loss.item(),
                     "config": {
                         "d_model": config.d_model,
                         "nhead": config.nhead,
