@@ -1950,7 +1950,7 @@ def main():
         eval_denoise_epoch_interval=1,
         eval_denoise_num_iterations=10,
         # Training parameters
-        num_epochs=300,
+        num_epochs=150,
         batch_size=32,
         learning_rate=1e-4,
         weight_decay=0.0,
