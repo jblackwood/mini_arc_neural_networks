@@ -893,7 +893,7 @@ class TransformerModel(nn.Module):
         """
         
         # Get sparse task embeddings and project through dictionary
-        task_emb_sparse = torch.sigmoid(self.task_embedding(task_indices))  # (batch_size, d_model*5)
+        task_emb_sparse = self.task_embedding(task_indices)  # (batch_size, d_model*5)
         
         # Normalize dictionary columns (rows of weight) to have max_norm
         with torch.no_grad():
@@ -1181,8 +1181,8 @@ def compute_loss_for_batch(
         target.view(-1)
     )
     
-    # Compute L1 regularization on sparse task embeddings used in this batch (after sigmoid)
-    task_emb_sparse = torch.sigmoid(model.task_embedding(task_indices))  # (batch_size, d_model*5)
+    # Compute L1 regularization on sparse task embeddings used in this batch
+    task_emb_sparse = model.task_embedding(task_indices)  # (batch_size, d_model*5)
     l1_loss = torch.abs(task_emb_sparse).mean()  # L1 norm averaged over batch and features
     
     # Combine losses
@@ -1743,11 +1743,10 @@ def train(config: Config):
             transformer_weights.append(encoder_layer.linear2.weight.flatten())
         transformer_mean_sq = torch.cat(transformer_weights).pow(2).mean().item()
 
-        # Calculate task embedding sparsity (percentage of near-zero values after sigmoid)
-        task_emb_sigmoid = torch.sigmoid(model.task_embedding.weight)
-        # Consider sigmoid values < 0.01 as effectively zero (since sigmoid outputs are in [0, 1])
+        # Calculate task embedding sparsity (percentage of near-zero values in raw embeddings)
+        # Consider absolute values < 0.01 as effectively zero (matches initialization std)
         sparsity_threshold = 0.01
-        task_emb_sparsity = (task_emb_sigmoid < sparsity_threshold).float().mean().item() * 100
+        task_emb_sparsity = (torch.abs(model.task_embedding.weight) < sparsity_threshold).float().mean().item() * 100
 
         # Log to console
         print(
