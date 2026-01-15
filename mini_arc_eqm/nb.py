@@ -1806,11 +1806,11 @@ def train(config: Config):
             transformer_weights.append(encoder_layer.linear2.weight.flatten())
         transformer_mean_sq = torch.cat(transformer_weights).pow(2).mean().item()
 
-        # Calculate task embedding sparsity (percentage of near-zero values)
-        task_emb_weights = model.task_embedding.weight.abs()
-        # Consider values < 1e-3 as effectively zero
-        sparsity_threshold = 1e-3
-        task_emb_sparsity = (task_emb_weights < sparsity_threshold).float().mean().item() * 100
+        # Calculate task embedding sparsity (percentage of near-zero values after sigmoid)
+        task_emb_sigmoid = torch.sigmoid(model.task_embedding.weight)
+        # Consider sigmoid values < 0.01 as effectively zero (since sigmoid outputs are in [0, 1])
+        sparsity_threshold = 0.01
+        task_emb_sparsity = (task_emb_sigmoid < sparsity_threshold).float().mean().item() * 100
 
         # Log to console
         print(
