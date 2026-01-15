@@ -35,6 +35,7 @@ class Config:
     num_layers: int
     dim_feedforward: int
     dropout: float
+    l1_weight: float
 
     # Training parameters
     batch_size: int
@@ -824,11 +825,15 @@ class TransformerModel(nn.Module):
         """
         super().__init__()
 
-        # Store vocab_size for later use
+        # Store vocab_size and d_model for later use
         self.vocab_size = vocab_size
+        self.d_model = d_model
 
-        # Task embedding layer
-        self.task_embedding = nn.Embedding(num_tasks, d_model, max_norm=1.0)
+        # Sparse task embedding layer (size d_model * 5)
+        self.task_embedding = nn.Embedding(num_tasks, d_model * 5)
+        
+        # Dictionary matrix to project sparse embeddings to d_model
+        self.dictionary = nn.Linear(d_model * 5, d_model, bias=False)
 
         # Token embedding layer (vocab_size -> d_model)
         self.token_embedding = nn.Embedding(vocab_size, d_model, max_norm=1.0)
@@ -869,8 +874,9 @@ class TransformerModel(nn.Module):
             Tensor of shape (batch_size, 25, vocab_size+1) with logits for token change prediction
         """
         
-        # Get task embeddings and add task position embedding
-        task_emb = self.task_embedding(task_indices)  # (batch_size, d_model)
+        # Get sparse task embeddings and project through dictionary
+        task_emb_sparse = self.task_embedding(task_indices)  # (batch_size, d_model*5)
+        task_emb = self.dictionary(task_emb_sparse)  # (batch_size, d_model)
         task_emb = task_emb + self.task_embedding_position  # Add task position embedding
         task_emb = task_emb.unsqueeze(1)  # (batch_size, 1, d_model)
         
@@ -1106,6 +1112,7 @@ def compute_loss_for_batch(
     batch: torch.Tensor,
     task_indices: torch.Tensor,
     device: torch.device,
+    l1_weight: float,
 ) -> torch.Tensor:
     """Compute loss for a single batch.
 
@@ -1114,6 +1121,7 @@ def compute_loss_for_batch(
         batch: Batch of tokens, shape (batch_size, 50)
         task_indices: Task indices of shape (batch_size,)
         device: Device to compute on
+        l1_weight: Weight for L1 regularization on sparse task embeddings
 
     Returns:
         Loss tensor (scalar)
@@ -1141,10 +1149,17 @@ def compute_loss_for_batch(
     logits = model(xg, task_indices)
 
     # Compute cross-entropy loss (expects logits)
-    loss = torch.nn.functional.cross_entropy(
+    ce_loss = torch.nn.functional.cross_entropy(
         logits.view(-1, vocab_size + 1), 
         target.view(-1)
     )
+    
+    # Compute L1 regularization on sparse task embeddings used in this batch
+    task_emb_sparse = model.task_embedding(task_indices)  # (batch_size, d_model*5)
+    l1_loss = torch.abs(task_emb_sparse).mean()  # L1 norm averaged over batch and features
+    
+    # Combine losses
+    loss = ce_loss + l1_weight * l1_loss
 
     return loss
 
@@ -1155,6 +1170,7 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     task_id_to_index: Dict[str, int],
+    l1_weight: float,
 ) -> float:
     """Train for one epoch.
 
@@ -1164,6 +1180,7 @@ def train_epoch(
         optimizer: Optimizer
         device: Device to train on
         task_id_to_index: Mapping from task_id strings to integer indices
+        l1_weight: Weight for L1 regularization on sparse task embeddings
 
     Returns:
         Average training loss
@@ -1188,7 +1205,7 @@ def train_epoch(
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
         
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, task_indices, device)
+        loss = compute_loss_for_batch(model, batch, task_indices, device, l1_weight)
 
         # Backward pass
         optimizer.zero_grad()
@@ -1206,6 +1223,7 @@ def test_epoch(
     test_loader: DataLoader,
     device: torch.device,
     task_id_to_index: Dict[str, int],
+    l1_weight: float,
 ) -> float:
     """Evaluate on test set.
 
@@ -1214,6 +1232,7 @@ def test_epoch(
         test_loader: Test data loader
         device: Device to evaluate on
         task_id_to_index: Mapping from task_id strings to integer indices
+        l1_weight: Weight for L1 regularization on sparse task embeddings
 
     Returns:
         Average test loss
@@ -1239,7 +1258,7 @@ def test_epoch(
             task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
             
             # Compute loss
-            loss = compute_loss_for_batch(model, batch, task_indices, device)
+            loss = compute_loss_for_batch(model, batch, task_indices, device, l1_weight)
 
             total_loss += loss.item()
             num_batches += 1
@@ -1253,6 +1272,7 @@ def learning_rate_test(
     device: torch.device,
     weight_decay: float,
     task_id_to_index: Dict[str, int],
+    l1_weight: float,
 ):
     """Test learning rate by starting at 1e-7 and doubling every batch.
 
@@ -1262,6 +1282,7 @@ def learning_rate_test(
         device: Device to train on
         weight_decay: Weight decay parameter
         task_id_to_index: Mapping from task_id strings to integer indices
+        l1_weight: Weight for L1 regularization on sparse task embeddings
     """
     # Start learning rate test
     print("\nStarting learning rate test...")
@@ -1290,7 +1311,7 @@ def learning_rate_test(
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
 
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, task_indices, device)
+        loss = compute_loss_for_batch(model, batch, task_indices, device, l1_weight)
 
         # Backward pass
         opt.zero_grad()
@@ -1313,6 +1334,7 @@ def weight_decay_test(
     device: torch.device,
     learning_rate: float,
     task_id_to_index: Dict[str, int],
+    l1_weight: float,
 ):
     """Test weight decay by starting at 1e-7 and doubling every batch.
 
@@ -1322,6 +1344,7 @@ def weight_decay_test(
         device: Device to train on
         learning_rate: Learning rate parameter
         task_id_to_index: Mapping from task_id strings to integer indices
+        l1_weight: Weight for L1 regularization on sparse task embeddings
     """
     # Start weight decay test
     print("\nStarting weight decay test...")
@@ -1350,7 +1373,7 @@ def weight_decay_test(
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
 
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, task_indices, device)
+        loss = compute_loss_for_batch(model, batch, task_indices, device, l1_weight)
 
         # Backward pass
         opt.zero_grad()
@@ -1640,12 +1663,12 @@ def train(config: Config):
 
     # Check if running learning rate test
     if config.mode == "learning_rate_test":
-        learning_rate_test(model, train_loader, device, config.weight_decay, task_id_to_index)
+        learning_rate_test(model, train_loader, device, config.weight_decay, task_id_to_index, config.l1_weight)
         return
 
     # Check if running weight decay test
     if config.mode == "weight_decay_test":
-        weight_decay_test(model, train_loader, device, config.learning_rate, task_id_to_index)
+        weight_decay_test(model, train_loader, device, config.learning_rate, task_id_to_index, config.l1_weight)
         return
 
     # Create optimizer
@@ -1700,10 +1723,10 @@ def train(config: Config):
         epoch_start_time = time.time()
 
         # Train
-        train_loss = train_epoch(model, train_loader, optimizer, device, task_id_to_index)
+        train_loss = train_epoch(model, train_loader, optimizer, device, task_id_to_index, config.l1_weight)
 
         # Test
-        test_loss = test_epoch(model, test_loader, device, task_id_to_index)
+        test_loss = test_epoch(model, test_loader, device, task_id_to_index, config.l1_weight)
 
         # Calculate epoch time
         epoch_time = time.time() - epoch_start_time
@@ -1793,12 +1816,12 @@ def train(config: Config):
 
         # Save checkpoint every N epochs (configurable)
         if (epoch + 1) % config.checkpoint_save_interval == 0:
-            checkpoint_path = f"{config.checkpoint_dir}/{config.timestamp}_epoch_{epoch + 1}_checkpoint.pt"
+            checkpoint_path = Path(config.checkpoint_dir) / f"{config.timestamp}_epoch_{epoch + 1}_checkpoint.pt"
             torch.save(
                 {
-                    "epoch": epoch + 1,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    "epoch": epoch + 1,
                     "train_loss": train_loss,
                     "test_loss": test_loss,
                     "config": {
@@ -1812,7 +1835,7 @@ def train(config: Config):
                 },
                 checkpoint_path,
             )
-            print(f"Saved checkpoint to {checkpoint_path}")
+            print(f"  Checkpoint saved to {checkpoint_path}")
             
             # Copy checkpoint to Google Drive if the directory exists
             if os.path.exists(config.google_drive_dir):
@@ -1858,6 +1881,7 @@ def main():
         num_layers=8,
         dim_feedforward=1024,
         dropout=0.1,
+        l1_weight=0.001,
         # Data parameters
         vocab_size=11,
         # Denoising evaluation parameters
