@@ -829,11 +829,13 @@ class TransformerModel(nn.Module):
         self.vocab_size = vocab_size
         self.d_model = d_model
 
-        # Sparse task embedding layer (size d_model * 5)
-        self.task_embedding = nn.Embedding(num_tasks, d_model * 5)
+        # Sparse task embedding layer (size d_model * 5) with max_norm constraint
+        self.task_embedding = nn.Embedding(num_tasks, d_model * 5, max_norm=10.0)
         
         # Dictionary matrix to project sparse embeddings to d_model
+        # Columns of the dictionary (rows of weight.T) will be normalized in forward pass
         self.dictionary = nn.Linear(d_model * 5, d_model, bias=False)
+        self.dictionary_max_norm = 1.0
 
         # Token embedding layer (vocab_size -> d_model)
         self.token_embedding = nn.Embedding(vocab_size, d_model, max_norm=1.0)
@@ -876,6 +878,15 @@ class TransformerModel(nn.Module):
         
         # Get sparse task embeddings and project through dictionary
         task_emb_sparse = self.task_embedding(task_indices)  # (batch_size, d_model*5)
+        
+        # Normalize dictionary columns (rows of weight) to have max_norm
+        with torch.no_grad():
+            # Dictionary weight shape: (d_model, d_model*5)
+            # Normalize each row (dictionary atom) to have max_norm
+            norms = torch.norm(self.dictionary.weight, p=2, dim=1, keepdim=True)
+            desired_norms = torch.clamp(norms, max=self.dictionary_max_norm)
+            self.dictionary.weight.mul_(desired_norms / (norms + 1e-8))
+        
         task_emb = self.dictionary(task_emb_sparse)  # (batch_size, d_model)
         task_emb = task_emb + self.task_embedding_position  # Add task position embedding
         task_emb = task_emb.unsqueeze(1)  # (batch_size, 1, d_model)
