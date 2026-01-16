@@ -1152,8 +1152,8 @@ def compute_task_embedding_kl_loss(model: TransformerModel) -> torch.Tensor:
     
     # Log determinant of covariance (add small epsilon for numerical stability)
     epsilon = 1e-6
-    cov_diag = cov.diag() + epsilon  # Use diagonal approximation for efficiency
-    log_det_cov = torch.log(cov_diag).sum()
+    cov_stable = cov + epsilon * torch.eye(d_model, device=cov.device)
+    log_det_cov = torch.logdet(cov_stable)
     
     # KL divergence
     kl_loss = 0.5 * (trace_cov + mean_sq_norm - d_model - log_det_cov)
