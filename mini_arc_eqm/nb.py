@@ -845,6 +845,8 @@ class TransformerModel(nn.Module):
 
         # Task embedding layer
         self.task_embedding = nn.Embedding(num_tasks, d_model)
+        # Initialize task embeddings with small values (mean=0, std=0.01)
+        nn.init.normal_(self.task_embedding.weight, mean=0.0, std=0.01)
 
         # Token embedding layer (vocab_size -> d_model)
         self.token_embedding = nn.Embedding(vocab_size, d_model, max_norm=1.0)
