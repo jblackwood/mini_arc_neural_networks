@@ -1966,7 +1966,7 @@ def main():
         # Data parameters
         vocab_size=11,
         # Loss parameters
-        kl_beta=0.01,
+        kl_beta=1.0,
         # Denoising evaluation parameters
         eval_denoise_epoch_interval=1,
         eval_denoise_num_iterations=10,
