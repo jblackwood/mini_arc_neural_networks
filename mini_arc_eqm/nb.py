@@ -1986,7 +1986,7 @@ def main():
         num_layers=8,
         dim_feedforward=1024,
         dropout=0.1,
-        task_emb_num_tokens=5,
+        task_emb_num_tokens=3,
         codebook_size=10,
         commitment_cost=0.25,
         group_lasso_weight=0.01,
@@ -1999,7 +1999,7 @@ def main():
         num_epochs=300,
         batch_size=32,
         learning_rate=1e-4,
-        weight_decay=0.0,
+        weight_decay=1,
         mode="train",
         checkpoint_save_interval=30,
         # Google Drive location for Colab
