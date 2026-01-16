@@ -35,13 +35,17 @@ class Config:
     num_layers: int
     dim_feedforward: int
     dropout: float
-    l1_weight: float
+    task_emb_num_tokens: int
+    codebook_size: int
+    commitment_cost: float
+    group_lasso_weight: float
 
     # Training parameters
     batch_size: int
     num_epochs: int
     learning_rate: float
-    mode: Literal["train", "learning_rate_test", "eval"]
+    weight_decay: float
+    mode: Literal["train", "learning_rate_test", "weight_decay_test", "eval"]
     checkpoint_save_interval: int
 
     # Data parameters
@@ -129,21 +133,6 @@ class DenoisingResult:
     optimized_output_tokens: Optional[torch.Tensor] = None
     best_grad_norm: Optional[torch.Tensor] = None
     best_iteration: Optional[torch.Tensor] = None
-
-
-@dataclass
-class LossResult:
-    """Result from loss computation.
-
-    Attributes:
-        loss: Total loss (cross-entropy + L1 regularization)
-        ce_loss: Cross-entropy loss component
-        l1_loss: L1 regularization loss component
-    """
-
-    loss: torch.Tensor
-    ce_loss: torch.Tensor
-    l1_loss: torch.Tensor
 
 
 def parse_arc_json(file_path: Path) -> ARCTask:
@@ -813,6 +802,71 @@ class RoPE2D(nn.Module):
         return x_rotated.reshape(x.shape[0], 25, self.d_model)
 
 
+class VectorQuantizer(nn.Module):
+    """Vector Quantization layer for VQVAE.
+    
+    Uses gradient descent to update the codebook via codebook_loss.
+    """
+    
+    def __init__(self, codebook_size: int, d_model: int):
+        """Initialize the vector quantizer.
+        
+        Args:
+            codebook_size: Number of vectors in the codebook
+            d_model: Dimension of each vector
+        """
+        super().__init__()
+        self.codebook_size = codebook_size
+        self.d_model = d_model
+        
+        # Initialize codebook
+        self.codebook = nn.Embedding(codebook_size, d_model)
+        self.codebook.weight.data.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
+    
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Quantize input vectors.
+        
+        Args:
+            x: Input tensor of shape (batch_size, num_tokens, d_model)
+        
+        Returns:
+            Tuple of:
+                - quantized: Quantized tensor, same shape as input
+                - codebook_loss: Loss for updating codebook
+                - commitment_loss: Loss for committing to codebook entries
+        """
+        # Flatten to (batch_size * num_tokens, d_model)
+        batch_size, num_tokens, d_model = x.shape
+        x_flat = x.reshape(-1, d_model)
+        
+        # Compute distances to codebook entries
+        # (batch_size * num_tokens, d_model) -> (batch_size * num_tokens, codebook_size)
+        distances = (
+            torch.sum(x_flat ** 2, dim=1, keepdim=True)
+            + torch.sum(self.codebook.weight ** 2, dim=1)
+            - 2 * torch.matmul(x_flat, self.codebook.weight.t())
+        )
+        
+        # Get indices of closest codebook entries
+        encoding_indices = torch.argmin(distances, dim=1)  # (batch_size * num_tokens,)
+        
+        # Quantize
+        quantized_flat = self.codebook(encoding_indices)  # (batch_size * num_tokens, d_model)
+        quantized = quantized_flat.reshape(batch_size, num_tokens, d_model)
+        
+        # Compute losses
+        # Codebook loss: MSE between detached input and codebook entries
+        codebook_loss = torch.mean((x.detach() - quantized) ** 2)
+        
+        # Commitment loss: MSE between input and detached codebook entries
+        commitment_loss = torch.mean((x - quantized.detach()) ** 2)
+        
+        # Straight-through estimator: use quantized in forward, but gradients flow through x
+        quantized = x + (quantized - x).detach()
+        
+        return quantized, codebook_loss, commitment_loss
+
+
 class TransformerModel(nn.Module):
     """Non-causal transformer encoder for ARC tasks."""
 
@@ -825,6 +879,8 @@ class TransformerModel(nn.Module):
         vocab_size: int,
         dropout: float,
         num_tasks: int,
+        task_emb_num_tokens: int,
+        codebook_size: int,
     ):
         """Initialize the transformer model.
 
@@ -836,28 +892,27 @@ class TransformerModel(nn.Module):
             vocab_size: Number of possible cell values (11 for ARC: 0-9 colors + mask token)
             dropout: Dropout rate
             num_tasks: Number of unique tasks for task embedding
+            task_emb_num_tokens: Number of task embedding tokens
+            codebook_size: Size of the vector quantizer codebook
         """
         super().__init__()
 
-        # Store vocab_size and d_model for later use
+        # Store vocab_size, task_emb_num_tokens, and d_model for later use
         self.vocab_size = vocab_size
+        self.task_emb_num_tokens = task_emb_num_tokens
         self.d_model = d_model
 
-        # Sparse task embedding layer (size d_model * 5) with max_norm constraint
-        self.task_embedding = nn.Embedding(num_tasks, d_model * 5)
-        # Initialize with small variance to prevent sigmoid saturation
-        nn.init.normal_(self.task_embedding.weight, mean=0.0, std=0.01)
+        # Task embedding layer
+        self.task_embedding = nn.Embedding(num_tasks, d_model * task_emb_num_tokens, max_norm=1.0)
         
-        # Dictionary matrix to project sparse embeddings to d_model
-        # Columns of the dictionary (rows of weight.T) will be normalized in forward pass
-        self.dictionary = nn.Linear(d_model * 5, d_model, bias=False)
-        self.dictionary_max_norm = 1.0
+        # Vector quantizer for task embeddings
+        self.task_vq = VectorQuantizer(codebook_size, d_model)
 
         # Token embedding layer (vocab_size -> d_model)
         self.token_embedding = nn.Embedding(vocab_size, d_model, max_norm=1.0)
 
-        # Learnable position embeddings for task token and grid types
-        self.task_embedding_position = nn.Parameter(torch.randn(d_model))
+        # Learnable position embeddings for task tokens and grid types
+        self.task_embedding_positions = nn.Parameter(torch.randn(task_emb_num_tokens, d_model))
         self.input_grid_embedding = nn.Parameter(torch.randn(d_model))
         self.output_grid_embedding = nn.Parameter(torch.randn(d_model))
 
@@ -875,13 +930,15 @@ class TransformerModel(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
 
         # Two linear output projection layers with transpose
-        # First: (batch_size, 51, d_model) -> (batch_size, 51, 25)
-        # Transpose: (batch_size, 51, 25) -> (batch_size, 25, 51)
-        # Second: (batch_size, 25, 51) -> (batch_size, 25, vocab_size+1)
+        # First: (batch_size, seq_len, d_model) -> (batch_size, seq_len, 25)
+        # Transpose: (batch_size, seq_len, 25) -> (batch_size, 25, seq_len)
+        # Second: (batch_size, 25, seq_len) -> (batch_size, 25, vocab_size+1)
+        # seq_len = task_emb_num_tokens + 25 + 25
+        seq_len = task_emb_num_tokens + 50
         self.output_proj_1 = nn.Linear(d_model, 25)
-        self.output_proj_2 = nn.Linear(51, vocab_size + 1)  # +1 for "no change" token
+        self.output_proj_2 = nn.Linear(seq_len, vocab_size + 1)  # +1 for "no change" token
 
-    def forward(self, x: torch.Tensor, task_indices: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, task_indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass.
 
         Args:
@@ -889,23 +946,22 @@ class TransformerModel(nn.Module):
             task_indices: Task indices of shape (batch_size,) - integer indices for task embeddings
 
         Returns:
-            Tensor of shape (batch_size, 25, vocab_size+1) with logits for token change prediction
+            Tuple of:
+                - logits: Tensor of shape (batch_size, 25, vocab_size+1) with logits for token change prediction
+                - codebook_loss: Scalar tensor with codebook loss from VQ
+                - commitment_loss: Scalar tensor with commitment loss from VQ
         """
         
-        # Get sparse task embeddings and project through dictionary
-        task_emb_sparse = self.task_embedding(task_indices)  # (batch_size, d_model*5)
+        # Get task embeddings and reshape to individual tokens
+        task_emb = self.task_embedding(task_indices)  # (batch_size, d_model * task_emb_num_tokens)
+        # Reshape to individual task tokens
+        task_emb = task_emb.view(-1, self.task_emb_num_tokens, self.d_model)  # (batch_size, task_emb_num_tokens, d_model)
         
-        # Normalize dictionary columns (rows of weight) to have max_norm
-        with torch.no_grad():
-            # Dictionary weight shape: (d_model, d_model*5)
-            # Normalize each row (dictionary atom) to have max_norm
-            norms = torch.norm(self.dictionary.weight, p=2, dim=1, keepdim=True)
-            desired_norms = torch.clamp(norms, max=self.dictionary_max_norm)
-            self.dictionary.weight.mul_(desired_norms / (norms + 1e-8))
+        # Apply vector quantization to task embeddings
+        task_emb, codebook_loss, commitment_loss = self.task_vq(task_emb)  # (batch_size, task_emb_num_tokens, d_model)
         
-        task_emb = self.dictionary(task_emb_sparse)  # (batch_size, d_model)
-        task_emb = task_emb + self.task_embedding_position  # Add task position embedding
-        task_emb = task_emb.unsqueeze(1)  # (batch_size, 1, d_model)
+        # Add position embeddings
+        task_emb = task_emb + self.task_embedding_positions  # (batch_size, task_emb_num_tokens, d_model)
         
         # Apply token embedding to grid tokens
         x = self.token_embedding(x)  # (batch_size, 50, d_model)
@@ -922,21 +978,21 @@ class TransformerModel(nn.Module):
         input_grid = self.rope(input_grid)  # (batch_size, 25, d_model)
         output_grid = self.rope(output_grid)  # (batch_size, 25, d_model)
         
-        # Concatenate: task token, input grid with RoPE, output grid with RoPE
-        x = torch.cat([task_emb, input_grid, output_grid], dim=1)  # (batch_size, 51, d_model)
+        # Concatenate: task tokens, input grid with RoPE, output grid with RoPE
+        x = torch.cat([task_emb, input_grid, output_grid], dim=1)  # (batch_size, task_emb_num_tokens+50, d_model)
 
         # Apply transformer encoder
-        x = self.transformer_encoder(x)  # (batch_size, 51, d_model)
+        x = self.transformer_encoder(x)  # (batch_size, task_emb_num_tokens+50, d_model)
 
         # Apply first output projection and transpose
-        x = self.output_proj_1(x)  # (batch_size, 51, 25)
-        x = x.transpose(1, 2)  # (batch_size, 25, 51)
+        x = self.output_proj_1(x)  # (batch_size, task_emb_num_tokens+50, 25)
+        x = x.transpose(1, 2)  # (batch_size, 25, task_emb_num_tokens+50)
         
         # Second output projection
         logits = self.output_proj_2(x)  # (batch_size, 25, vocab_size+1)
         
-        # Return raw logits for training (cross-entropy expects logits)
-        return logits
+        # Return raw logits and VQ losses for training
+        return logits, codebook_loss, commitment_loss
 
 
 def optimize_output_grid(
@@ -969,8 +1025,8 @@ def optimize_output_grid(
         best_x = x.clone()
 
         for iteration in range(num_iterations):
-            # Get logits from model
-            logits = model(x, task_indices)  # (batch_size, 25, vocab_size+1)
+            # Get logits from model (ignore VQ losses during inference)
+            logits, _, _ = model(x, task_indices)  # (batch_size, 25, vocab_size+1)
             
             # Get the most likely token for each position
             token_change_predictions = torch.argmax(logits, dim=2)  # (batch_size, 25)
@@ -1139,8 +1195,9 @@ def compute_loss_for_batch(
     batch: torch.Tensor,
     task_indices: torch.Tensor,
     device: torch.device,
-    l1_weight: float,
-) -> LossResult:
+    commitment_cost: float,
+    group_lasso_weight: float,
+) -> torch.Tensor:
     """Compute loss for a single batch.
 
     Args:
@@ -1148,10 +1205,11 @@ def compute_loss_for_batch(
         batch: Batch of tokens, shape (batch_size, 50)
         task_indices: Task indices of shape (batch_size,)
         device: Device to compute on
-        l1_weight: Weight for L1 regularization on sparse task embeddings
+        commitment_cost: Weight for commitment loss (beta in VQVAE)
+        group_lasso_weight: Weight for group lasso regularization on task embeddings
 
     Returns:
-        LossResult with total loss, cross-entropy loss, and L1 loss
+        Loss tensor (scalar)
     """
     x = batch.to(device)  # (batch_size, 50)
     task_indices = task_indices.to(device)  # (batch_size,)
@@ -1172,8 +1230,8 @@ def compute_loss_for_batch(
     same_mask = (x_output == xg_output)  # (batch_size, 25)
     target = torch.where(same_mask, no_change_token, x_output)  # (batch_size, 25)
 
-    # Forward pass - model returns logits (batch_size, 25, vocab_size+1)
-    logits = model(xg, task_indices)
+    # Forward pass - model returns logits and VQ losses
+    logits, codebook_loss, commitment_loss = model(xg, task_indices)
 
     # Compute cross-entropy loss (expects logits)
     ce_loss = torch.nn.functional.cross_entropy(
@@ -1181,14 +1239,20 @@ def compute_loss_for_batch(
         target.view(-1)
     )
     
-    # Compute L1 regularization on sparse task embeddings used in this batch
-    task_emb_sparse = model.task_embedding(task_indices)  # (batch_size, d_model*5)
-    l1_loss = torch.abs(task_emb_sparse).mean()  # L1 norm averaged over batch and features
+    # Compute group lasso regularization on task embeddings
+    # Get task embeddings and reshape to (batch_size, task_emb_num_tokens, d_model)
+    task_emb_flat = model.task_embedding(task_indices)  # (batch_size, d_model * task_emb_num_tokens)
+    task_emb = task_emb_flat.view(-1, model.task_emb_num_tokens, model.d_model)  # (batch_size, task_emb_num_tokens, d_model)
     
-    # Combine losses
-    loss = ce_loss + l1_weight * l1_loss
+    # For each token position, compute L2 norm across d_model dimension
+    token_norms = torch.norm(task_emb, p=2, dim=2)  # (batch_size, task_emb_num_tokens)
+    # Sum over tokens and average over batch
+    group_lasso_loss = token_norms.sum(dim=1).mean(dim=0)  # scalar
+    
+    # Combine losses: CE + codebook_loss + commitment_cost * commitment_loss + group_lasso_weight * group_lasso_loss
+    loss = ce_loss + codebook_loss + commitment_cost * commitment_loss + group_lasso_weight * group_lasso_loss
 
-    return LossResult(loss=loss, ce_loss=ce_loss, l1_loss=l1_loss)
+    return loss
 
 
 def train_epoch(
@@ -1197,8 +1261,9 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     task_id_to_index: Dict[str, int],
-    l1_weight: float,
-) -> LossResult:
+    commitment_cost: float,
+    group_lasso_weight: float,
+) -> float:
     """Train for one epoch.
 
     Args:
@@ -1207,15 +1272,14 @@ def train_epoch(
         optimizer: Optimizer
         device: Device to train on
         task_id_to_index: Mapping from task_id strings to integer indices
-        l1_weight: Weight for L1 regularization on sparse task embeddings
+        commitment_cost: Weight for commitment loss (beta in VQVAE)
+        group_lasso_weight: Weight for group lasso regularization on task embeddings
 
     Returns:
-        LossResult with average losses over the epoch
+        Average training loss
     """
     model.train()
     total_loss = 0.0
-    total_ce_loss = 0.0
-    total_l1_loss = 0.0
     num_batches = 0
 
     for examples in train_loader:
@@ -1234,23 +1298,17 @@ def train_epoch(
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
         
         # Compute loss
-        loss_result = compute_loss_for_batch(model, batch, task_indices, device, l1_weight)
+        loss = compute_loss_for_batch(model, batch, task_indices, device, commitment_cost, group_lasso_weight)
 
         # Backward pass
         optimizer.zero_grad()
-        loss_result.loss.backward()
+        loss.backward()
         optimizer.step()
 
-        total_loss += loss_result.loss.item()
-        total_ce_loss += loss_result.ce_loss.item()
-        total_l1_loss += loss_result.l1_loss.item()
+        total_loss += loss.item()
         num_batches += 1
 
-    return LossResult(
-        loss=torch.tensor(total_loss / num_batches),
-        ce_loss=torch.tensor(total_ce_loss / num_batches),
-        l1_loss=torch.tensor(total_l1_loss / num_batches)
-    )
+    return total_loss / num_batches
 
 
 def test_epoch(
@@ -1258,8 +1316,9 @@ def test_epoch(
     test_loader: DataLoader,
     device: torch.device,
     task_id_to_index: Dict[str, int],
-    l1_weight: float,
-) -> LossResult:
+    commitment_cost: float,
+    group_lasso_weight: float,
+) -> float:
     """Evaluate on test set.
 
     Args:
@@ -1267,15 +1326,14 @@ def test_epoch(
         test_loader: Test data loader
         device: Device to evaluate on
         task_id_to_index: Mapping from task_id strings to integer indices
-        l1_weight: Weight for L1 regularization on sparse task embeddings
+        commitment_cost: Weight for commitment loss (beta in VQVAE)
+        group_lasso_weight: Weight for group lasso regularization on task embeddings
 
     Returns:
-        LossResult with average losses over the test set
+        Average test loss
     """
     model.eval()
     total_loss = 0.0
-    total_ce_loss = 0.0
-    total_l1_loss = 0.0
     num_batches = 0
 
     with torch.no_grad():
@@ -1295,26 +1353,22 @@ def test_epoch(
             task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
             
             # Compute loss
-            loss_result = compute_loss_for_batch(model, batch, task_indices, device, l1_weight)
+            loss = compute_loss_for_batch(model, batch, task_indices, device, commitment_cost, group_lasso_weight)
 
-            total_loss += loss_result.loss.item()
-            total_ce_loss += loss_result.ce_loss.item()
-            total_l1_loss += loss_result.l1_loss.item()
+            total_loss += loss.item()
             num_batches += 1
 
-    return LossResult(
-        loss=torch.tensor(total_loss / num_batches),
-        ce_loss=torch.tensor(total_ce_loss / num_batches),
-        l1_loss=torch.tensor(total_l1_loss / num_batches)
-    )
+    return total_loss / num_batches
 
 
 def learning_rate_test(
     model: TransformerModel,
     train_loader: DataLoader,
     device: torch.device,
+    weight_decay: float,
     task_id_to_index: Dict[str, int],
-    l1_weight: float,
+    commitment_cost: float,
+    group_lasso_weight: float,
 ):
     """Test learning rate by starting at 1e-7 and doubling every batch.
 
@@ -1322,8 +1376,10 @@ def learning_rate_test(
         model: The transformer model
         train_loader: Training data loader
         device: Device to train on
+        weight_decay: Weight decay parameter
         task_id_to_index: Mapping from task_id strings to integer indices
-        l1_weight: Weight for L1 regularization on sparse task embeddings
+        commitment_cost: Weight for commitment loss (beta in VQVAE)
+        group_lasso_weight: Weight for group lasso regularization on task embeddings
     """
     # Start learning rate test
     print("\nStarting learning rate test...")
@@ -1336,8 +1392,8 @@ def learning_rate_test(
             break
 
         # Create optimizer with current learning rate
-        opt = torch.optim.Adam(
-            model.parameters(), lr=lr
+        opt = torch.optim.AdamW(
+            model.parameters(), lr=lr, weight_decay=weight_decay
         )
 
         # Prepare batch
@@ -1352,21 +1408,85 @@ def learning_rate_test(
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
 
         # Compute loss
-        loss_result = compute_loss_for_batch(model, batch, task_indices, device, l1_weight)
+        loss = compute_loss_for_batch(model, batch, task_indices, device, commitment_cost, group_lasso_weight)
 
         # Backward pass
         opt.zero_grad()
-        loss_result.loss.backward()
+        loss.backward()
         opt.step()
 
         # Print learning rate and loss
-        print(f"Batch {batch_count + 1}: LR = {lr:.2e}, Loss = {loss_result.loss.item():.6f}")
+        print(f"Batch {batch_count + 1}: LR = {lr:.2e}, Loss = {loss.item():.6f}")
 
         # Double learning rate for next batch
         lr *= 2
         batch_count += 1
 
     print("\nLearning rate test complete!")
+
+
+def weight_decay_test(
+    model: TransformerModel,
+    train_loader: DataLoader,
+    device: torch.device,
+    learning_rate: float,
+    task_id_to_index: Dict[str, int],
+    commitment_cost: float,
+    group_lasso_weight: float,
+):
+    """Test weight decay by starting at 1e-7 and doubling every batch.
+
+    Args:
+        model: The transformer model
+        train_loader: Training data loader
+        device: Device to train on
+        learning_rate: Learning rate parameter
+        task_id_to_index: Mapping from task_id strings to integer indices
+        commitment_cost: Weight for commitment loss (beta in VQVAE)
+        group_lasso_weight: Weight for group lasso regularization on task embeddings
+    """
+    # Start weight decay test
+    print("\nStarting weight decay test...")
+    wd = 1e-7
+    model.train()
+
+    batch_count = 0
+    for examples in train_loader:
+        if batch_count >= 30:
+            break
+
+        # Create optimizer with current weight decay
+        opt = torch.optim.AdamW(
+            model.parameters(), lr=learning_rate, weight_decay=wd
+        )
+
+        # Prepare batch
+        batch_tensors = []
+        task_ids = []
+        for example in examples:
+            concatenated = torch.cat([example["input_grid"], example["output_grid"]], dim=0)  # (50,)
+            batch_tensors.append(concatenated)
+            task_ids.append(example["task_id"])
+        
+        batch = torch.stack(batch_tensors, dim=0)  # (batch_size, 50)
+        task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
+
+        # Compute loss
+        loss = compute_loss_for_batch(model, batch, task_indices, device, commitment_cost, group_lasso_weight)
+
+        # Backward pass
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+        # Print weight decay and loss
+        print(f"Batch {batch_count + 1}: WD = {wd:.2e}, Loss = {loss.item():.6f}")
+
+        # Double weight decay for next batch
+        wd *= 2
+        batch_count += 1
+
+    print("\nWeight decay test complete!")
 
 
 def evaluate_denoising(
@@ -1622,6 +1742,8 @@ def train(config: Config):
         vocab_size=config.vocab_size,
         dropout=config.dropout,
         num_tasks=num_tasks,
+        task_emb_num_tokens=config.task_emb_num_tokens,
+        codebook_size=config.codebook_size,
     ).to(device)
 
     # Compile model for better performance (PyTorch 2.0+)
@@ -1642,18 +1764,18 @@ def train(config: Config):
 
     # Check if running learning rate test
     if config.mode == "learning_rate_test":
-        learning_rate_test(model, train_loader, device, task_id_to_index, config.l1_weight)
+        learning_rate_test(model, train_loader, device, config.weight_decay, task_id_to_index, config.commitment_cost, config.group_lasso_weight)
         return
 
-    # Create optimizer with different learning rates for task embeddings
-    # Task embeddings need higher LR since they only update once per epoch (when that task appears)
-    # while other params update every batch (~1562 times per epoch with 50k tasks and batch_size=32)
-    task_embedding_lr_multiplier = 50.0  # Compensate for ~50x fewer updates per epoch
-    
-    optimizer = torch.optim.Adam([
-        {'params': model.task_embedding.parameters(), 'lr': config.learning_rate * task_embedding_lr_multiplier},
-        {'params': [p for n, p in model.named_parameters() if 'task_embedding' not in n], 'lr': config.learning_rate}
-    ])
+    # Check if running weight decay test
+    if config.mode == "weight_decay_test":
+        weight_decay_test(model, train_loader, device, config.learning_rate, task_id_to_index, config.commitment_cost, config.group_lasso_weight)
+        return
+
+    # Create optimizer
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
+    )
 
     # Load existing model if specified
     start_epoch = 0
@@ -1702,10 +1824,10 @@ def train(config: Config):
         epoch_start_time = time.time()
 
         # Train
-        train_result = train_epoch(model, train_loader, optimizer, device, task_id_to_index, config.l1_weight)
+        train_loss = train_epoch(model, train_loader, optimizer, device, task_id_to_index, config.commitment_cost, config.group_lasso_weight)
 
         # Test
-        test_result = test_epoch(model, test_loader, device, task_id_to_index, config.l1_weight)
+        test_loss = test_epoch(model, test_loader, device, task_id_to_index, config.commitment_cost, config.group_lasso_weight)
 
         # Calculate epoch time
         epoch_time = time.time() - epoch_start_time
@@ -1743,15 +1865,10 @@ def train(config: Config):
             transformer_weights.append(encoder_layer.linear2.weight.flatten())
         transformer_mean_sq = torch.cat(transformer_weights).pow(2).mean().item()
 
-        # Calculate task embedding sparsity (percentage of near-zero values in raw embeddings)
-        # Consider absolute values < 0.01 as effectively zero (matches initialization std)
-        sparsity_threshold = 0.01
-        task_emb_sparsity = (torch.abs(model.task_embedding.weight) < sparsity_threshold).float().mean().item() * 100
-
         # Log to console
         print(
             f"Epoch {epoch + 1}/{start_epoch + config.num_epochs} - "
-            f"Train Loss: {train_result.loss.item():.6f}, Test Loss: {test_result.loss.item():.6f}, "
+            f"Train Loss: {train_loss:.6f}, Test Loss: {test_loss:.6f}, "
             f"Time: {epoch_time:.2f}s, "
             f"Weight Norm: {model_weight_norm:.4f}, "
             f"Logit Scale: {logit_scale:.4f}"
@@ -1762,21 +1879,10 @@ def train(config: Config):
             f"Out Proj 1: {output_proj_1_mean_sq:.6f}, Out Proj 2: {output_proj_2_mean_sq:.6f}, "
             f"Transformer: {transformer_mean_sq:.6f}"
         )
-        print(
-            f"  Task Embedding Sparsity: {task_emb_sparsity:.2f}%"
-        )
-        print(
-            f"  Loss Components - Train CE: {train_result.ce_loss.item():.6f}, Train L1: {train_result.l1_loss.item():.6f}, "
-            f"Test CE: {test_result.ce_loss.item():.6f}, Test L1: {test_result.l1_loss.item():.6f}"
-        )
 
         # Log to tensorboard
-        writer.add_scalar("Loss/train", train_result.loss.item(), epoch)
-        writer.add_scalar("Loss/test", test_result.loss.item(), epoch)
-        writer.add_scalar("Loss/train_ce", train_result.ce_loss.item(), epoch)
-        writer.add_scalar("Loss/test_ce", test_result.ce_loss.item(), epoch)
-        writer.add_scalar("Loss/train_l1", train_result.l1_loss.item(), epoch)
-        writer.add_scalar("Loss/test_l1", test_result.l1_loss.item(), epoch)
+        writer.add_scalar("Loss/train", train_loss, epoch)
+        writer.add_scalar("Loss/test", test_loss, epoch)
         writer.add_scalar("Time/epoch", epoch_time, epoch)
         writer.add_scalar("Model/weight_norm", model_weight_norm, epoch)
         writer.add_scalar("Model/logit_scale", logit_scale, epoch)
@@ -1787,9 +1893,6 @@ def train(config: Config):
         writer.add_scalar("LayerMeanSquare/output_proj_1", output_proj_1_mean_sq, epoch)
         writer.add_scalar("LayerMeanSquare/output_proj_2", output_proj_2_mean_sq, epoch)
         writer.add_scalar("LayerMeanSquare/transformer_avg", transformer_mean_sq, epoch)
-        
-        # Log task embedding sparsity
-        writer.add_scalar("Sparsity/task_embedding", task_emb_sparsity, epoch)
 
         # Evaluate denoising accuracy periodically
         if (epoch + 1) % config.eval_denoise_epoch_interval == 0:
@@ -1820,8 +1923,8 @@ def train(config: Config):
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "epoch": epoch + 1,
-                    "train_loss": train_result.loss.item(),
-                    "test_loss": test_result.loss.item(),
+                    "train_loss": train_loss,
+                    "test_loss": test_loss,
                     "config": {
                         "d_model": config.d_model,
                         "nhead": config.nhead,
@@ -1829,6 +1932,8 @@ def train(config: Config):
                         "dim_feedforward": config.dim_feedforward,
                         "vocab_size": config.vocab_size,
                         "dropout": config.dropout,
+                        "task_emb_num_tokens": config.task_emb_num_tokens,
+                        "codebook_size": config.codebook_size,
                     },
                 },
                 checkpoint_path,
@@ -1857,6 +1962,8 @@ def train(config: Config):
                 "dim_feedforward": config.dim_feedforward,
                 "vocab_size": config.vocab_size,
                 "dropout": config.dropout,
+                "task_emb_num_tokens": config.task_emb_num_tokens,
+                "codebook_size": config.codebook_size,
             },
         },
         config.model_save_path,
@@ -1879,16 +1986,20 @@ def main():
         num_layers=8,
         dim_feedforward=1024,
         dropout=0.1,
-        l1_weight=1,
+        task_emb_num_tokens=5,
+        codebook_size=10,
+        commitment_cost=0.25,
+        group_lasso_weight=0.01,
         # Data parameters
         vocab_size=11,
         # Denoising evaluation parameters
         eval_denoise_epoch_interval=1,
         eval_denoise_num_iterations=10,
         # Training parameters
-        num_epochs=150,
+        num_epochs=300,
         batch_size=32,
         learning_rate=1e-4,
+        weight_decay=0.0,
         mode="train",
         checkpoint_save_interval=30,
         # Google Drive location for Colab
