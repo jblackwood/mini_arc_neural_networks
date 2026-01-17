@@ -829,10 +829,14 @@ class TransformerModel(nn.Module):
         self.vocab_size = vocab_size
 
         # Task embedding layer
-        self.task_embedding = nn.Embedding(num_tasks, d_model, max_norm=1.0)
+        self.task_embedding = nn.Embedding(num_tasks, d_model)
+        # Initialize task embeddings with mean 0 and std 0.01
+        nn.init.normal_(self.task_embedding.weight, mean=0.0, std=0.01)
 
         # Token embedding layer (vocab_size -> d_model)
-        self.token_embedding = nn.Embedding(vocab_size, d_model, max_norm=1.0)
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
+        # Initialize token embeddings with mean 0 and std 0.01
+        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.01)
 
         # Learnable position embeddings for task token and grid types
         self.task_embedding_position = nn.Parameter(torch.randn(d_model))
@@ -1197,6 +1201,7 @@ def train_epoch(
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         total_loss += loss.item()
@@ -1301,6 +1306,7 @@ def learning_rate_test(
         # Backward pass
         opt.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         opt.step()
 
         # Print learning rate and loss
@@ -1362,6 +1368,7 @@ def weight_decay_test(
         # Backward pass
         opt.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         opt.step()
 
         # Print weight decay and loss
