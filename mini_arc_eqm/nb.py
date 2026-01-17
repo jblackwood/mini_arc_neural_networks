@@ -1881,7 +1881,7 @@ def main():
         num_epochs=150,
         batch_size=32,
         learning_rate=1e-4,
-        weight_decay=0.01,
+        weight_decay=0.1,
         label_smoothing=0.1,
         mode="train",
         checkpoint_save_interval=30,
