@@ -1880,7 +1880,7 @@ def main():
         # Training parameters
         num_epochs=150,
         batch_size=32,
-        learning_rate=1e-4,
+        learning_rate=2e-4,
         weight_decay=0.1,
         label_smoothing=0.1,
         mode="train",
