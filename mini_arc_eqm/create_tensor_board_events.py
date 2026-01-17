@@ -23,12 +23,30 @@ from torch.utils.tensorboard import SummaryWriter
 def parse_epoch_line(line: str):
     """Parse an epoch summary line.
     
-    Example: "Epoch 1/300 - Train Loss: 0.045345, Test Loss: 0.031181, Time: 154.78s, Weight Norm: 378.6285, Logit Scale: 8.1446"
+    Example formats:
+    - "Epoch 1/300 - Train Loss: 0.045345, Test Loss: 0.031181, Time: 154.78s, Weight Norm: 378.6285, Logit Scale: 8.1446"
+    - "Epoch 1/150 - Train Loss: 635.124390 (CE: 1.578391, KL: 633.546021), Test Loss: 470.223816 (CE: 1.351296, KL: 468.872528), Time: 127.30s"
     
     Returns:
-        dict with keys: epoch, train_loss, test_loss, time, weight_norm (optional), logit_scale (optional)
+        dict with keys: epoch, train_loss, test_loss, time, weight_norm (optional), logit_scale (optional), 
+                        train_ce (optional), train_kl (optional), test_ce (optional), test_kl (optional)
     """
-    # Try the new format with Weight Norm and Logit Scale
+    # Try the format with CE/KL breakdown
+    pattern_ce_kl = r"Epoch (\d+)/\d+ - Train Loss: ([\d.]+) \(CE: ([\d.]+), KL: ([-\d.]+)\), Test Loss: ([\d.]+) \(CE: ([\d.]+), KL: ([-\d.]+)\), Time: ([\d.]+)s"
+    match = re.match(pattern_ce_kl, line)
+    if match:
+        return {
+            'epoch': int(match.group(1)),
+            'train_loss': float(match.group(2)),
+            'train_ce': float(match.group(3)),
+            'train_kl': float(match.group(4)),
+            'test_loss': float(match.group(5)),
+            'test_ce': float(match.group(6)),
+            'test_kl': float(match.group(7)),
+            'time': float(match.group(8))
+        }
+    
+    # Try the format with Weight Norm and Logit Scale
     pattern_new = r"Epoch (\d+)/\d+ - Train Loss: ([\d.]+), Test Loss: ([\d.]+), Time: ([\d.]+)s, Weight Norm: ([\d.]+), Logit Scale: ([\d.]+)"
     match = re.match(pattern_new, line)
     if match:
@@ -261,6 +279,13 @@ def write_to_tensorboard(metrics, log_dir: Path, model_name: str):
         writer.add_scalar("Loss/test", epoch_data['test_loss'], epoch)
         writer.add_scalar("Time/epoch", epoch_data['time'], epoch)
         
+        # Write CE/KL components if available
+        if 'train_ce' in epoch_data:
+            writer.add_scalar("LossComponents/train_ce", epoch_data['train_ce'], epoch)
+            writer.add_scalar("LossComponents/train_kl", epoch_data['train_kl'], epoch)
+            writer.add_scalar("LossComponents/test_ce", epoch_data['test_ce'], epoch)
+            writer.add_scalar("LossComponents/test_kl", epoch_data['test_kl'], epoch)
+        
         # Write model metrics if available
         if 'weight_norm' in epoch_data:
             writer.add_scalar("Model/weight_norm", epoch_data['weight_norm'], epoch)
@@ -293,11 +318,9 @@ def write_to_tensorboard(metrics, log_dir: Path, model_name: str):
         if 'task_emb_sparsity' in epoch_data:
             writer.add_scalar("Sparsity/task_embedding", epoch_data['task_emb_sparsity'], epoch)
         
-        # Write loss components if available
-        if 'train_ce' in epoch_data:
-            writer.add_scalar("LossComponents/train_ce", epoch_data['train_ce'], epoch)
+        # Write L1 loss components if available
+        if 'train_l1' in epoch_data:
             writer.add_scalar("LossComponents/train_l1", epoch_data['train_l1'], epoch)
-            writer.add_scalar("LossComponents/test_ce", epoch_data['test_ce'], epoch)
             writer.add_scalar("LossComponents/test_l1", epoch_data['test_l1'], epoch)
     
     writer.close()
@@ -306,7 +329,7 @@ def write_to_tensorboard(metrics, log_dir: Path, model_name: str):
 
 def main():
     # ============ Configure these variables ============
-    md_file = "mini_arc_eqm/results/20260115_114228_epoch_150_checkpoint.md"
+    md_file = "mini_arc_eqm/results/20260116_234853_epoch_120_checkpoint.md"
     log_dir = "output/mini_arc_eqm5/runs"
     # ===================================================
     
