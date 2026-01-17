@@ -41,6 +41,7 @@ class Config:
     num_epochs: int
     learning_rate: float
     weight_decay: float
+    label_smoothing: float
     mode: Literal["train", "learning_rate_test", "weight_decay_test", "eval"]
     checkpoint_save_interval: int
 
@@ -1106,6 +1107,7 @@ def compute_loss_for_batch(
     batch: torch.Tensor,
     task_indices: torch.Tensor,
     device: torch.device,
+    label_smoothing: float,
 ) -> torch.Tensor:
     """Compute loss for a single batch.
 
@@ -1143,7 +1145,8 @@ def compute_loss_for_batch(
     # Compute cross-entropy loss (expects logits)
     loss = torch.nn.functional.cross_entropy(
         logits.view(-1, vocab_size + 1), 
-        target.view(-1)
+        target.view(-1),
+        label_smoothing=label_smoothing
     )
 
     return loss
@@ -1155,6 +1158,7 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     task_id_to_index: Dict[str, int],
+    label_smoothing: float,
 ) -> float:
     """Train for one epoch.
 
@@ -1188,7 +1192,7 @@ def train_epoch(
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
         
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, task_indices, device)
+        loss = compute_loss_for_batch(model, batch, task_indices, device, label_smoothing)
 
         # Backward pass
         optimizer.zero_grad()
@@ -1206,6 +1210,7 @@ def test_epoch(
     test_loader: DataLoader,
     device: torch.device,
     task_id_to_index: Dict[str, int],
+    label_smoothing: float,
 ) -> float:
     """Evaluate on test set.
 
@@ -1239,7 +1244,7 @@ def test_epoch(
             task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
             
             # Compute loss
-            loss = compute_loss_for_batch(model, batch, task_indices, device)
+            loss = compute_loss_for_batch(model, batch, task_indices, device, label_smoothing)
 
             total_loss += loss.item()
             num_batches += 1
@@ -1253,6 +1258,7 @@ def learning_rate_test(
     device: torch.device,
     weight_decay: float,
     task_id_to_index: Dict[str, int],
+    label_smoothing: float,
 ):
     """Test learning rate by starting at 1e-7 and doubling every batch.
 
@@ -1290,7 +1296,7 @@ def learning_rate_test(
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
 
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, task_indices, device)
+        loss = compute_loss_for_batch(model, batch, task_indices, device, label_smoothing)
 
         # Backward pass
         opt.zero_grad()
@@ -1313,6 +1319,7 @@ def weight_decay_test(
     device: torch.device,
     learning_rate: float,
     task_id_to_index: Dict[str, int],
+    label_smoothing: float,
 ):
     """Test weight decay by starting at 1e-7 and doubling every batch.
 
@@ -1350,7 +1357,7 @@ def weight_decay_test(
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
 
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, task_indices, device)
+        loss = compute_loss_for_batch(model, batch, task_indices, device, label_smoothing)
 
         # Backward pass
         opt.zero_grad()
@@ -1640,12 +1647,12 @@ def train(config: Config):
 
     # Check if running learning rate test
     if config.mode == "learning_rate_test":
-        learning_rate_test(model, train_loader, device, config.weight_decay, task_id_to_index)
+        learning_rate_test(model, train_loader, device, config.weight_decay, task_id_to_index, config.label_smoothing)
         return
 
     # Check if running weight decay test
     if config.mode == "weight_decay_test":
-        weight_decay_test(model, train_loader, device, config.learning_rate, task_id_to_index)
+        weight_decay_test(model, train_loader, device, config.learning_rate, task_id_to_index, config.label_smoothing)
         return
 
     # Create optimizer
@@ -1700,10 +1707,10 @@ def train(config: Config):
         epoch_start_time = time.time()
 
         # Train
-        train_loss = train_epoch(model, train_loader, optimizer, device, task_id_to_index)
+        train_loss = train_epoch(model, train_loader, optimizer, device, task_id_to_index, config.label_smoothing)
 
         # Test
-        test_loss = test_epoch(model, test_loader, device, task_id_to_index)
+        test_loss = test_epoch(model, test_loader, device, task_id_to_index, config.label_smoothing)
 
         # Calculate epoch time
         epoch_time = time.time() - epoch_start_time
@@ -1868,6 +1875,7 @@ def main():
         batch_size=32,
         learning_rate=1e-4,
         weight_decay=0.0,
+        label_smoothing=0.1,
         mode="train",
         checkpoint_save_interval=30,
         # Google Drive location for Colab
