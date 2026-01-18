@@ -1888,7 +1888,7 @@ def main():
         learning_rate=1e-4,
         task_embedding_lr=1e-2,
         weight_decay=0.01,
-        label_smoothing=0.2,
+        label_smoothing=0.1,
         mode="train",
         checkpoint_save_interval=30,
         # Google Drive location for Colab
