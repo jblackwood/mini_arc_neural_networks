@@ -832,10 +832,16 @@ class TransformerModel(nn.Module):
         self.vocab_size = vocab_size
         self.task_embedding_num_tokens = task_embedding_num_tokens
 
-        # Task embedding layer
-        self.task_embedding = nn.Embedding(num_tasks, d_model * task_embedding_num_tokens)
+        # Task embedding layer (10x smaller for low-rank approximation)
+        task_embedding_dim = (d_model * task_embedding_num_tokens) // 10
+        self.task_embedding = nn.Embedding(num_tasks, task_embedding_dim)
         # Initialize task embeddings with mean 0 and std 0.01
         nn.init.normal_(self.task_embedding.weight, mean=0.0, std=0.01)
+        
+        # Task embedding projection layer (no bias)
+        self.task_embedding_proj = nn.Linear(task_embedding_dim, d_model * task_embedding_num_tokens, bias=False)
+        # Initialize projection with mean 0 and std 0.01
+        nn.init.normal_(self.task_embedding_proj.weight, mean=0.0, std=0.01)
 
         # Token embedding layer (vocab_size -> d_model)
         self.token_embedding = nn.Embedding(vocab_size, d_model)
@@ -878,8 +884,9 @@ class TransformerModel(nn.Module):
             Tensor of shape (batch_size, 25, vocab_size+1) with logits for token change prediction
         """
         
-        # Get task embeddings and add task position embedding
-        task_emb = self.task_embedding(task_indices)  # (batch_size, d_model * task_embedding_num_tokens)
+        # Get task embeddings, project to full size, and add task position embedding
+        task_emb = self.task_embedding(task_indices)  # (batch_size, task_embedding_dim)
+        task_emb = self.task_embedding_proj(task_emb)  # (batch_size, d_model * task_embedding_num_tokens)
         task_emb = task_emb.view(-1, self.task_embedding_num_tokens, task_emb.size(-1) // self.task_embedding_num_tokens)  # (batch_size, task_embedding_num_tokens, d_model)
         task_emb = task_emb + self.task_embedding_position  # Add task position embedding
         
