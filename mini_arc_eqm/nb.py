@@ -43,6 +43,7 @@ class Config:
     learning_rate: float
     task_embedding_lr: float
     weight_decay: float
+    task_embedding_weight_decay: float
     label_smoothing: float
     mode: Literal["train", "learning_rate_test", "weight_decay_test", "eval"]
     checkpoint_save_interval: int
@@ -1674,14 +1675,14 @@ def train(config: Config):
         weight_decay_test(model, train_loader, device, config.learning_rate, task_id_to_index, config.label_smoothing)
         return
 
-    # Create optimizer with separate learning rate for task embeddings
+    # Create optimizer with separate learning rate and weight decay for task embeddings
     task_embedding_params = list(model.task_embedding.parameters())
     other_params = [p for n, p in model.named_parameters() if 'task_embedding' not in n]
     
     optimizer = torch.optim.AdamW([
-        {'params': task_embedding_params, 'lr': config.task_embedding_lr},
-        {'params': other_params, 'lr': config.learning_rate}
-    ], weight_decay=config.weight_decay)
+        {'params': task_embedding_params, 'lr': config.task_embedding_lr, 'weight_decay': config.task_embedding_weight_decay},
+        {'params': other_params, 'lr': config.learning_rate, 'weight_decay': config.weight_decay}
+    ])
 
     # Load existing model if specified
     start_epoch = 0
@@ -1900,6 +1901,7 @@ def main():
         learning_rate=1e-4,
         task_embedding_lr=1e-2,
         weight_decay=0.01,
+        task_embedding_weight_decay=0.1,
         label_smoothing=0.1,
         mode="train",
         checkpoint_save_interval=30,
