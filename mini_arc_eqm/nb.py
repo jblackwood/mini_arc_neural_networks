@@ -1889,7 +1889,7 @@ def main():
         num_layers=8,
         dim_feedforward=1024,
         dropout=0.1,
-        task_embedding_num_tokens=2,
+        task_embedding_num_tokens=10,
         # Data parameters
         vocab_size=11,
         # Denoising evaluation parameters
