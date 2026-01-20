@@ -1395,20 +1395,20 @@ def weight_decay_test(
 
 def evaluate_denoising(
     model: TransformerModel,
-    train_dataset: ARCTaskDataset,
-    test_dataset: ARCTaskDataset,
+    train_loader: DataLoader,
+    test_loader: DataLoader,
     device: torch.device,
     eval_denoise_num_iterations: int,
     task_id_to_index: Dict[str, int],
     writer: Optional[SummaryWriter] = None,
     epoch: Optional[int] = None,
 ) -> Tuple[float, float]:
-    """Evaluate denoising accuracy on original tasks.
+    """Evaluate denoising accuracy on all tasks.
 
     Args:
         model: The transformer model
-        train_dataset: Training dataset
-        test_dataset: Test dataset
+        train_loader: Training dataloader
+        test_loader: Test dataloader
         device: Device to evaluate on
         eval_denoise_num_iterations: Number of optimization iterations
         task_id_to_index: Mapping from task_id strings to integer indices
@@ -1418,75 +1418,67 @@ def evaluate_denoising(
     Returns:
         Tuple of (average_train_accuracy, average_test_accuracy)
     """
-    # Filter for original tasks in train dataset
-    train_original_tasks = [
-        (idx, file_path)
-        for idx, file_path in enumerate(train_dataset.task_files)
-        if file_path.name.endswith("original.json")
-    ]
-    assert len(train_original_tasks) > 10 and len(train_original_tasks) < 200, "Expected between 10 and 200 original tasks in train dataset"
-
-    # Filter for original tasks in test dataset
-    test_original_tasks = [
-        (idx, file_path)
-        for idx, file_path in enumerate(test_dataset.task_files)
-        if file_path.name.endswith("original.json")
-    ]
-    assert len(test_original_tasks) > 10 and len(test_original_tasks) < 50, "Expected between 10 and 50 original tasks in test dataset"
-
     # Evaluate denoising accuracy
     eval_start_time = time.time()
 
-    # Evaluate train tasks in batch
+    # Evaluate train tasks
     model.eval()
     with torch.no_grad():
-        # Load all train tasks and concat input/output grids
-        train_tensors = []
-        train_task_ids = []
-        for task_idx, _ in train_original_tasks:
-            examples = train_dataset[task_idx]
+        # Process train tasks batch by batch
+        train_results = []
+        for examples in train_loader:
+            # Prepare batch
+            batch_tensors = []
+            batch_task_ids = []
             for example in examples:
                 # Concat input and output grids into (50,) token tensor
                 concatenated = torch.cat([example["input_grid"], example["output_grid"]], dim=0)
-                train_tensors.append(concatenated)
-                train_task_ids.append(example["task_id"])
-        
-        train_batch = torch.stack(train_tensors, dim=0).to(device)  # (num_examples, 50)
-        train_task_indices = torch.tensor([task_id_to_index[tid] for tid in train_task_ids], dtype=torch.long, device=device)
+                batch_tensors.append(concatenated)
+                batch_task_ids.append(example["task_id"])
+            
+            batch = torch.stack(batch_tensors, dim=0).to(device)  # (batch_size, 50)
+            batch_task_indices = torch.tensor([task_id_to_index[tid] for tid in batch_task_ids], dtype=torch.long, device=device)
 
-        train_result = evaluate_denoising_accuracy(
-            model=model,
-            x_clean=train_batch,
-            task_indices=train_task_indices,
-            num_iterations=eval_denoise_num_iterations,
-        )
+            # Evaluate this batch
+            batch_result = evaluate_denoising_accuracy(
+                model=model,
+                x_clean=batch,
+                task_indices=batch_task_indices,
+                num_iterations=eval_denoise_num_iterations,
+            )
+            train_results.append(batch_result)
 
-        assert train_result.accuracies is not None
-        train_accuracies = train_result.accuracies.cpu().numpy()
-
-        # Load all test tasks and concat input/output grids
-        test_tensors = []
-        test_task_ids = []
-        for task_idx, _ in test_original_tasks:
-            examples = test_dataset[task_idx]
+        # Process test tasks batch by batch
+        test_results = []
+        for examples in test_loader:
+            # Prepare batch
+            batch_tensors = []
+            batch_task_ids = []
             for example in examples:
                 # Concat input and output grids into (50,) token tensor
                 concatenated = torch.cat([example["input_grid"], example["output_grid"]], dim=0)
-                test_tensors.append(concatenated)
-                test_task_ids.append(example["task_id"])
-        
-        test_batch = torch.stack(test_tensors, dim=0).to(device)  # (num_examples, 50)
-        test_task_indices = torch.tensor([task_id_to_index[tid] for tid in test_task_ids], dtype=torch.long, device=device)
+                batch_tensors.append(concatenated)
+                batch_task_ids.append(example["task_id"])
+            
+            batch = torch.stack(batch_tensors, dim=0).to(device)  # (batch_size, 50)
+            batch_task_indices = torch.tensor([task_id_to_index[tid] for tid in batch_task_ids], dtype=torch.long, device=device)
 
-        test_result = evaluate_denoising_accuracy(
-            model=model,
-            x_clean=test_batch,
-            task_indices=test_task_indices,
-            num_iterations=eval_denoise_num_iterations,
-        )
+            # Evaluate this batch
+            batch_result = evaluate_denoising_accuracy(
+                model=model,
+                x_clean=batch,
+                task_indices=batch_task_indices,
+                num_iterations=eval_denoise_num_iterations,
+            )
+            test_results.append(batch_result)
 
-        assert test_result.accuracies is not None
-        test_accuracies = test_result.accuracies.cpu().numpy()
+    # Aggregate train results
+    train_accuracies = np.concatenate([result.accuracies.cpu().numpy() for result in train_results])
+    train_best_iterations = np.concatenate([result.best_iteration.cpu().numpy() for result in train_results])
+
+    # Aggregate test results
+    test_accuracies = np.concatenate([result.accuracies.cpu().numpy() for result in test_results])
+    test_best_iterations = np.concatenate([result.best_iteration.cpu().numpy() for result in test_results])
 
     # Compute average accuracies
     avg_train_acc = np.mean(train_accuracies) if len(train_accuracies) > 0 else 0.0
@@ -1497,14 +1489,10 @@ def evaluate_denoising(
     test_perfect_pct = (np.sum(test_accuracies == 1.0) / len(test_accuracies) * 100) if len(test_accuracies) > 0 else 0.0
 
     # Get max iteration across all samples
-    assert train_result.best_iteration is not None
-    assert test_result.best_iteration is not None
-    max_train_iter = train_result.best_iteration.max().item()
-    max_test_iter = test_result.best_iteration.max().item()
+    max_train_iter = int(np.max(train_best_iterations)) if len(train_best_iterations) > 0 else 0
+    max_test_iter = int(np.max(test_best_iterations)) if len(test_best_iterations) > 0 else 0
 
     # Compute average and std of best iteration
-    train_best_iterations = train_result.best_iteration.cpu().numpy()
-    test_best_iterations = test_result.best_iteration.cpu().numpy()
     avg_train_iter = np.mean(train_best_iterations) if len(train_best_iterations) > 0 else 0.0
     std_train_iter = np.std(train_best_iterations) if len(train_best_iterations) > 0 else 0.0
     avg_test_iter = np.mean(test_best_iterations) if len(test_best_iterations) > 0 else 0.0
@@ -1708,10 +1696,24 @@ def train(config: Config):
         train_dataset_eval = ARCTaskDataset(config.train_data_dir, vocab_size=config.vocab_size, grids="test")
         test_dataset_eval = ARCTaskDataset(config.test_data_dir, vocab_size=config.vocab_size, grids="test")
         
+        # Create dataloaders
+        train_loader_eval = DataLoader(
+            train_dataset_eval,
+            batch_size=config.batch_size,
+            shuffle=False,
+            collate_fn=arc_collate_fn,
+        )
+        test_loader_eval = DataLoader(
+            test_dataset_eval,
+            batch_size=config.batch_size,
+            shuffle=False,
+            collate_fn=arc_collate_fn,
+        )
+        
         evaluate_denoising(
             model=model,
-            train_dataset=train_dataset_eval,
-            test_dataset=test_dataset_eval,
+            train_loader=train_loader_eval,
+            test_loader=test_loader_eval,
             device=device,
             eval_denoise_num_iterations=config.eval_denoise_num_iterations,
             task_id_to_index=task_id_to_index,
@@ -1808,11 +1810,25 @@ def train(config: Config):
             # Create evaluation datasets (test grids only)
             train_dataset_eval = ARCTaskDataset(config.train_data_dir, vocab_size=config.vocab_size, grids="test")
             test_dataset_eval = ARCTaskDataset(config.test_data_dir, vocab_size=config.vocab_size, grids="test")
+            
+            # Create dataloaders
+            train_loader_eval = DataLoader(
+                train_dataset_eval,
+                batch_size=config.batch_size,
+                shuffle=False,
+                collate_fn=arc_collate_fn,
+            )
+            test_loader_eval = DataLoader(
+                test_dataset_eval,
+                batch_size=config.batch_size,
+                shuffle=False,
+                collate_fn=arc_collate_fn,
+            )
 
             evaluate_denoising(
                 model=model,
-                train_dataset=train_dataset_eval,
-                test_dataset=test_dataset_eval,
+                train_loader=train_loader_eval,
+                test_loader=test_loader_eval,
                 device=device,
                 eval_denoise_num_iterations=config.eval_denoise_num_iterations,
                 task_id_to_index=task_id_to_index,
