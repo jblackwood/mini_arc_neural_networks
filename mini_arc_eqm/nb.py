@@ -1899,7 +1899,7 @@ def main():
         num_layers=8,
         dim_feedforward=1024,
         dropout=0.1,
-        task_embedding_num_tokens=1,
+        task_embedding_num_tokens=10,
         # Data parameters
         vocab_size=11,
         # Denoising evaluation parameters
@@ -1914,7 +1914,7 @@ def main():
         task_embedding_weight_decay=0.01,
         label_smoothing=0.1,
         mode="train",
-        checkpoint_save_interval=30,
+        checkpoint_save_interval=150,
         # Google Drive location for Colab
         google_drive_dir="/content/drive/MyDrive/sparse_arc",
         # Optional: Load existing model to continue training
