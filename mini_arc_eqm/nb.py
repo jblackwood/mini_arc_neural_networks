@@ -35,7 +35,8 @@ class Config:
     num_layers: int
     dim_feedforward: int
     dropout: float
-    task_embedding_num_tokens: int
+    task_num_tokens: int
+    task_token_dim: int
 
     # Training parameters
     batch_size: int
@@ -814,7 +815,8 @@ class TransformerModel(nn.Module):
         vocab_size: int,
         dropout: float,
         num_tasks: int,
-        task_embedding_num_tokens: int,
+        task_num_tokens: int,
+        task_token_dim: int,
     ):
         """Initialize the transformer model.
 
@@ -831,13 +833,17 @@ class TransformerModel(nn.Module):
 
         # Store vocab_size for later use
         self.vocab_size = vocab_size
-        self.task_embedding_num_tokens = task_embedding_num_tokens
+        self.task_num_tokens = task_num_tokens
+        self.task_token_dim = task_token_dim
 
         # Task embedding layer
-        task_embedding_dim = d_model * task_embedding_num_tokens
+        task_embedding_dim = task_token_dim * task_num_tokens
         self.task_embedding = nn.Embedding(num_tasks, task_embedding_dim)
         # Initialize task embeddings with mean 0 and std 0.01
         nn.init.normal_(self.task_embedding.weight, mean=0.0, std=0.01)
+
+        # Linear projection from task_token_dim to d_model (no bias)
+        self.task_token_proj = nn.Linear(task_token_dim, d_model, bias=False)
 
         # Token embedding layer (vocab_size -> d_model)
         self.token_embedding = nn.Embedding(vocab_size, d_model)
@@ -845,7 +851,7 @@ class TransformerModel(nn.Module):
         nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.01)
 
         # Learnable position embeddings for task tokens and grid types
-        self.task_embedding_position = nn.Parameter(torch.randn(task_embedding_num_tokens, d_model))
+        self.task_embedding_position = nn.Parameter(torch.randn(task_num_tokens, d_model))
         self.input_grid_embedding = nn.Parameter(torch.randn(d_model))
         self.output_grid_embedding = nn.Parameter(torch.randn(d_model))
 
@@ -863,11 +869,11 @@ class TransformerModel(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
 
         # Two linear output projection layers with transpose
-        # First: (batch_size, task_embedding_num_tokens + 50, d_model) -> (batch_size, task_embedding_num_tokens + 50, 25)
-        # Transpose: (batch_size, task_embedding_num_tokens + 50, 25) -> (batch_size, 25, task_embedding_num_tokens + 50)
-        # Second: (batch_size, 25, task_embedding_num_tokens + 50) -> (batch_size, 25, vocab_size+1)
+        # First: (batch_size, task_num_tokens + 50, d_model) -> (batch_size, task_num_tokens + 50, 25)
+        # Transpose: (batch_size, task_num_tokens + 50, 25) -> (batch_size, 25, task_num_tokens + 50)
+        # Second: (batch_size, 25, task_num_tokens + 50) -> (batch_size, 25, vocab_size+1)
         self.output_proj_1 = nn.Linear(d_model, 25)
-        self.output_proj_2 = nn.Linear(task_embedding_num_tokens + 50, vocab_size + 1)  # +1 for "no change" token
+        self.output_proj_2 = nn.Linear(task_num_tokens + 50, vocab_size + 1)  # +1 for "no change" token
 
     def forward(self, x: torch.Tensor, task_indices: torch.Tensor) -> torch.Tensor:
         """Forward pass.
@@ -880,10 +886,15 @@ class TransformerModel(nn.Module):
             Tensor of shape (batch_size, 25, vocab_size+1) with logits for token change prediction
         """
         
-        # Get task embeddings directly
+        # Get task embeddings and split into tokens
         task_emb = self.task_embedding(task_indices)  # (batch_size, task_embedding_dim)
-        task_emb = task_emb.view(-1, self.task_embedding_num_tokens, task_emb.size(-1) // self.task_embedding_num_tokens)  # (batch_size, task_embedding_num_tokens, d_model)
-        task_emb = task_emb + self.task_embedding_position  # Add task position embedding
+        task_emb = task_emb.view(-1, self.task_num_tokens, self.task_token_dim)  # (batch_size, task_num_tokens, task_token_dim)
+        
+        # Project each task token to d_model using shared linear layer
+        task_emb = self.task_token_proj(task_emb)  # (batch_size, task_num_tokens, d_model)
+        
+        # Add task position embedding
+        task_emb = task_emb + self.task_embedding_position  # (batch_size, task_num_tokens, d_model)
         
         # Apply token embedding to grid tokens
         x = self.token_embedding(x)  # (batch_size, 50, d_model)
@@ -901,14 +912,14 @@ class TransformerModel(nn.Module):
         output_grid = self.rope(output_grid)  # (batch_size, 25, d_model)
         
         # Concatenate: task tokens, input grid with RoPE, output grid with RoPE
-        x = torch.cat([task_emb, input_grid, output_grid], dim=1)  # (batch_size, task_embedding_num_tokens + 50, d_model)
+        x = torch.cat([task_emb, input_grid, output_grid], dim=1)  # (batch_size, task_num_tokens + 50, d_model)
 
         # Apply transformer encoder
-        x = self.transformer_encoder(x)  # (batch_size, 51, d_model)
+        x = self.transformer_encoder(x)  # (batch_size, task_num_tokens + 50, d_model)
 
         # Apply first output projection and transpose
-        x = self.output_proj_1(x)  # (batch_size, 51, 25)
-        x = x.transpose(1, 2)  # (batch_size, 25, 51)
+        x = self.output_proj_1(x)  # (batch_size, task_num_tokens + 50, 25)
+        x = x.transpose(1, 2)  # (batch_size, 25, task_num_tokens + 50)
         
         # Second output projection
         logits = self.output_proj_2(x)  # (batch_size, 25, vocab_size+1)
@@ -1628,7 +1639,8 @@ def train(config: Config):
         vocab_size=config.vocab_size,
         dropout=config.dropout,
         num_tasks=num_tasks,
-        task_embedding_num_tokens=config.task_embedding_num_tokens,
+        task_num_tokens=config.task_num_tokens,
+        task_token_dim=config.task_token_dim,
     ).to(device)
 
     # Compile model for better performance (PyTorch 2.0+)
@@ -1899,7 +1911,8 @@ def main():
         num_layers=8,
         dim_feedforward=1024,
         dropout=0.1,
-        task_embedding_num_tokens=10,
+        task_num_tokens=10,
+        task_token_dim=4,
         # Data parameters
         vocab_size=11,
         # Denoising evaluation parameters
