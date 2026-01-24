@@ -42,7 +42,6 @@ class Config:
     batch_size: int
     num_epochs: int
     learning_rate: float
-    label_smoothing: float
     lambd: float  # Weight for loss_sig_reg in loss calculation
     mode: Literal["train", "learning_rate_test"]
     checkpoint_save_interval: int
@@ -1511,10 +1510,10 @@ def main():
         random_seed=42,
         max_augmentations=500,
         # Model parameters
-        d_model=256,
-        nhead=8,
-        num_layers=8,
-        dim_feedforward=1024,
+        d_model=32,
+        nhead=4,
+        num_layers=4,
+        dim_feedforward=128,
         dropout=0.1,
         embedding_dim=512,
         # Data parameters
@@ -1523,11 +1522,10 @@ def main():
         num_epochs=150,
         batch_size=32,
         learning_rate=1e-4,
-        label_smoothing=0.1,
-        lambd=0.5,
+        lambd=0.05,
         mode="train",
         checkpoint_save_interval=50,
-        eval_interval=10,
+        eval_interval=1,
         eval_optimization_steps=50,
         eval_learning_rate=1e-2,
         # Google Drive location for Colab
