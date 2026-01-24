@@ -48,6 +48,7 @@ class Config:
     eval_interval: int  # Number of epochs between eval steps
     eval_optimization_steps: int  # Number of optimization steps per test example
     eval_learning_rate: float  # Learning rate for eval optimization
+    max_eval_batches: int  # Maximum number of batches to evaluate (to speed up eval)
 
     # Data parameters
     vocab_size: int
@@ -826,8 +827,6 @@ class TransformerModel(nn.Module):
 
         # Token embedding layer (vocab_size -> d_model)
         self.token_embedding = nn.Embedding(vocab_size, d_model)
-        # Initialize token embeddings with mean 0 and std 0.01
-        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.01)
 
         # Learnable position embeddings for grid types
         self.input_grid_embedding = nn.Parameter(torch.randn(d_model))
@@ -1020,6 +1019,7 @@ def eval_step(
     eval_learning_rate: float,
     epoch: int,
     writer: SummaryWriter,
+    max_eval_batches: int,
 ) -> Tuple[float, float]:
     """Evaluate model by optimizing output grids to match task centers.
     
@@ -1031,6 +1031,7 @@ def eval_step(
         eval_learning_rate: Learning rate for optimization
         epoch: Current epoch number
         writer: Tensorboard writer
+        max_eval_batches: Maximum number of batches to process
     
     Returns:
         Tuple of (average_accuracy, perfect_task_rate)
@@ -1041,9 +1042,13 @@ def eval_step(
     total_tokens = 0
     perfect_tasks = 0
     total_tasks = 0
+    batch_count = 0
     
     # Process one batch at a time
     for batch_examples in test_loader:
+        if batch_count >= max_eval_batches:
+            break
+        batch_count += 1
         # Group examples in this batch by task_id
         task_groups = defaultdict(list)
         for example in batch_examples:
@@ -1095,7 +1100,7 @@ def eval_step(
         # Initialize optimizable output grid parameters for all tasks
         # Shape: (num_tasks, 25, d_model)
         output_grid_params = nn.Parameter(
-            torch.randn(num_tasks, 25, model.token_embedding.embedding_dim, device=device) * 0.01
+            torch.randn(num_tasks, 25, model.token_embedding.embedding_dim, device=device)
         )
         
         # Create optimizer for all output grid parameters
@@ -1330,7 +1335,7 @@ def train(config: Config):
     test_loader = DataLoader(
         test_dataset,
         batch_size=config.batch_size,
-        shuffle=False,
+        shuffle=True,
         collate_fn=arc_collate_fn,
     )
 
@@ -1478,6 +1483,7 @@ def train(config: Config):
                 config.eval_learning_rate,
                 epoch,
                 writer,
+                config.max_eval_batches,
             )
             eval_time = time.time() - eval_start_time
             print(f"  Eval Time: {eval_time:.2f}s")
@@ -1556,12 +1562,13 @@ def main():
         num_epochs=150,
         batch_size=128,
         learning_rate=1e-4,
-        lambd=0.00001,
+        lambd=0.5,
         mode="train",
         checkpoint_save_interval=50,
         eval_interval=1,
         eval_optimization_steps=100,
         eval_learning_rate=1e-2,
+        max_eval_batches=2,
         # Google Drive location for Colab
         google_drive_dir="/content/drive/MyDrive/sparse_arc",
         # Optional: Load existing model to continue training
