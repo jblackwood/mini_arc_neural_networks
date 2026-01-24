@@ -1151,7 +1151,7 @@ def eval_step(
     perfect_task_rate = perfect_tasks / total_tasks if total_tasks > 0 else 0.0
     
     # Log to console
-    print(f"  Eval: Avg Accuracy: {avg_accuracy:.4f} ({total_correct_tokens}/{total_tokens}), Perfect Tasks: {perfect_task_rate:.4f} ({perfect_tasks}/{total_tasks})")
+    print(f"  Eval: Avg Accuracy: {avg_accuracy*100:.2f}% ({total_correct_tokens}/{total_tokens}), Perfect Tasks: {perfect_task_rate*100:.2f}% ({perfect_tasks}/{total_tasks})")
     
     # Log to tensorboard
     writer.add_scalar("Eval/avg_accuracy", avg_accuracy, epoch)
@@ -1389,18 +1389,6 @@ def train(config: Config):
         # Test
         test_loss = test_epoch(model, test_loader, device, config.lambd)
 
-        # Run eval step every eval_interval epochs
-        if (epoch + 1) % config.eval_interval == 0:
-            eval_step(
-                model,
-                test_loader,
-                device,
-                config.eval_optimization_steps,
-                config.eval_learning_rate,
-                epoch,
-                writer,
-            )
-
         # Calculate epoch time
         epoch_time = time.time() - epoch_start_time
 
@@ -1461,6 +1449,18 @@ def train(config: Config):
         writer.add_scalar("LayerMeanSquare/token_embedding", token_emb_mean_sq, epoch)
         writer.add_scalar("LayerMeanSquare/output_proj", output_proj_mean_sq, epoch)
         writer.add_scalar("LayerMeanSquare/transformer_avg", transformer_mean_sq, epoch)
+
+        # Run eval step every eval_interval epochs
+        if (epoch + 1) % config.eval_interval == 0:
+            eval_step(
+                model,
+                test_loader,
+                device,
+                config.eval_optimization_steps,
+                config.eval_learning_rate,
+                epoch,
+                writer,
+            )
 
         # Save checkpoint every N epochs (configurable)
         if (epoch + 1) % config.checkpoint_save_interval == 0:
