@@ -824,15 +824,23 @@ class TransformerModel(nn.Module):
         # Store vocab_size for later use
         self.vocab_size = vocab_size
         self.embedding_dim = embedding_dim
+        self.d_model = d_model
 
         # Token embedding layer (vocab_size -> d_model)
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         # Initialize token embeddings with small std to keep activation scale stable
         nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.01)
 
+        # Padding embedding for masked positions (token value -1)
+        self.padding_embedding = nn.Parameter(torch.zeros(d_model))
+
         # Learnable position embeddings for grid types
         self.input_grid_embedding = nn.Parameter(torch.randn(d_model))
         self.output_grid_embedding = nn.Parameter(torch.randn(d_model))
+
+        # Learnable example embeddings (4 examples per task)
+        # Example 0: tokens 0-49, Example 1: tokens 50-99, etc.
+        self.example_embeddings = nn.Parameter(torch.randn(4, d_model) * 0.01)
 
         # 2D Rotary Position Embeddings
         self.rope = RoPE2D(d_model=d_model, max_grid_size=5)
@@ -850,56 +858,101 @@ class TransformerModel(nn.Module):
         # Output projection to embedding_dim
         self.output_proj = nn.Linear(d_model, embedding_dim)
 
-    def _forward_from_grid_embeddings(self, grid_embeddings: torch.Tensor) -> torch.Tensor:
+    def _forward_from_grid_embeddings(
+        self,
+        grid_embeddings: torch.Tensor,
+        src_key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Process grid embeddings through the model architecture.
         
         Args:
-            grid_embeddings: Tensor of shape (batch_size, 50, d_model) containing
-                            concatenated input and output grid embeddings
+            grid_embeddings: Tensor of shape (batch_size, 200, d_model) containing
+                            embeddings for up to 4 examples (each 50 tokens)
+            src_key_padding_mask: Optional tensor of shape (batch_size, 200) where
+                                  True indicates padding positions to ignore
         
         Returns:
             Tensor of shape (batch_size, embedding_dim) with final embeddings
         """
-        # Split into input and output grids
-        input_grid = grid_embeddings[:, :25, :]  # (batch_size, 25, d_model)
-        output_grid = grid_embeddings[:, 25:, :]  # (batch_size, 25, d_model)
+        batch_size = grid_embeddings.shape[0]
+        seq_len = grid_embeddings.shape[1]  # Should be 200
+        num_examples = seq_len // 50  # 4 for full sequence
         
-        # Add grid type embeddings
-        input_grid = input_grid + self.input_grid_embedding  # (batch_size, 25, d_model)
-        output_grid = output_grid + self.output_grid_embedding  # (batch_size, 25, d_model)
+        # Process each example's grids
+        processed_grids = []
+        for ex_idx in range(num_examples):
+            start_idx = ex_idx * 50
+            # Split into input and output grids for this example
+            input_grid = grid_embeddings[:, start_idx:start_idx + 25, :]  # (batch_size, 25, d_model)
+            output_grid = grid_embeddings[:, start_idx + 25:start_idx + 50, :]  # (batch_size, 25, d_model)
+            
+            # Add grid type embeddings
+            input_grid = input_grid + self.input_grid_embedding
+            output_grid = output_grid + self.output_grid_embedding
+            
+            # Add example embeddings
+            input_grid = input_grid + self.example_embeddings[ex_idx]
+            output_grid = output_grid + self.example_embeddings[ex_idx]
+            
+            # Apply 2D rotary position embeddings separately to each grid
+            input_grid = self.rope(input_grid)
+            output_grid = self.rope(output_grid)
+            
+            # Concatenate input and output for this example
+            example_grid = torch.cat([input_grid, output_grid], dim=1)  # (batch_size, 50, d_model)
+            processed_grids.append(example_grid)
         
-        # Apply 2D rotary position embeddings separately to each grid
-        input_grid = self.rope(input_grid)  # (batch_size, 25, d_model)
-        output_grid = self.rope(output_grid)  # (batch_size, 25, d_model)
-        
-        # Concatenate: input grid with RoPE, output grid with RoPE
-        x = torch.cat([input_grid, output_grid], dim=1)  # (batch_size, 50, d_model)
+        # Concatenate all examples
+        x = torch.cat(processed_grids, dim=1)  # (batch_size, 200, d_model)
 
-        # Apply transformer encoder
-        x = self.transformer_encoder(x)  # (batch_size, 50, d_model)
+        # Apply transformer encoder with optional padding mask
+        x = self.transformer_encoder(x, src_key_padding_mask=src_key_padding_mask)  # (batch_size, 200, d_model)
 
-        # Global average pooling over sequence dimension
-        x = x.mean(dim=1)  # (batch_size, d_model)
+        # Global average pooling over non-padded positions
+        if src_key_padding_mask is not None:
+            # Mask out padded positions before averaging
+            # src_key_padding_mask: True = padding, so invert for valid positions
+            valid_mask = ~src_key_padding_mask  # (batch_size, 200)
+            valid_mask = valid_mask.unsqueeze(-1).float()  # (batch_size, 200, 1)
+            x = (x * valid_mask).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1)  # (batch_size, d_model)
+        else:
+            x = x.mean(dim=1)  # (batch_size, d_model)
         
         # Project to embedding_dim
         x = self.output_proj(x)  # (batch_size, embedding_dim)
         
         return x
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        src_key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Forward pass.
 
         Args:
-            x: Input tensor of shape (batch_size, 50) - tokens for input and output grids
+            x: Input tensor of shape (batch_size, 200) - tokens for up to 4 examples
+               Padding positions should have value -1
+            src_key_padding_mask: Optional tensor of shape (batch_size, 200) where
+                                  True indicates padding positions to ignore
 
         Returns:
             Tensor of shape (batch_size, embedding_dim) with embeddings
         """
+        # Handle padding tokens (-1) by replacing with 0 for embedding lookup
+        # The actual embeddings at padding positions will be replaced with padding_embedding
+        padding_mask = (x == -1)
+        x_safe = x.clone()
+        x_safe[padding_mask] = 0  # Replace -1 with 0 for valid embedding lookup
+        
         # Apply token embedding to grid tokens
-        grid_embeddings = self.token_embedding(x)  # (batch_size, 50, d_model)
+        grid_embeddings = self.token_embedding(x_safe)  # (batch_size, 200, d_model)
+        
+        # Replace padding positions with padding embedding
+        grid_embeddings[padding_mask] = self.padding_embedding
         
         # Process through the rest of the model
-        return self._forward_from_grid_embeddings(grid_embeddings)
+        return self._forward_from_grid_embeddings(grid_embeddings, src_key_padding_mask)
 
 
 def sig_reg(x: torch.Tensor, num_slices: int = 256) -> torch.Tensor:
@@ -949,7 +1002,10 @@ def compute_loss_for_batch(
     device: torch.device,
     lambd: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute LeJEPA loss for a single batch.
+    """Compute LeJEPA loss for a single batch with global and local views.
+
+    Creates 2 global views (all 4 examples with different orderings) and
+    8 local views (4 single-example, 2 two-example, 2 three-example views).
 
     Args:
         model: The transformer model
@@ -961,56 +1017,136 @@ def compute_loss_for_batch(
         Tuple of (total_loss, sim_loss, sig_reg_loss) tensors (all scalars)
     """
     # Group examples by task_id
-    task_groups = defaultdict(list)
+    task_groups: Dict[str, List[torch.Tensor]] = defaultdict(list)
     for example in examples:
         task_id = example["task_id"]
         # Concatenate input and output grids
         concatenated = torch.cat([example["input_grid"], example["output_grid"]], dim=0)  # (50,)
         task_groups[task_id].append(concatenated)
     
-    # Ensure all tasks have exactly 4 views (duplicate last example if needed)
-    num_views = 4
-    all_views = []
-    for task_id in sorted(task_groups.keys()):  # Sort for determinism
+    # Ensure all tasks have exactly 4 examples (duplicate last example if needed)
+    num_examples = 4
+    for task_id in task_groups:
         task_examples = task_groups[task_id]
-        while len(task_examples) < num_views:
-            # Duplicate the last example to pad to 4 views
+        while len(task_examples) < num_examples:
             task_examples.append(task_examples[-1])
-        # Only take first 4 if there are more
-        task_examples = task_examples[:num_views]
-        all_views.extend(task_examples)
-    
-    # Stack all views into single batch
-    batch = torch.stack(all_views, dim=0).to(device)  # (num_tasks * num_views, 50)
-    
-    # Forward pass - model returns embeddings
-    embeddings = model(batch)  # (num_tasks * num_views, embedding_dim)
+        task_groups[task_id] = task_examples[:num_examples]
     
     bs = len(task_groups)  # number of tasks
-    K = embeddings.size(1)  # embedding_dim
+    sorted_task_ids = sorted(task_groups.keys())  # Sort for determinism
     
-    # Reshape to (num_views, bs, K)
-    embeddings_reshaped = embeddings.view(num_views, bs, K)
+    # Create global views (2 views, each with all 4 examples in different order)
+    global_views: List[torch.Tensor] = []  # Each: (bs, 200)
+    global_masks: List[torch.Tensor] = []  # Each: (bs, 200) - all False (no padding)
     
-    # Centers: Mean representation across all views per task
-    centers = embeddings_reshaped.mean(0)  # (bs, K)
+    for _ in range(2):
+        global_batch = []
+        for task_id in sorted_task_ids:
+            task_examples = task_groups[task_id][:]
+            # Randomly shuffle the order of examples for each global view
+            random.shuffle(task_examples)
+            # Concatenate all 4 examples: (200,)
+            global_seq = torch.cat(task_examples, dim=0)
+            global_batch.append(global_seq)
+        global_views.append(torch.stack(global_batch, dim=0))  # (bs, 200)
+        global_masks.append(torch.zeros(bs, 200, dtype=torch.bool))  # No padding
     
-    # Similarity term: MSE between centers and all view embeddings
-    sim = (centers.unsqueeze(0) - embeddings_reshaped).square().mean()
+    # Create local views with padding to 200 tokens
+    local_views: List[torch.Tensor] = []  # Each: (bs, 200)
+    local_masks: List[torch.Tensor] = []  # Each: (bs, 200) - True for padding positions
+    
+    # 4 views with 1 example each (50 tokens, padded to 200)
+    for ex_idx in range(4):
+        local_batch = []
+        for task_id in sorted_task_ids:
+            example = task_groups[task_id][ex_idx]  # (50,)
+            # Pad to 200 tokens with -1 (invalid token, will be masked)
+            padded = torch.full((200,), -1, dtype=example.dtype)
+            padded[:50] = example
+            local_batch.append(padded)
+        local_views.append(torch.stack(local_batch, dim=0))  # (bs, 200)
+        # Mask: True for padding positions (50-199)
+        mask = torch.zeros(bs, 200, dtype=torch.bool)
+        mask[:, 50:] = True
+        local_masks.append(mask)
+    
+    # 2 views with 2 examples each (100 tokens, padded to 200)
+    for view_idx in range(2):
+        local_batch = []
+        for task_id in sorted_task_ids:
+            task_examples = task_groups[task_id][:]
+            random.shuffle(task_examples)
+            # Take first 2 examples
+            seq = torch.cat(task_examples[:2], dim=0)  # (100,)
+            # Pad to 200 tokens with -1 (invalid token, will be masked)
+            padded = torch.full((200,), -1, dtype=seq.dtype)
+            padded[:100] = seq
+            local_batch.append(padded)
+        local_views.append(torch.stack(local_batch, dim=0))  # (bs, 200)
+        # Mask: True for padding positions (100-199)
+        mask = torch.zeros(bs, 200, dtype=torch.bool)
+        mask[:, 100:] = True
+        local_masks.append(mask)
+    
+    # 2 views with 3 examples each (150 tokens, padded to 200)
+    for view_idx in range(2):
+        local_batch = []
+        for task_id in sorted_task_ids:
+            task_examples = task_groups[task_id][:]
+            random.shuffle(task_examples)
+            # Take first 3 examples
+            seq = torch.cat(task_examples[:3], dim=0)  # (150,)
+            # Pad to 200 tokens with -1 (invalid token, will be masked)
+            padded = torch.full((200,), -1, dtype=seq.dtype)
+            padded[:150] = seq
+            local_batch.append(padded)
+        local_views.append(torch.stack(local_batch, dim=0))  # (bs, 200)
+        # Mask: True for padding positions (150-199)
+        mask = torch.zeros(bs, 200, dtype=torch.bool)
+        mask[:, 150:] = True
+        local_masks.append(mask)
+    
+    # Combine all views
+    all_views = global_views + local_views  # 10 views total
+    all_masks = global_masks + local_masks
+    
+    num_global_views = 2
+    num_all_views = len(all_views)  # 10
+    
+    # Stack all views into single batch for forward pass
+    all_batch = torch.cat(all_views, dim=0).to(device)  # (num_all_views * bs, 200)
+    all_mask_batch = torch.cat(all_masks, dim=0).to(device)  # (num_all_views * bs, 200)
+    
+    # Forward pass for all views
+    all_embeddings = model(all_batch, src_key_padding_mask=all_mask_batch)  # (num_all_views * bs, embedding_dim)
+    
+    K = all_embeddings.size(1)  # embedding_dim
+    
+    # Reshape to (num_all_views, bs, K)
+    all_emb_reshaped = all_embeddings.view(num_all_views, bs, K)
+    
+    # Extract global view embeddings for computing centers
+    global_emb = all_emb_reshaped[:num_global_views]  # (2, bs, K)
+    
+    # Centers: Mean representation of global views per task
+    centers = global_emb.mean(0)  # (bs, K)
+    
+    # Similarity term: MSE between centers and ALL view embeddings (global + local)
+    sim = (centers.unsqueeze(0) - all_emb_reshaped).square().mean()
     
     # Regularization term: SIG-Reg applied to each view independently
     sig_reg_vals = []
-    for view_idx in range(num_views):
-        view_emb = embeddings_reshaped[view_idx]  # (bs, K)
+    for view_idx in range(num_all_views):
+        view_emb = all_emb_reshaped[view_idx]  # (bs, K)
         sig_reg_val = sig_reg(view_emb)  # (num_slices,)
         sig_reg_vals.append(sig_reg_val.mean())
     
-    sig_reg_val = torch.stack(sig_reg_vals).mean()
+    sig_reg_loss = torch.stack(sig_reg_vals).mean()
     
     # Final weighted loss
-    loss = (1 - lambd) * sim + lambd * sig_reg_val
+    loss = (1 - lambd) * sim + lambd * sig_reg_loss
     
-    return loss, sim, sig_reg_val
+    return loss, sim, sig_reg_loss
 
 
 def eval_step(
@@ -1077,32 +1213,51 @@ def eval_step(
         
         num_tasks = len(valid_tasks)
         
-        # Stack all train examples from all tasks
-        # Shape: (num_tasks * 3, 50)
-        all_train_grids = []
+        # Build global view with all 3 train examples + test input (with placeholder output)
+        # We'll use this to compute the center embedding from train examples
+        # Shape: (num_tasks, 200) - 3 train examples (150 tokens) + 1 test example (50 tokens)
+        train_batch = []
         for task in valid_tasks:
+            train_grids = []
             for ex in task["train"]:
-                concatenated = torch.cat([ex["input_grid"], ex["output_grid"]], dim=0)
-                all_train_grids.append(concatenated)
+                concatenated = torch.cat([ex["input_grid"], ex["output_grid"]], dim=0)  # (50,)
+                train_grids.append(concatenated)
+            # Concatenate all 3 train examples: (150,)
+            train_seq = torch.cat(train_grids, dim=0)
+            # Pad with -1 to 200 tokens (invalid token, will be masked)
+            padded = torch.full((200,), -1, dtype=train_seq.dtype)
+            padded[:150] = train_seq
+            train_batch.append(padded)
         
-        train_batch = torch.stack(all_train_grids, dim=0).to(device)  # (num_tasks * 3, 50)
+        train_batch_tensor = torch.stack(train_batch, dim=0).to(device)  # (num_tasks, 200)
+        # Mask: True for padding positions (150-199)
+        train_mask = torch.zeros(num_tasks, 200, dtype=torch.bool, device=device)
+        train_mask[:, 150:] = True
         
-        # Compute embeddings for all train examples
+        # Compute center embeddings from train examples only
         with torch.no_grad():
-            train_embeddings = model(train_batch)  # (num_tasks * 3, embedding_dim)
-            
-            # Reshape to (num_tasks, 3, embedding_dim) and compute centers
-            train_embeddings = train_embeddings.view(num_tasks, 3, -1)  # (num_tasks, 3, embedding_dim)
-            centers = train_embeddings.mean(dim=1)  # (num_tasks, embedding_dim)
+            centers = model(train_batch_tensor, src_key_padding_mask=train_mask)  # (num_tasks, embedding_dim)
         
         # Stack all test input grids and true output grids
         test_input_grids = torch.stack([task["test"]["input_grid"] for task in valid_tasks], dim=0).to(device)  # (num_tasks, 25)
         true_output_grids = torch.stack([task["test"]["output_grid"] for task in valid_tasks], dim=0).to(device)  # (num_tasks, 25)
         
+        # Build the full sequence with train examples + test input + optimizable test output
+        # Get train example embeddings (frozen)
+        train_example_embeddings = []
+        for task in valid_tasks:
+            task_train_emb = []
+            for ex in task["train"]:
+                concatenated = torch.cat([ex["input_grid"], ex["output_grid"]], dim=0)  # (50,)
+                task_train_emb.append(concatenated)
+            train_example_embeddings.append(torch.cat(task_train_emb, dim=0))  # (150,)
+        
+        train_tokens = torch.stack(train_example_embeddings, dim=0).to(device)  # (num_tasks, 150)
+        
         # Initialize optimizable output grid parameters for all tasks
         # Shape: (num_tasks, 25, d_model)
         output_grid_params = nn.Parameter(
-            torch.randn(num_tasks, 25, model.token_embedding.embedding_dim, device=device) * 0.01
+            torch.randn(num_tasks, 25, model.d_model, device=device) * 0.01
         )
         
         # Create optimizer for all output grid parameters
@@ -1112,14 +1267,17 @@ def eval_step(
         for step in range(eval_optimization_steps):
             optimizer.zero_grad()
             
-            # Build embedding sequences for all tasks
-            # Input grids: use token embeddings (frozen)
-            input_embeddings = model.token_embedding(test_input_grids)  # (num_tasks, 25, d_model)
+            # Build full 200-token embedding sequences for all tasks
+            # Train examples: use token embeddings (frozen)
+            train_emb = model.token_embedding(train_tokens)  # (num_tasks, 150, d_model)
             
-            # Concatenate input embeddings with optimizable output parameters
-            grid_embeddings = torch.cat([input_embeddings, output_grid_params], dim=1)  # (num_tasks, 50, d_model)
+            # Test input: use token embeddings (frozen)
+            test_input_emb = model.token_embedding(test_input_grids)  # (num_tasks, 25, d_model)
             
-            # Process through the model (frozen)
+            # Concatenate: train examples + test input + optimizable test output
+            grid_embeddings = torch.cat([train_emb, test_input_emb, output_grid_params], dim=1)  # (num_tasks, 200, d_model)
+            
+            # Process through the model (frozen) - no padding mask needed
             embeddings = model._forward_from_grid_embeddings(grid_embeddings)  # (num_tasks, embedding_dim)
             
             # Compute loss for all tasks
