@@ -1452,6 +1452,7 @@ def train(config: Config):
 
         # Run eval step every eval_interval epochs
         if (epoch + 1) % config.eval_interval == 0:
+            eval_start_time = time.time()
             eval_step(
                 model,
                 test_loader,
@@ -1461,6 +1462,8 @@ def train(config: Config):
                 epoch,
                 writer,
             )
+            eval_time = time.time() - eval_start_time
+            print(f"  Eval Time: {eval_time:.2f}s")
 
         # Save checkpoint every N epochs (configurable)
         if (epoch + 1) % config.checkpoint_save_interval == 0:
