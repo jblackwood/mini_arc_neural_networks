@@ -827,6 +827,8 @@ class TransformerModel(nn.Module):
 
         # Token embedding layer (vocab_size -> d_model)
         self.token_embedding = nn.Embedding(vocab_size, d_model)
+        # Initialize token embeddings with small std to keep activation scale stable
+        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.01)
 
         # Learnable position embeddings for grid types
         self.input_grid_embedding = nn.Parameter(torch.randn(d_model))
@@ -1100,7 +1102,7 @@ def eval_step(
         # Initialize optimizable output grid parameters for all tasks
         # Shape: (num_tasks, 25, d_model)
         output_grid_params = nn.Parameter(
-            torch.randn(num_tasks, 25, model.token_embedding.embedding_dim, device=device)
+            torch.randn(num_tasks, 25, model.token_embedding.embedding_dim, device=device) * 0.01
         )
         
         # Create optimizer for all output grid parameters
@@ -1555,14 +1557,14 @@ def main():
         num_layers=8,
         dim_feedforward=1024,
         dropout=0.1,
-        embedding_dim=1024,
+        embedding_dim=512,
         # Data parameters
         vocab_size=10,
         # Training parameters
         num_epochs=150,
         batch_size=128,
-        learning_rate=1e-4,
-        lambd=0.005,
+        learning_rate=2.5e-5,
+        lambd=0.5,
         mode="train",
         checkpoint_save_interval=50,
         eval_interval=1,
