@@ -524,13 +524,27 @@ def create_dataset(
 
     # Get all JSON files
     json_files = sorted(data_dir.glob("*.json"))
-    print(f"Found {len(json_files)} task files")
+    print(f"Found {len(json_files)} total task files")
+
+    # Filter to only tasks with 3 train and 1 test example
+    filtered_files = []
+    for json_file in json_files:
+        try:
+            task = parse_arc_json(json_file)
+            if len(task.train) == 3 and len(task.test) == 1:
+                filtered_files.append(json_file)
+        except Exception as e:
+            print(f"Error reading {json_file.name}: {e}")
+            continue
+    
+    print(f"Filtered to {len(filtered_files)} tasks with 3 train and 1 test examples")
+    assert len(filtered_files) == 82, f"Expected 82 tasks with 3 train and 1 test, but found {len(filtered_files)}"
 
     # Shuffle and split into train and test
-    random.shuffle(json_files)
-    num_test = int(len(json_files) * test_ratio)
-    test_files = json_files[:num_test]
-    train_files = json_files[num_test:]
+    random.shuffle(filtered_files)
+    num_test = int(len(filtered_files) * test_ratio)
+    test_files = filtered_files[:num_test]
+    train_files = filtered_files[num_test:]
 
     print(f"Train tasks: {len(train_files)}")
     print(f"Test tasks: {len(test_files)}")
