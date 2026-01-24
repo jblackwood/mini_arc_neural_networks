@@ -1131,17 +1131,20 @@ def eval_step(
         
         # After optimization, convert output_grid_params to tokens for all tasks
         with torch.no_grad():
-            # For each position, find nearest token embedding
+            # For each position, find nearest token embedding using cosine similarity
             token_embeddings = model.token_embedding.weight  # (vocab_size, d_model)
-            
-            # Vectorized nearest neighbor search
-            # output_grid_params: (num_tasks, 25, d_model)
-            # token_embeddings: (vocab_size, d_model)
-            # Compute distances: (num_tasks, 25, vocab_size)
-            distances = torch.cdist(output_grid_params, token_embeddings.unsqueeze(0).expand(num_tasks, -1, -1))
-            
-            # Find nearest token for each position
-            optimized_output_grids = distances.argmin(dim=2)  # (num_tasks, 25)
+
+            # Normalize vectors to compute cosine similarity safely
+            eps = 1e-8
+            out = output_grid_params  # (num_tasks, 25, d_model)
+            out_norm = out / out.norm(dim=2, keepdim=True).clamp(min=eps)
+            token_norm = token_embeddings / token_embeddings.norm(dim=1, keepdim=True).clamp(min=eps)  # (vocab_size, d_model)
+
+            # Compute cosine similarity: (num_tasks, 25, vocab_size)
+            similarity = torch.einsum('tpd,vd->tpv', out_norm, token_norm)
+
+            # Select token with highest cosine similarity for each position
+            optimized_output_grids = similarity.argmax(dim=2)  # (num_tasks, 25)
             
             # Calculate accuracy for all tasks
             correct_per_task = (optimized_output_grids == true_output_grids).sum(dim=1)  # (num_tasks,)
