@@ -1562,7 +1562,7 @@ def main():
         num_epochs=150,
         batch_size=128,
         learning_rate=1e-4,
-        lambd=0.5,
+        lambd=0.05,
         mode="train",
         checkpoint_save_interval=50,
         eval_interval=1,
