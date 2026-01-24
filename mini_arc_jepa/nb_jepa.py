@@ -1515,7 +1515,7 @@ def train(config: Config):
 
     # Compile model for better performance (PyTorch 2.0+)
     print("Compiling model with torch.compile...")
-    model = cast(TransformerModel, torch.compile(model))
+    # model = cast(TransformerModel, torch.compile(model))
 
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1723,7 +1723,7 @@ def main():
         vocab_size=10,
         # Training parameters
         num_epochs=150,
-        batch_size=128,
+        batch_size=64,
         learning_rate=2.5e-5,
         lambd=0.5,
         mode="train",
