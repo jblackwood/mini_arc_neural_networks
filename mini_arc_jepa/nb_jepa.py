@@ -947,7 +947,7 @@ def compute_loss_for_batch(
     examples: List[ARCTaskExample],
     device: torch.device,
     lambd: float,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute LeJEPA loss for a single batch.
 
     Args:
@@ -957,7 +957,7 @@ def compute_loss_for_batch(
         lambd: Weight for sig_reg loss
 
     Returns:
-        Loss tensor (scalar)
+        Tuple of (total_loss, sim_loss, sig_reg_loss) tensors (all scalars)
     """
     # Group examples by task_id
     task_groups = defaultdict(list)
@@ -1009,7 +1009,7 @@ def compute_loss_for_batch(
     # Final weighted loss
     loss = (1 - lambd) * sim + lambd * sig_reg_val
     
-    return loss
+    return loss, sim, sig_reg_val
 
 
 def eval_step(
@@ -1166,7 +1166,7 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     lambd: float,
-) -> float:
+) -> Tuple[float, float, float]:
     """Train for one epoch.
 
     Args:
@@ -1177,15 +1177,17 @@ def train_epoch(
         lambd: Weight for sig_reg loss
 
     Returns:
-        Average training loss
+        Tuple of (average_total_loss, average_sim_loss, average_sig_reg_loss)
     """
     model.train()
     total_loss = 0.0
+    total_sim = 0.0
+    total_sig_reg = 0.0
     num_batches = 0
 
     for batch_idx, examples in enumerate(train_loader):
         # Compute loss with raw examples
-        loss = compute_loss_for_batch(model, examples, device, lambd)
+        loss, sim, sig_reg_val = compute_loss_for_batch(model, examples, device, lambd)
 
         # Backward pass
         optimizer.zero_grad()
@@ -1194,9 +1196,11 @@ def train_epoch(
         optimizer.step()
 
         total_loss += loss.item()
+        total_sim += sim.item()
+        total_sig_reg += sig_reg_val.item()
         num_batches += 1
 
-    return total_loss / num_batches
+    return total_loss / num_batches, total_sim / num_batches, total_sig_reg / num_batches
 
 
 def test_epoch(
@@ -1204,7 +1208,7 @@ def test_epoch(
     test_loader: DataLoader,
     device: torch.device,
     lambd: float,
-) -> float:
+) -> Tuple[float, float, float]:
     """Evaluate on test set.
 
     Args:
@@ -1214,21 +1218,25 @@ def test_epoch(
         lambd: Weight for sig_reg loss
 
     Returns:
-        Average test loss
+        Tuple of (average_total_loss, average_sim_loss, average_sig_reg_loss)
     """
     model.eval()
     total_loss = 0.0
+    total_sim = 0.0
+    total_sig_reg = 0.0
     num_batches = 0
 
     with torch.no_grad():
         for batch_idx, examples in enumerate(test_loader):
             # Compute loss with raw examples
-            loss = compute_loss_for_batch(model, examples, device, lambd)
+            loss, sim, sig_reg_val = compute_loss_for_batch(model, examples, device, lambd)
 
             total_loss += loss.item()
+            total_sim += sim.item()
+            total_sig_reg += sig_reg_val.item()
             num_batches += 1
 
-    return total_loss / num_batches
+    return total_loss / num_batches, total_sim / num_batches, total_sig_reg / num_batches
 
 
 def learning_rate_test(
@@ -1261,7 +1269,7 @@ def learning_rate_test(
         )
 
         # Compute loss with raw examples
-        loss = compute_loss_for_batch(model, examples, device, lambd)
+        loss, sim, sig_reg_val = compute_loss_for_batch(model, examples, device, lambd)
 
         # Backward pass
         opt.zero_grad()
@@ -1270,7 +1278,7 @@ def learning_rate_test(
         opt.step()
 
         # Print learning rate and loss
-        print(f"Batch {batch_count + 1}: LR = {lr:.2e}, Loss = {loss.item():.6f}")
+        print(f"Batch {batch_count + 1}: LR = {lr:.2e}, Loss = {loss.item():.6f}, Sim = {sim.item():.6f}, SigReg = {sig_reg_val.item():.6f}")
 
         # Double learning rate for next batch
         lr *= 2
@@ -1384,10 +1392,10 @@ def train(config: Config):
         epoch_start_time = time.time()
 
         # Train
-        train_loss = train_epoch(model, train_loader, optimizer, device, config.lambd)
+        train_loss, train_sim, train_sig_reg = train_epoch(model, train_loader, optimizer, device, config.lambd)
 
         # Test
-        test_loss = test_epoch(model, test_loader, device, config.lambd)
+        test_loss, test_sim, test_sig_reg = test_epoch(model, test_loader, device, config.lambd)
 
         # Calculate epoch time
         epoch_time = time.time() - epoch_start_time
@@ -1432,6 +1440,11 @@ def train(config: Config):
             f"Output Scale: {output_proj_scale:.4f}"
         )
         print(
+            f"  Loss Components - "
+            f"Train Sim: {train_sim:.6f}, Train SigReg: {train_sig_reg:.6f}, "
+            f"Test Sim: {test_sim:.6f}, Test SigReg: {test_sig_reg:.6f}"
+        )
+        print(
             f"  Layer Mean Squares - "
             f"Token Emb: {token_emb_mean_sq:.6f}, "
             f"Out Proj: {output_proj_mean_sq:.6f}, "
@@ -1441,6 +1454,10 @@ def train(config: Config):
         # Log to tensorboard
         writer.add_scalar("Loss/train", train_loss, epoch)
         writer.add_scalar("Loss/test", test_loss, epoch)
+        writer.add_scalar("Loss/train_sim", train_sim, epoch)
+        writer.add_scalar("Loss/train_sig_reg", train_sig_reg, epoch)
+        writer.add_scalar("Loss/test_sim", test_sim, epoch)
+        writer.add_scalar("Loss/test_sig_reg", test_sig_reg, epoch)
         writer.add_scalar("Time/epoch", epoch_time, epoch)
         writer.add_scalar("Model/weight_norm", model_weight_norm, epoch)
         writer.add_scalar("Model/output_proj_scale", output_proj_scale, epoch)
