@@ -1514,7 +1514,7 @@ def train(config: Config):
     ).to(device)
 
     # Compile model for better performance (PyTorch 2.0+)
-    print("Compiling model with torch.compile...")
+    # print("Compiling model with torch.compile...")
     # model = cast(TransformerModel, torch.compile(model))
 
     # Count parameters
