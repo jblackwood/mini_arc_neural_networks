@@ -46,7 +46,6 @@ class Config:
     mode: Literal["train", "learning_rate_test"]
     checkpoint_save_interval: int
     eval_interval: int  # Number of epochs between eval steps
-    eval_optimization_steps: int  # Number of optimization steps per test example
     eval_learning_rate: float  # Learning rate for eval optimization
     max_eval_batches: int  # Maximum number of batches to evaluate (to speed up eval)
 
@@ -1144,7 +1143,6 @@ def eval_step(
     model: TransformerModel,
     test_loader: DataLoader,
     device: torch.device,
-    eval_optimization_steps: int,
     eval_learning_rate: float,
     epoch: int,
     writer: SummaryWriter,
@@ -1152,11 +1150,12 @@ def eval_step(
 ) -> Tuple[float, float]:
     """Evaluate model by optimizing output grids to match task centers.
     
+    Uses early stopping: stops optimization when loss hasn't improved for 25 consecutive steps.
+    
     Args:
         model: The transformer model
         test_loader: Test data loader
         device: Device to evaluate on
-        eval_optimization_steps: Number of optimization steps per test example
         eval_learning_rate: Learning rate for optimization
         epoch: Current epoch number
         writer: Tensorboard writer
@@ -1254,8 +1253,14 @@ def eval_step(
         # Create optimizer for all output grid parameters
         optimizer = torch.optim.Adam([output_grid_params], lr=eval_learning_rate)
         
-        # Vectorized optimization loop
-        for step in range(eval_optimization_steps):
+        # Early stopping: track best loss and steps without improvement
+        best_loss = float('inf')
+        steps_without_improvement = 0
+        patience = 25
+        step = 0
+        
+        # Vectorized optimization loop with early stopping
+        while steps_without_improvement < patience:
             optimizer.zero_grad()
             
             # Build full 200-token embedding sequences for all tasks
@@ -1273,14 +1278,27 @@ def eval_step(
             
             # Compute loss for all tasks
             loss = (embeddings - centers).square().mean()
+            current_loss = loss.item()
             
-            # Debug: print loss every 10 iterations
+            # Print loss every 10 steps
             if step % 10 == 0:
-                print(f"    Optimization step {step}/{eval_optimization_steps}: loss = {loss.item():.6f}")
+                print(f"    Optimization step {step}: loss = {current_loss:.6f}")
+            
+            # Check for improvement
+            if current_loss < best_loss:
+                best_loss = current_loss
+                steps_without_improvement = 0
+            else:
+                steps_without_improvement += 1
             
             # Backprop
             loss.backward()
             optimizer.step()
+            
+            step += 1
+        
+        # Print number of steps taken
+        print(f"    Optimization converged after {step} steps (best loss: {best_loss:.6f})")
         
         # After optimization, convert output_grid_params to tokens for all tasks
         with torch.no_grad():
@@ -1637,7 +1655,6 @@ def train(config: Config):
                 model,
                 test_loader,
                 device,
-                config.eval_optimization_steps,
                 config.eval_learning_rate,
                 epoch,
                 writer,
@@ -1724,7 +1741,6 @@ def main():
         mode="train",
         checkpoint_save_interval=25,
         eval_interval=1,
-        eval_optimization_steps=100,
         eval_learning_rate=1e-4,
         max_eval_batches=2,
         # Google Drive location for Colab
