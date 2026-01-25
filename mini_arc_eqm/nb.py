@@ -35,7 +35,6 @@ class Config:
     num_layers: int
     dim_feedforward: int
     dropout: float
-    task_embedding_num_tokens: int
 
     # Training parameters
     batch_size: int
@@ -814,7 +813,6 @@ class TransformerModel(nn.Module):
         vocab_size: int,
         dropout: float,
         num_tasks: int,
-        task_embedding_num_tokens: int,
     ):
         """Initialize the transformer model.
 
@@ -825,17 +823,15 @@ class TransformerModel(nn.Module):
             dim_feedforward: Dimension of feedforward network
             vocab_size: Number of possible cell values (11 for ARC: 0-9 colors + mask token)
             dropout: Dropout rate
-            num_tasks: Number of unique tasks for task embedding
+            num_tasks: Number of unique tasks for task embedding (1 token per task)
         """
         super().__init__()
 
         # Store vocab_size for later use
         self.vocab_size = vocab_size
-        self.task_embedding_num_tokens = task_embedding_num_tokens
 
-        # Task embedding layer
-        task_embedding_dim = d_model * task_embedding_num_tokens
-        self.task_embedding = nn.Embedding(num_tasks, task_embedding_dim)
+        # Task embedding layer (1 token per task)
+        self.task_embedding = nn.Embedding(num_tasks, d_model)
         # Initialize task embeddings with mean 0 and std 0.01
         nn.init.normal_(self.task_embedding.weight, mean=0.0, std=0.01)
 
@@ -844,8 +840,7 @@ class TransformerModel(nn.Module):
         # Initialize token embeddings with mean 0 and std 0.01
         nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.01)
 
-        # Learnable position embeddings for task tokens and grid types
-        self.task_embedding_position = nn.Parameter(torch.randn(task_embedding_num_tokens, d_model))
+        # Learnable position embeddings for grid types
         self.input_grid_embedding = nn.Parameter(torch.randn(d_model))
         self.output_grid_embedding = nn.Parameter(torch.randn(d_model))
 
@@ -863,11 +858,11 @@ class TransformerModel(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
 
         # Two linear output projection layers with transpose
-        # First: (batch_size, task_embedding_num_tokens + 50, d_model) -> (batch_size, task_embedding_num_tokens + 50, 25)
-        # Transpose: (batch_size, task_embedding_num_tokens + 50, 25) -> (batch_size, 25, task_embedding_num_tokens + 50)
-        # Second: (batch_size, 25, task_embedding_num_tokens + 50) -> (batch_size, 25, vocab_size+1)
+        # First: (batch_size, 51, d_model) -> (batch_size, 51, 25)
+        # Transpose: (batch_size, 51, 25) -> (batch_size, 25, 51)
+        # Second: (batch_size, 25, 51) -> (batch_size, 25, vocab_size+1)
         self.output_proj_1 = nn.Linear(d_model, 25)
-        self.output_proj_2 = nn.Linear(task_embedding_num_tokens + 50, vocab_size + 1)  # +1 for "no change" token
+        self.output_proj_2 = nn.Linear(51, vocab_size + 1)  # +1 for "no change" token
 
     def forward(self, x: torch.Tensor, task_indices: torch.Tensor) -> torch.Tensor:
         """Forward pass.
@@ -880,10 +875,9 @@ class TransformerModel(nn.Module):
             Tensor of shape (batch_size, 25, vocab_size+1) with logits for token change prediction
         """
         
-        # Get task embeddings directly
-        task_emb = self.task_embedding(task_indices)  # (batch_size, task_embedding_dim)
-        task_emb = task_emb.view(-1, self.task_embedding_num_tokens, task_emb.size(-1) // self.task_embedding_num_tokens)  # (batch_size, task_embedding_num_tokens, d_model)
-        task_emb = task_emb + self.task_embedding_position  # Add task position embedding
+        # Get task embeddings (1 token per task)
+        task_emb = self.task_embedding(task_indices)  # (batch_size, d_model)
+        task_emb = task_emb.unsqueeze(1)  # (batch_size, 1, d_model)
         
         # Apply token embedding to grid tokens
         x = self.token_embedding(x)  # (batch_size, 50, d_model)
@@ -900,8 +894,8 @@ class TransformerModel(nn.Module):
         input_grid = self.rope(input_grid)  # (batch_size, 25, d_model)
         output_grid = self.rope(output_grid)  # (batch_size, 25, d_model)
         
-        # Concatenate: task tokens, input grid with RoPE, output grid with RoPE
-        x = torch.cat([task_emb, input_grid, output_grid], dim=1)  # (batch_size, task_embedding_num_tokens + 50, d_model)
+        # Concatenate: task token, input grid with RoPE, output grid with RoPE
+        x = torch.cat([task_emb, input_grid, output_grid], dim=1)  # (batch_size, 51, d_model)
 
         # Apply transformer encoder
         x = self.transformer_encoder(x)  # (batch_size, 51, d_model)
@@ -1628,7 +1622,6 @@ def train(config: Config):
         vocab_size=config.vocab_size,
         dropout=config.dropout,
         num_tasks=num_tasks,
-        task_embedding_num_tokens=config.task_embedding_num_tokens,
     ).to(device)
 
     # Compile model for better performance (PyTorch 2.0+)
@@ -1899,7 +1892,6 @@ def main():
         num_layers=8,
         dim_feedforward=1024,
         dropout=0.1,
-        task_embedding_num_tokens=1,
         # Data parameters
         vocab_size=11,
         # Denoising evaluation parameters
