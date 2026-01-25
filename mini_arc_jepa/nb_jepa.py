@@ -1721,12 +1721,12 @@ def main():
         random_seed=42,
         max_augmentations=500,
         # Model parameters
-        d_model=32,
-        nhead=4,
-        num_layers=4,
-        dim_feedforward=256,
+        d_model=128,
+        nhead=8,
+        num_layers=8,
+        dim_feedforward=512,
         dropout=0.1,
-        embedding_dim=256,
+        embedding_dim=512,
         # Data parameters
         vocab_size=10,
         # Training parameters
