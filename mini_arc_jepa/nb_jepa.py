@@ -1741,7 +1741,7 @@ def main():
         mode="train",
         checkpoint_save_interval=25,
         eval_interval=1,
-        eval_learning_rate=4e-4,
+        eval_learning_rate=1e-2,
         max_eval_batches=2,
         # Google Drive location for Colab
         google_drive_dir="/content/drive/MyDrive/sparse_arc",
