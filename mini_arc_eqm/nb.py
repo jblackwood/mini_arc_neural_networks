@@ -1873,25 +1873,6 @@ def train(config: Config):
     writer.close()
     print("\nTraining complete!")
 
-    # Save model
-    Path(config.model_save_dir).mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "config": {
-                "d_model": config.d_model,
-                "nhead": config.nhead,
-                "num_layers": config.num_layers,
-                "dim_feedforward": config.dim_feedforward,
-                "vocab_size": config.vocab_size,
-                "dropout": config.dropout,
-            },
-        },
-        config.model_save_path,
-    )
-    print(f"Model saved to {config.model_save_path}")
-
 
 def main():
     # Create configuration
@@ -1928,6 +1909,10 @@ def main():
         # Optional: Load existing model to continue training
         load_model_path=None,
     )
+
+    # Validate configuration
+    assert config.num_epochs % config.checkpoint_save_interval == 0, \
+        f"num_epochs ({config.num_epochs}) must be a multiple of checkpoint_save_interval ({config.checkpoint_save_interval})"
 
     # Print configuration
     print("Configuration:")
