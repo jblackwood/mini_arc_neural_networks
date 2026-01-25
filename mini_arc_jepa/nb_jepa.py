@@ -1280,10 +1280,6 @@ def eval_step(
             loss = (embeddings - centers).square().mean()
             current_loss = loss.item()
             
-            # Print loss every 10 steps
-            if step % 10 == 0:
-                print(f"    Optimization step {step}: loss = {current_loss:.6f}")
-            
             # Check for improvement
             if current_loss < best_loss:
                 best_loss = current_loss
