@@ -1678,13 +1678,11 @@ def train(config: Config):
             print(f"\nLoading existing model from {config.load_model_path}")
             checkpoint = torch.load(config.load_model_path, map_location=device)
             model.load_state_dict(checkpoint["model_state_dict"])
-            # Note: task_embedding is not loaded from checkpoint, it's reinitialized
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             start_epoch = checkpoint.get("epoch", 0)
             print(f"Resumed from epoch {start_epoch}")
             print(f"Previous train loss: {checkpoint.get('train_loss', 'N/A')}")
             print(f"Previous test loss: {checkpoint.get('test_loss', 'N/A')}")
-            print(f"Note: Task embeddings reinitialized (not loaded from checkpoint)")
+            print(f"Note: Task embeddings and optimizer reinitialized (not loaded from checkpoint)")
         else:
             print(
                 f"\nWarning: Model path {config.load_model_path} does not exist. Starting from scratch."
