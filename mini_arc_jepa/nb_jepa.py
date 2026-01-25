@@ -826,13 +826,13 @@ class TransformerModel(nn.Module):
         self.embedding_dim = embedding_dim
         self.d_model = d_model
 
-        # Token embedding layer (vocab_size -> d_model)
-        self.token_embedding = nn.Embedding(vocab_size, d_model)
+        # Token embedding layer (vocab_size + 1 -> d_model)
+        # Includes padding token at index 10 (tokens 0-9 are valid colors, 10 is padding)
+        self.token_embedding = nn.Embedding(vocab_size + 1, d_model)
         # Initialize token embeddings with small std to keep activation scale stable
         nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.01)
-
-        # Padding embedding for masked positions (token value -1)
-        self.padding_embedding = nn.Parameter(torch.zeros(d_model))
+        # Initialize padding token (index 10) to zeros
+        nn.init.zeros_(self.token_embedding.weight[vocab_size])
 
         # Learnable position embeddings for grid types
         self.input_grid_embedding = nn.Parameter(torch.randn(d_model))
@@ -932,24 +932,15 @@ class TransformerModel(nn.Module):
 
         Args:
             x: Input tensor of shape (batch_size, 200) - tokens for up to 4 examples
-               Padding positions should have value -1
+               Padding positions should have value 10 (vocab_size)
             src_key_padding_mask: Optional tensor of shape (batch_size, 200) where
                                   True indicates padding positions to ignore
 
         Returns:
             Tensor of shape (batch_size, embedding_dim) with embeddings
         """
-        # Handle padding tokens (-1) by replacing with 0 for embedding lookup
-        # The actual embeddings at padding positions will be replaced with padding_embedding
-        padding_mask = (x == -1)
-        x_safe = x.clone()
-        x_safe[padding_mask] = 0  # Replace -1 with 0 for valid embedding lookup
-        
-        # Apply token embedding to grid tokens
-        grid_embeddings = self.token_embedding(x_safe)  # (batch_size, 200, d_model)
-        
-        # Replace padding positions with padding embedding
-        grid_embeddings[padding_mask] = self.padding_embedding
+        # Apply token embedding to grid tokens (includes padding token at index 11)
+        grid_embeddings = self.token_embedding(x)  # (batch_size, 200, d_model)
         
         # Process through the rest of the model
         return self._forward_from_grid_embeddings(grid_embeddings, src_key_padding_mask)
@@ -1060,8 +1051,8 @@ def compute_loss_for_batch(
         local_batch = []
         for task_id in sorted_task_ids:
             example = task_groups[task_id][ex_idx]  # (50,)
-            # Pad to 200 tokens with -1 (invalid token, will be masked)
-            padded = torch.full((200,), -1, dtype=example.dtype)
+            # Pad to 200 tokens with 10 (padding token, will be masked)
+            padded = torch.full((200,), 10, dtype=example.dtype)
             padded[:50] = example
             local_batch.append(padded)
         local_views.append(torch.stack(local_batch, dim=0))  # (bs, 200)
@@ -1078,8 +1069,8 @@ def compute_loss_for_batch(
             random.shuffle(task_examples)
             # Take first 2 examples
             seq = torch.cat(task_examples[:2], dim=0)  # (100,)
-            # Pad to 200 tokens with -1 (invalid token, will be masked)
-            padded = torch.full((200,), -1, dtype=seq.dtype)
+            # Pad to 200 tokens with 10 (padding token, will be masked)
+            padded = torch.full((200,), 10, dtype=seq.dtype)
             padded[:100] = seq
             local_batch.append(padded)
         local_views.append(torch.stack(local_batch, dim=0))  # (bs, 200)
@@ -1096,8 +1087,8 @@ def compute_loss_for_batch(
             random.shuffle(task_examples)
             # Take first 3 examples
             seq = torch.cat(task_examples[:3], dim=0)  # (150,)
-            # Pad to 200 tokens with -1 (invalid token, will be masked)
-            padded = torch.full((200,), -1, dtype=seq.dtype)
+            # Pad to 200 tokens with 10 (padding token, will be masked)
+            padded = torch.full((200,), 10, dtype=seq.dtype)
             padded[:150] = seq
             local_batch.append(padded)
         local_views.append(torch.stack(local_batch, dim=0))  # (bs, 200)
@@ -1224,8 +1215,8 @@ def eval_step(
                 train_grids.append(concatenated)
             # Concatenate all 3 train examples: (150,)
             train_seq = torch.cat(train_grids, dim=0)
-            # Pad with -1 to 200 tokens (invalid token, will be masked)
-            padded = torch.full((200,), -1, dtype=train_seq.dtype)
+            # Pad with 10 to 200 tokens (padding token, will be masked)
+            padded = torch.full((200,), 10, dtype=train_seq.dtype)
             padded[:150] = train_seq
             train_batch.append(padded)
         
