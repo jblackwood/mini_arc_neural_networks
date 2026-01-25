@@ -1274,6 +1274,10 @@ def eval_step(
             # Compute loss for all tasks
             loss = (embeddings - centers).square().mean()
             
+            # Debug: print loss every 10 iterations
+            if step % 10 == 0:
+                print(f"    Optimization step {step}/{eval_optimization_steps}: loss = {loss.item():.6f}")
+            
             # Backprop
             loss.backward()
             optimizer.step()
@@ -1715,13 +1719,13 @@ def main():
         # Training parameters
         num_epochs=150,
         batch_size=64,
-        learning_rate=2.5e-5,
+        learning_rate=1e-4,
         lambd=0.05,
         mode="train",
         checkpoint_save_interval=25,
         eval_interval=1,
         eval_optimization_steps=100,
-        eval_learning_rate=1e-3,
+        eval_learning_rate=1e-4,
         max_eval_batches=2,
         # Google Drive location for Colab
         google_drive_dir="/content/drive/MyDrive/sparse_arc",
