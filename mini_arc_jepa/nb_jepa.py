@@ -1732,7 +1732,7 @@ def main():
         # Training parameters
         num_epochs=150,
         batch_size=64,
-        learning_rate=4e-4,
+        learning_rate=1e-4,
         lambd=0.05,
         mode="train",
         checkpoint_save_interval=25,
