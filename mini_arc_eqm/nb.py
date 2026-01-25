@@ -812,7 +812,6 @@ class TransformerModel(nn.Module):
         dim_feedforward: int,
         vocab_size: int,
         dropout: float,
-        num_tasks: int,
     ):
         """Initialize the transformer model.
 
@@ -823,17 +822,12 @@ class TransformerModel(nn.Module):
             dim_feedforward: Dimension of feedforward network
             vocab_size: Number of possible cell values (11 for ARC: 0-9 colors + mask token)
             dropout: Dropout rate
-            num_tasks: Number of unique tasks for task embedding (1 token per task)
         """
         super().__init__()
 
-        # Store vocab_size for later use
+        # Store vocab_size and d_model for later use
         self.vocab_size = vocab_size
-
-        # Task embedding layer (1 token per task)
-        self.task_embedding = nn.Embedding(num_tasks, d_model)
-        # Initialize task embeddings with mean 0 and std 0.01
-        nn.init.normal_(self.task_embedding.weight, mean=0.0, std=0.01)
+        self.d_model = d_model
 
         # Token embedding layer (vocab_size -> d_model)
         self.token_embedding = nn.Embedding(vocab_size, d_model)
@@ -864,19 +858,18 @@ class TransformerModel(nn.Module):
         self.output_proj_1 = nn.Linear(d_model, 25)
         self.output_proj_2 = nn.Linear(51, vocab_size + 1)  # +1 for "no change" token
 
-    def forward(self, x: torch.Tensor, task_indices: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, task_emb: torch.Tensor) -> torch.Tensor:
         """Forward pass.
 
         Args:
             x: Input tensor of shape (batch_size, 50) - tokens for input and output grids
-            task_indices: Task indices of shape (batch_size,) - integer indices for task embeddings
+            task_emb: Task embedding tensor of shape (batch_size, d_model)
 
         Returns:
             Tensor of shape (batch_size, 25, vocab_size+1) with logits for token change prediction
         """
         
-        # Get task embeddings (1 token per task)
-        task_emb = self.task_embedding(task_indices)  # (batch_size, d_model)
+        # Expand task embedding to sequence dimension
         task_emb = task_emb.unsqueeze(1)  # (batch_size, 1, d_model)
         
         # Apply token embedding to grid tokens
@@ -914,7 +907,7 @@ class TransformerModel(nn.Module):
 def optimize_output_grid(
     model: TransformerModel,
     x_input: torch.Tensor,
-    task_indices: torch.Tensor,
+    task_emb: torch.Tensor,
     num_iterations: int,
 ) -> DenoisingResult:
     """Optimize the output grid using iterative token prediction.
@@ -922,7 +915,7 @@ def optimize_output_grid(
     Args:
         model: The transformer model to use for computing token predictions
         x_input: Input tensor of shape (batch_size, 50) - tokens
-        task_indices: Task indices of shape (batch_size,)
+        task_emb: Task embedding tensor of shape (batch_size, d_model)
         num_iterations: Number of optimization iterations
 
     Returns:
@@ -942,7 +935,7 @@ def optimize_output_grid(
 
         for iteration in range(num_iterations):
             # Get logits from model
-            logits = model(x, task_indices)  # (batch_size, 25, vocab_size+1)
+            logits = model(x, task_emb)  # (batch_size, 25, vocab_size+1)
             
             # Get the most likely token for each position
             token_change_predictions = torch.argmax(logits, dim=2)  # (batch_size, 25)
@@ -1018,7 +1011,7 @@ def decode_grids(tokens: torch.Tensor, vocab_size: int) -> torch.Tensor:
 def evaluate_denoising_accuracy(
     model: TransformerModel,
     x_clean: torch.Tensor,
-    task_indices: torch.Tensor,
+    task_emb: torch.Tensor,
     num_iterations: int,
 ) -> DenoisingResult:
     """Evaluate denoising accuracy by corrupting and denoising output grids.
@@ -1026,7 +1019,7 @@ def evaluate_denoising_accuracy(
     Args:
         model: The transformer model to use for computing gradients
         x_clean: Clean input tensor of shape (batch_size, 50) - tokens
-        task_indices: Task indices of shape (batch_size,)
+        task_emb: Task embedding tensor of shape (batch_size, d_model)
         num_iterations: Number of optimization iterations
 
     Returns:
@@ -1046,7 +1039,7 @@ def evaluate_denoising_accuracy(
     opt_result = optimize_output_grid(
         model=model,
         x_input=x_i,
-        task_indices=task_indices,
+        task_emb=task_emb,
         num_iterations=num_iterations,
     )
 
@@ -1109,7 +1102,7 @@ def noise_last_25_tokens(batch: torch.Tensor, device: torch.device, vocab_size: 
 def compute_loss_for_batch(
     model: TransformerModel,
     batch: torch.Tensor,
-    task_indices: torch.Tensor,
+    task_emb: torch.Tensor,
     device: torch.device,
     label_smoothing: float,
 ) -> torch.Tensor:
@@ -1118,14 +1111,14 @@ def compute_loss_for_batch(
     Args:
         model: The transformer model
         batch: Batch of tokens, shape (batch_size, 50)
-        task_indices: Task indices of shape (batch_size,)
+        task_emb: Task embedding tensor of shape (batch_size, d_model)
         device: Device to compute on
 
     Returns:
         Loss tensor (scalar)
     """
     x = batch.to(device)  # (batch_size, 50)
-    task_indices = task_indices.to(device)  # (batch_size,)
+    task_emb = task_emb.to(device)  # (batch_size, d_model)
     vocab_size = model.vocab_size
     
     # no_change_token is the largest token value (vocab_size)
@@ -1144,7 +1137,7 @@ def compute_loss_for_batch(
     target = torch.where(same_mask, no_change_token, x_output)  # (batch_size, 25)
 
     # Forward pass - model returns logits (batch_size, 25, vocab_size+1)
-    logits = model(xg, task_indices)
+    logits = model(xg, task_emb)
 
     # Compute cross-entropy loss (expects logits)
     loss = torch.nn.functional.cross_entropy(
@@ -1158,6 +1151,7 @@ def compute_loss_for_batch(
 
 def train_epoch(
     model: TransformerModel,
+    task_embedding: nn.Embedding,
     train_loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
@@ -1168,6 +1162,7 @@ def train_epoch(
 
     Args:
         model: The transformer model
+        task_embedding: Task embedding layer
         train_loader: Training data loader
         optimizer: Optimizer
         device: Device to train on
@@ -1192,11 +1187,12 @@ def train_epoch(
         # Stack into batch
         batch = torch.stack(batch_tensors, dim=0)  # (batch_size, 50)
         
-        # Convert task_ids to indices
-        task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
+        # Convert task_ids to indices and get embeddings
+        task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long, device=device)
+        task_emb = task_embedding(task_indices)  # (batch_size, d_model)
         
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, task_indices, device, label_smoothing)
+        loss = compute_loss_for_batch(model, batch, task_emb, device, label_smoothing)
 
         # Backward pass
         optimizer.zero_grad()
@@ -1212,6 +1208,7 @@ def train_epoch(
 
 def test_epoch(
     model: TransformerModel,
+    task_embedding: nn.Embedding,
     test_loader: DataLoader,
     device: torch.device,
     task_id_to_index: Dict[str, int],
@@ -1221,6 +1218,7 @@ def test_epoch(
 
     Args:
         model: The transformer model
+        task_embedding: Task embedding layer
         test_loader: Test data loader
         device: Device to evaluate on
         task_id_to_index: Mapping from task_id strings to integer indices
@@ -1245,11 +1243,12 @@ def test_epoch(
             # Stack into batch
             batch = torch.stack(batch_tensors, dim=0)  # (batch_size, 50)
             
-            # Convert task_ids to indices
-            task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
+            # Convert task_ids to indices and get embeddings
+            task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long, device=device)
+            task_emb = task_embedding(task_indices)  # (batch_size, d_model)
             
             # Compute loss
-            loss = compute_loss_for_batch(model, batch, task_indices, device, label_smoothing)
+            loss = compute_loss_for_batch(model, batch, task_emb, device, label_smoothing)
 
             total_loss += loss.item()
             num_batches += 1
@@ -1259,6 +1258,7 @@ def test_epoch(
 
 def learning_rate_test(
     model: TransformerModel,
+    task_embedding: nn.Embedding,
     train_loader: DataLoader,
     device: torch.device,
     weight_decay: float,
@@ -1269,6 +1269,7 @@ def learning_rate_test(
 
     Args:
         model: The transformer model
+        task_embedding: Task embedding layer
         train_loader: Training data loader
         device: Device to train on
         weight_decay: Weight decay parameter
@@ -1286,7 +1287,7 @@ def learning_rate_test(
 
         # Create optimizer with current learning rate
         opt = torch.optim.AdamW(
-            model.parameters(), lr=lr, weight_decay=weight_decay
+            list(model.parameters()) + list(task_embedding.parameters()), lr=lr, weight_decay=weight_decay
         )
 
         # Prepare batch
@@ -1298,10 +1299,11 @@ def learning_rate_test(
             task_ids.append(example["task_id"])
         
         batch = torch.stack(batch_tensors, dim=0)  # (batch_size, 50)
-        task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
+        task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long, device=device)
+        task_emb = task_embedding(task_indices)  # (batch_size, d_model)
 
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, task_indices, device, label_smoothing)
+        loss = compute_loss_for_batch(model, batch, task_emb, device, label_smoothing)
 
         # Backward pass
         opt.zero_grad()
@@ -1321,6 +1323,7 @@ def learning_rate_test(
 
 def weight_decay_test(
     model: TransformerModel,
+    task_embedding: nn.Embedding,
     train_loader: DataLoader,
     device: torch.device,
     learning_rate: float,
@@ -1331,6 +1334,7 @@ def weight_decay_test(
 
     Args:
         model: The transformer model
+        task_embedding: Task embedding layer
         train_loader: Training data loader
         device: Device to train on
         learning_rate: Learning rate parameter
@@ -1348,7 +1352,7 @@ def weight_decay_test(
 
         # Create optimizer with current weight decay
         opt = torch.optim.AdamW(
-            model.parameters(), lr=learning_rate, weight_decay=wd
+            list(model.parameters()) + list(task_embedding.parameters()), lr=learning_rate, weight_decay=wd
         )
 
         # Prepare batch
@@ -1360,10 +1364,11 @@ def weight_decay_test(
             task_ids.append(example["task_id"])
         
         batch = torch.stack(batch_tensors, dim=0)  # (batch_size, 50)
-        task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
+        task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long, device=device)
+        task_emb = task_embedding(task_indices)  # (batch_size, d_model)
 
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, task_indices, device, label_smoothing)
+        loss = compute_loss_for_batch(model, batch, task_emb, device, label_smoothing)
 
         # Backward pass
         opt.zero_grad()
@@ -1383,6 +1388,7 @@ def weight_decay_test(
 
 def evaluate_denoising(
     model: TransformerModel,
+    task_embedding: nn.Embedding,
     train_loader: DataLoader,
     test_loader: DataLoader,
     device: torch.device,
@@ -1395,6 +1401,7 @@ def evaluate_denoising(
 
     Args:
         model: The transformer model
+        task_embedding: Task embedding layer
         train_loader: Training dataloader
         test_loader: Test dataloader
         device: Device to evaluate on
@@ -1426,12 +1433,13 @@ def evaluate_denoising(
             
             batch = torch.stack(batch_tensors, dim=0).to(device)  # (batch_size, 50)
             batch_task_indices = torch.tensor([task_id_to_index[tid] for tid in batch_task_ids], dtype=torch.long, device=device)
+            batch_task_emb = task_embedding(batch_task_indices)  # (batch_size, d_model)
 
             # Evaluate this batch
             batch_result = evaluate_denoising_accuracy(
                 model=model,
                 x_clean=batch,
-                task_indices=batch_task_indices,
+                task_emb=batch_task_emb,
                 num_iterations=eval_denoise_num_iterations,
             )
             train_results.append(batch_result)
@@ -1450,12 +1458,13 @@ def evaluate_denoising(
             
             batch = torch.stack(batch_tensors, dim=0).to(device)  # (batch_size, 50)
             batch_task_indices = torch.tensor([task_id_to_index[tid] for tid in batch_task_ids], dtype=torch.long, device=device)
+            batch_task_emb = task_embedding(batch_task_indices)  # (batch_size, d_model)
 
             # Evaluate this batch
             batch_result = evaluate_denoising_accuracy(
                 model=model,
                 x_clean=batch,
-                task_indices=batch_task_indices,
+                task_emb=batch_task_emb,
                 num_iterations=eval_denoise_num_iterations,
             )
             test_results.append(batch_result)
@@ -1621,17 +1630,23 @@ def train(config: Config):
         dim_feedforward=config.dim_feedforward,
         vocab_size=config.vocab_size,
         dropout=config.dropout,
-        num_tasks=num_tasks,
     ).to(device)
+
+    # Create task embedding layer (separate from model)
+    task_embedding = nn.Embedding(num_tasks, config.d_model).to(device)
+    # Initialize task embeddings with mean 0 and std 0.01
+    nn.init.normal_(task_embedding.weight, mean=0.0, std=0.01)
 
     # Compile model for better performance (PyTorch 2.0+)
     print("Compiling model with torch.compile...")
     model = cast(TransformerModel, torch.compile(model))
 
     # Count parameters
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    task_embedding_params = sum(p.numel() for p in task_embedding.parameters() if p.requires_grad)
+    total_params = model_params + task_embedding_params
     
-    embedding_params = sum(p.numel() for p in model.task_embedding.parameters() if p.requires_grad)
+    embedding_params = task_embedding_params
     embedding_params += sum(p.numel() for p in model.rope.parameters() if p.requires_grad)
     
     other_params = total_params - embedding_params
@@ -1642,21 +1657,18 @@ def train(config: Config):
 
     # Check if running learning rate test
     if config.mode == "learning_rate_test":
-        learning_rate_test(model, train_loader, device, config.weight_decay, task_id_to_index, config.label_smoothing)
+        learning_rate_test(model, task_embedding, train_loader, device, config.weight_decay, task_id_to_index, config.label_smoothing)
         return
 
     # Check if running weight decay test
     if config.mode == "weight_decay_test":
-        weight_decay_test(model, train_loader, device, config.learning_rate, task_id_to_index, config.label_smoothing)
+        weight_decay_test(model, task_embedding, train_loader, device, config.learning_rate, task_id_to_index, config.label_smoothing)
         return
 
     # Create optimizer with separate learning rate and weight decay for task embeddings
-    task_embedding_params = list(model.task_embedding.parameters())
-    other_params = [p for n, p in model.named_parameters() if 'task_embedding' not in n]
-    
     optimizer = torch.optim.AdamW([
-        {'params': task_embedding_params, 'lr': config.task_embedding_lr, 'weight_decay': config.task_embedding_weight_decay},
-        {'params': other_params, 'lr': config.learning_rate, 'weight_decay': config.weight_decay}
+        {'params': task_embedding.parameters(), 'lr': config.task_embedding_lr, 'weight_decay': config.task_embedding_weight_decay},
+        {'params': model.parameters(), 'lr': config.learning_rate, 'weight_decay': config.weight_decay}
     ])
 
     # Load existing model if specified
@@ -1666,11 +1678,13 @@ def train(config: Config):
             print(f"\nLoading existing model from {config.load_model_path}")
             checkpoint = torch.load(config.load_model_path, map_location=device)
             model.load_state_dict(checkpoint["model_state_dict"])
+            # Note: task_embedding is not loaded from checkpoint, it's reinitialized
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             start_epoch = checkpoint.get("epoch", 0)
             print(f"Resumed from epoch {start_epoch}")
             print(f"Previous train loss: {checkpoint.get('train_loss', 'N/A')}")
             print(f"Previous test loss: {checkpoint.get('test_loss', 'N/A')}")
+            print(f"Note: Task embeddings reinitialized (not loaded from checkpoint)")
         else:
             print(
                 f"\nWarning: Model path {config.load_model_path} does not exist. Starting from scratch."
@@ -1699,6 +1713,7 @@ def train(config: Config):
         
         evaluate_denoising(
             model=model,
+            task_embedding=task_embedding,
             train_loader=train_loader_eval,
             test_loader=test_loader_eval,
             device=device,
@@ -1720,10 +1735,10 @@ def train(config: Config):
         epoch_start_time = time.time()
 
         # Train
-        train_loss = train_epoch(model, train_loader, optimizer, device, task_id_to_index, config.label_smoothing)
+        train_loss = train_epoch(model, task_embedding, train_loader, optimizer, device, task_id_to_index, config.label_smoothing)
 
         # Test
-        test_loss = test_epoch(model, test_loader, device, task_id_to_index, config.label_smoothing)
+        test_loss = test_epoch(model, task_embedding, test_loader, device, task_id_to_index, config.label_smoothing)
 
         # Calculate epoch time
         epoch_time = time.time() - epoch_start_time
@@ -1741,7 +1756,7 @@ def train(config: Config):
 
         # Calculate layer-wise mean square using vectorized operations
         # Embedding layers
-        task_emb_mean_sq = model.task_embedding.weight.pow(2).mean().item()
+        task_emb_mean_sq = task_embedding.weight.pow(2).mean().item()
         token_emb_mean_sq = model.token_embedding.weight.pow(2).mean().item()
         
         # Linear layers
@@ -1814,6 +1829,7 @@ def train(config: Config):
 
             evaluate_denoising(
                 model=model,
+                task_embedding=task_embedding,
                 train_loader=train_loader_eval,
                 test_loader=test_loader_eval,
                 device=device,
