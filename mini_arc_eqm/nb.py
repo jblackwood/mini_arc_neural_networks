@@ -26,8 +26,8 @@ class Config:
     data_dir: Path
     output_dir: Path
     test_ratio: float
-    random_seed: int
     max_augmentations: int
+    epochs_without_improvement_before_dataset_recreation: int
 
     # Model parameters
     d_model: int
@@ -51,7 +51,6 @@ class Config:
     vocab_size: int
 
     # Denoising evaluation parameters
-    eval_denoise_epoch_interval: int
     eval_denoise_num_iterations: int
 
     # Google Drive location for Colab
@@ -132,6 +131,17 @@ class DenoisingResult:
     optimized_output_tokens: Optional[torch.Tensor] = None
     best_grad_norm: Optional[torch.Tensor] = None
     best_iteration: Optional[torch.Tensor] = None
+
+
+@dataclass
+class DataAndEmbeddings:
+    """Data loaders, task mappings, embeddings, and optimizer."""
+
+    train_loader: DataLoader
+    test_loader: DataLoader
+    task_id_to_index: Dict[str, int]
+    task_embedding: nn.Embedding
+    optimizer: torch.optim.Optimizer
 
 
 def parse_arc_json(file_path: Path) -> ARCTask:
@@ -508,7 +518,6 @@ def create_dataset(
     data_dir: Path,
     output_dir: Path,
     test_ratio: float,
-    random_seed: int,
     max_augmentations: int,
 ) -> None:
     """Create train and test datasets from MiniARC tasks with augmentations.
@@ -516,32 +525,21 @@ def create_dataset(
     Args:
         data_dir: Path to the MiniARC data directory
         output_dir: Path to the output directory
-        test_ratio: Ratio of tasks to put in test set (default: 0.2)
-        random_seed: Random seed for deterministic splitting (default: 42)
-        max_augmentations: Maximum number of augmented tasks per original task (default: 100)
+        test_ratio: Ratio of tasks to put in test set
+        max_augmentations: Maximum number of augmented tasks per original task
     """
     # Create output directories
     train_output_dir = output_dir / "train"
     test_output_dir = output_dir / "test"
 
-    # Check if both directories already exist and contain files
-    if train_output_dir.exists() and test_output_dir.exists():
-        train_files_exist = list(train_output_dir.glob("*.json"))
-        test_files_exist = list(test_output_dir.glob("*.json"))
-
-        if train_files_exist and test_files_exist:
-            print(f"Output directories already exist and contain data:")
-            print(
-                f"  Train directory: {train_output_dir} ({len(train_files_exist)} files)"
-            )
-            print(
-                f"  Test directory: {test_output_dir} ({len(test_files_exist)} files)"
-            )
-            print(f"Skipping dataset creation.")
-            return
-
-    # Set random seed for reproducibility
-    random.seed(random_seed)
+    # Delete existing directories if they exist
+    if train_output_dir.exists():
+        shutil.rmtree(train_output_dir)
+        print(f"Deleted existing train directory: {train_output_dir}")
+    
+    if test_output_dir.exists():
+        shutil.rmtree(test_output_dir)
+        print(f"Deleted existing test directory: {test_output_dir}")
 
     # Get all JSON files
     json_files = sorted(data_dir.glob("*.json"))
@@ -556,13 +554,15 @@ def create_dataset(
     print(f"Train tasks: {len(train_files)}")
     print(f"Test tasks: {len(test_files)}")
 
-    # Process train files
+    # Process train files (use time-based seed for randomness)
     print(f"\nProcessing train files...")
-    process_files(train_files, train_output_dir, max_augmentations, random_seed)
+    train_seed = int(time.time() * 1000000) % (2**32)
+    process_files(train_files, train_output_dir, max_augmentations, train_seed)
 
-    # Process test files
+    # Process test files (use different time-based seed)
     print(f"\nProcessing test files...")
-    process_files(test_files, test_output_dir, max_augmentations, random_seed + 1)
+    test_seed = int(time.time() * 1000000) % (2**32) + 1
+    process_files(test_files, test_output_dir, max_augmentations, test_seed)
 
     print(f"\nDatasets created successfully!")
     print(f"Train directory: {train_output_dir}")
@@ -1550,24 +1550,30 @@ def evaluate_denoising(
     return float(avg_train_acc), float(avg_test_acc)
 
 
-def train(config: Config):
-    """Train transformer model on ARC tasks.
-
+def initialize_data_and_embeddings(
+    config: Config,
+    model: TransformerModel,
+    device: torch.device,
+) -> DataAndEmbeddings:
+    """Initialize datasets, dataloaders, task embeddings, and optimizer.
+    
     Args:
-        config: Configuration object containing all training parameters
+        config: Configuration object containing all parameters
+        model: The transformer model (needed for optimizer)
+        device: Device to create embeddings on
+        
+    Returns:
+        DataAndEmbeddings object with all initialized components
     """
-
-    # Set device
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-        # Enable TF32 for faster matmul on Ampere+ GPUs
-        torch.set_float32_matmul_precision("high")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-    print(f"Using device: {device}")
-
+    # Create dataset
+    print("\nCreating dataset...")
+    create_dataset(
+        data_dir=config.data_dir / "data" / "MiniARC",
+        output_dir=config.output_dir,
+        test_ratio=config.test_ratio,
+        max_augmentations=config.max_augmentations,
+    )
+    
     # Create datasets
     # Train dataset uses all grids (train + test from each task)
     train_dataset_all = ARCTaskDataset(config.train_data_dir, vocab_size=config.vocab_size, grids="all")
@@ -1621,8 +1627,46 @@ def train(config: Config):
         shuffle=False,
         collate_fn=arc_collate_fn,
     )
+    
+    # Create task embedding layer (separate from model)
+    task_embedding = nn.Embedding(num_tasks, config.d_model).to(device)
+    # Initialize task embeddings with mean 0 and std 0.01
+    nn.init.normal_(task_embedding.weight, mean=0.0, std=0.01)
+    
+    # Create optimizer with separate learning rate and weight decay for task embeddings
+    optimizer = torch.optim.AdamW([
+        {'params': task_embedding.parameters(), 'lr': config.task_embedding_lr, 'weight_decay': config.task_embedding_weight_decay},
+        {'params': model.parameters(), 'lr': config.learning_rate, 'weight_decay': config.weight_decay}
+    ])
+    
+    return DataAndEmbeddings(
+        train_loader=train_loader,
+        test_loader=test_loader,
+        task_id_to_index=task_id_to_index,
+        task_embedding=task_embedding,
+        optimizer=optimizer,
+    )
 
-    # Create model
+
+def train(config: Config):
+    """Train transformer model on ARC tasks.
+
+    Args:
+        config: Configuration object containing all training parameters
+    """
+
+    # Set device
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        # Enable TF32 for faster matmul on Ampere+ GPUs
+        torch.set_float32_matmul_precision("high")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    print(f"Using device: {device}")
+
+    # Create model first (before data initialization)
     model = TransformerModel(
         d_model=config.d_model,
         nhead=config.nhead,
@@ -1632,14 +1676,17 @@ def train(config: Config):
         dropout=config.dropout,
     ).to(device)
 
-    # Create task embedding layer (separate from model)
-    task_embedding = nn.Embedding(num_tasks, config.d_model).to(device)
-    # Initialize task embeddings with mean 0 and std 0.01
-    nn.init.normal_(task_embedding.weight, mean=0.0, std=0.01)
-
     # Compile model for better performance (PyTorch 2.0+)
     print("Compiling model with torch.compile...")
     model = cast(TransformerModel, torch.compile(model))
+
+    # Initialize data and embeddings
+    data_and_emb = initialize_data_and_embeddings(config, model, device)
+    train_loader = data_and_emb.train_loader
+    test_loader = data_and_emb.test_loader
+    task_id_to_index = data_and_emb.task_id_to_index
+    task_embedding = data_and_emb.task_embedding
+    optimizer = data_and_emb.optimizer
 
     # Count parameters
     model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1664,12 +1711,6 @@ def train(config: Config):
     if config.mode == "weight_decay_test":
         weight_decay_test(model, task_embedding, train_loader, device, config.learning_rate, task_id_to_index, config.label_smoothing)
         return
-
-    # Create optimizer with separate learning rate and weight decay for task embeddings
-    optimizer = torch.optim.AdamW([
-        {'params': task_embedding.parameters(), 'lr': config.task_embedding_lr, 'weight_decay': config.task_embedding_weight_decay},
-        {'params': model.parameters(), 'lr': config.learning_rate, 'weight_decay': config.weight_decay}
-    ])
 
     # Load existing model if specified
     start_epoch = 0
@@ -1729,6 +1770,9 @@ def train(config: Config):
 
     # Training loop
     print("\nStarting training...")
+    best_test_loss = float('inf')
+    epochs_without_improvement = 0
+    
     for epoch in range(start_epoch, start_epoch + config.num_epochs):
         epoch_start_time = time.time()
 
@@ -1737,6 +1781,65 @@ def train(config: Config):
 
         # Test
         test_loss = test_epoch(model, task_embedding, test_loader, device, task_id_to_index, config.label_smoothing)
+        
+        # Track test loss improvement
+        if test_loss < best_test_loss:
+            best_test_loss = test_loss
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+        
+        # Check if we need to recreate the dataset
+        if epochs_without_improvement >= config.epochs_without_improvement_before_dataset_recreation:
+            print(f"\n{'='*80}")
+            print(f"Test loss hasn't improved for {epochs_without_improvement} epochs.")
+            print(f"Evaluating denoising accuracy before dataset recreation...")
+            print(f"{'='*80}\n")
+            
+            # Evaluate denoising accuracy before recreating dataset
+            train_dataset_eval = ARCTaskDataset(config.train_data_dir, vocab_size=config.vocab_size, grids="test")
+            test_dataset_eval = ARCTaskDataset(config.test_data_dir, vocab_size=config.vocab_size, grids="test")
+            
+            train_loader_eval = DataLoader(
+                train_dataset_eval,
+                batch_size=config.batch_size,
+                shuffle=False,
+                collate_fn=arc_collate_fn,
+            )
+            test_loader_eval = DataLoader(
+                test_dataset_eval,
+                batch_size=config.batch_size,
+                shuffle=False,
+                collate_fn=arc_collate_fn,
+            )
+
+            evaluate_denoising(
+                model=model,
+                task_embedding=task_embedding,
+                train_loader=train_loader_eval,
+                test_loader=test_loader_eval,
+                device=device,
+                eval_denoise_num_iterations=config.eval_denoise_num_iterations,
+                task_id_to_index=task_id_to_index,
+                writer=writer,
+                epoch=epoch,
+            )
+            
+            print(f"\nRecreating dataset, task embeddings, and optimizer...\n")
+            
+            # Reinitialize data and embeddings (includes dataset recreation)
+            data_and_emb = initialize_data_and_embeddings(config, model, device)
+            train_loader = data_and_emb.train_loader
+            test_loader = data_and_emb.test_loader
+            task_id_to_index = data_and_emb.task_id_to_index
+            task_embedding = data_and_emb.task_embedding
+            optimizer = data_and_emb.optimizer
+            
+            # Reset tracking
+            best_test_loss = float('inf')
+            epochs_without_improvement = 0
+            
+            print(f"\nDataset recreated. Continuing training...\n")
 
         # Calculate epoch time
         epoch_time = time.time() - epoch_start_time
@@ -1803,42 +1906,6 @@ def train(config: Config):
         writer.add_scalar("LayerMeanSquare/output_proj_2", output_proj_2_mean_sq, epoch)
         writer.add_scalar("LayerMeanSquare/transformer_avg", transformer_mean_sq, epoch)
 
-        # Evaluate denoising accuracy periodically
-        if (epoch + 1) % config.eval_denoise_epoch_interval == 0:
-            print(f"\nEvaluating denoising accuracy at epoch {epoch + 1}...")
-            
-            # Create evaluation datasets (test grids only)
-            train_dataset_eval = ARCTaskDataset(config.train_data_dir, vocab_size=config.vocab_size, grids="test")
-            test_dataset_eval = ARCTaskDataset(config.test_data_dir, vocab_size=config.vocab_size, grids="test")
-            
-            # Create dataloaders
-            train_loader_eval = DataLoader(
-                train_dataset_eval,
-                batch_size=config.batch_size,
-                shuffle=False,
-                collate_fn=arc_collate_fn,
-            )
-            test_loader_eval = DataLoader(
-                test_dataset_eval,
-                batch_size=config.batch_size,
-                shuffle=False,
-                collate_fn=arc_collate_fn,
-            )
-
-            evaluate_denoising(
-                model=model,
-                task_embedding=task_embedding,
-                train_loader=train_loader_eval,
-                test_loader=test_loader_eval,
-                device=device,
-                eval_denoise_num_iterations=config.eval_denoise_num_iterations,
-                task_id_to_index=task_id_to_index,
-                writer=writer,
-                epoch=epoch,
-            )
-
-            print()  # Empty line for readability
-
         # Save checkpoint every N epochs (configurable)
         if (epoch + 1) % config.checkpoint_save_interval == 0:
             checkpoint_path = f"{config.checkpoint_dir}/{config.timestamp}_epoch_{epoch + 1}_checkpoint.pt"
@@ -1879,8 +1946,8 @@ def main():
         data_dir=Path("data/MINI-ARC"),
         output_dir=Path("output/mini_arc_eqm5"),
         test_ratio=0.2,
-        random_seed=43,
         max_augmentations=500,
+        epochs_without_improvement_before_dataset_recreation=3,
         # Model parameters
         d_model=256,
         nhead=8,
@@ -1890,7 +1957,6 @@ def main():
         # Data parameters
         vocab_size=11,
         # Denoising evaluation parameters
-        eval_denoise_epoch_interval=10,
         eval_denoise_num_iterations=10,
         # Training parameters
         num_epochs=60,
@@ -1920,16 +1986,7 @@ def main():
     # Download dataset
     download_mini_arc(config.data_dir)
 
-    # Create train/test split with augmentations
-    create_dataset(
-        data_dir=config.data_dir / "data" / "MiniARC",
-        output_dir=config.output_dir,
-        test_ratio=config.test_ratio,
-        random_seed=config.random_seed,
-        max_augmentations=config.max_augmentations,
-    )
-
-    # # Train model
+    # Train model (dataset creation happens inside train())
     train(config)
 
     # Shut down Google Colab runtime if running in Colab (only in train mode)
