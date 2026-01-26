@@ -28,6 +28,7 @@ class Config:
     test_ratio: float
     max_augmentations: int
     epochs_without_improvement_before_dataset_recreation: int
+    train_test_split_seed: int
 
     # Model parameters
     d_model: int
@@ -519,6 +520,7 @@ def create_dataset(
     output_dir: Path,
     test_ratio: float,
     max_augmentations: int,
+    train_test_split_seed: int,
 ) -> None:
     """Create train and test datasets from MiniARC tasks with augmentations.
 
@@ -527,6 +529,7 @@ def create_dataset(
         output_dir: Path to the output directory
         test_ratio: Ratio of tasks to put in test set
         max_augmentations: Maximum number of augmented tasks per original task
+        train_test_split_seed: Random seed for deterministic train/test split
     """
     # Create output directories
     train_output_dir = output_dir / "train"
@@ -545,8 +548,9 @@ def create_dataset(
     json_files = sorted(data_dir.glob("*.json"))
     print(f"Found {len(json_files)} task files")
 
-    # Shuffle and split into train and test
-    random.shuffle(json_files)
+    # Shuffle and split into train and test (use fixed seed for deterministic split)
+    split_rng = random.Random(train_test_split_seed)
+    split_rng.shuffle(json_files)
     num_test = int(len(json_files) * test_ratio)
     test_files = json_files[:num_test]
     train_files = json_files[num_test:]
@@ -1572,6 +1576,7 @@ def initialize_data_and_embeddings(
         output_dir=config.output_dir,
         test_ratio=config.test_ratio,
         max_augmentations=config.max_augmentations,
+        train_test_split_seed=config.train_test_split_seed,
     )
     
     # Create datasets
@@ -1948,6 +1953,7 @@ def main():
         test_ratio=0.2,
         max_augmentations=500,
         epochs_without_improvement_before_dataset_recreation=3,
+        train_test_split_seed=42,
         # Model parameters
         d_model=256,
         nhead=8,
