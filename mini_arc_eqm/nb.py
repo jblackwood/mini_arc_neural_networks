@@ -1965,7 +1965,7 @@ def main():
         # Denoising evaluation parameters
         eval_denoise_num_iterations=10,
         # Training parameters
-        num_epochs=60,
+        num_epochs=150,
         batch_size=32,
         learning_rate=1e-4,
         task_embedding_lr=1e-2,
