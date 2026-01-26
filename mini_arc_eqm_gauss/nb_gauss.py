@@ -801,43 +801,7 @@ class RoPE2D(nn.Module):
         return x_rotated.reshape(x.shape[0], 25, self.d_model)
 
 
-class NormalizedEmbedding(nn.Module):
-    """Embedding layer that normalizes outputs to have mean 0 and variance 1."""
-    
-    def __init__(self, num_embeddings: int, embedding_dim: int):
-        """Initialize normalized embedding.
-        
-        Args:
-            num_embeddings: Size of the embedding dictionary
-            embedding_dim: Dimension of embeddings
-        """
-        super().__init__()
-        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
-        self.embedding_dim = embedding_dim
-    
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        """Forward pass with normalization.
-        
-        Args:
-            input: Tensor containing indices
-            
-        Returns:
-            Normalized embeddings with mean 0 and variance 1
-        """
-        # Get embeddings
-        emb = self.embedding(input)  # Shape: (..., embedding_dim)
-        
-        # Normalize to mean 0 and variance 1 across the embedding dimension
-        mean = emb.mean(dim=-1, keepdim=True)
-        var = emb.var(dim=-1, keepdim=True, unbiased=False)
-        emb_normalized = (emb - mean) / torch.sqrt(var + 1e-8)
-        
-        return emb_normalized
-    
-    @property
-    def weight(self):
-        """Access to underlying embedding weights."""
-        return self.embedding.weight
+
 
 
 class TransformerModel(nn.Module):
@@ -871,10 +835,10 @@ class TransformerModel(nn.Module):
         self.d_model = d_model
 
         # Task embedding layer (1 token per task)
-        self.task_embedding = NormalizedEmbedding(num_tasks, d_model)
+        self.task_embedding = nn.Embedding(num_tasks, d_model)
 
         # Token embedding layer (vocab_size -> d_model)
-        self.token_embedding = NormalizedEmbedding(vocab_size, d_model)
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
 
         # Learnable position embeddings for grid types
         self.input_grid_embedding = nn.Parameter(torch.randn(d_model))
@@ -1210,6 +1174,20 @@ def train_epoch(
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+
+        # Normalize embedding matrices column-wise (mean=0, var=1 for each dimension)
+        with torch.no_grad():
+            # Normalize task embeddings
+            task_emb_weight = model.task_embedding.weight
+            task_mean = task_emb_weight.mean(dim=0, keepdim=True)
+            task_var = task_emb_weight.var(dim=0, keepdim=True, unbiased=False)
+            task_emb_weight.copy_((task_emb_weight - task_mean) / torch.sqrt(task_var + 1e-8))
+            
+            # Normalize token embeddings
+            token_emb_weight = model.token_embedding.weight
+            token_mean = token_emb_weight.mean(dim=0, keepdim=True)
+            token_var = token_emb_weight.var(dim=0, keepdim=True, unbiased=False)
+            token_emb_weight.copy_((token_emb_weight - token_mean) / torch.sqrt(token_var + 1e-8))
 
         total_loss += loss.item()
         num_batches += 1
