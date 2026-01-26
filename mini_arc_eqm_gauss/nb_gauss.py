@@ -52,6 +52,7 @@ class Config:
     # Denoising evaluation parameters
     eval_denoise_epoch_interval: int
     eval_denoise_num_iterations: int
+    eta: float
 
     # Google Drive location for Colab
     google_drive_dir: str
@@ -831,10 +832,10 @@ class TransformerModel(nn.Module):
         self.d_model = d_model
 
         # Task embedding layer (1 token per task)
-        self.task_embedding = nn.Embedding(num_tasks, d_model, max_norm=1.0)
+        self.task_embedding = nn.Embedding(num_tasks, d_model)
 
         # Token embedding layer (vocab_size -> d_model)
-        self.token_embedding = nn.Embedding(vocab_size, d_model, max_norm=1.0)
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
 
         # Learnable position embeddings for grid types
         self.input_grid_embedding = nn.Parameter(torch.randn(d_model))
@@ -890,6 +891,7 @@ def optimize_output_grid(
     batch: torch.Tensor,
     task_indices: torch.Tensor,
     num_iterations: int,
+    eta: float,
 ) -> DenoisingResult:
     """Optimize the output grid in continuous embedding space.
 
@@ -902,6 +904,7 @@ def optimize_output_grid(
         batch: Input tensor of shape (batch_size, 50) - clean tokens for input and output grids
         task_indices: Task indices of shape (batch_size,)
         num_iterations: Number of optimization iterations
+        eta: Learning rate for gradient descent updates
 
     Returns:
         DenoisingResult with optimized_output_tokens (decoded to 0-9 values) and best_grad_norm
@@ -938,8 +941,8 @@ def optimize_output_grid(
             # Update only the output grid portion (last 25 tokens)
             output_grad = grad[:, -25:, :]  # (batch_size, 25, d_model)
             
-            # Update output grid: x = x - grad
-            output_grid = output_grid - output_grad
+            # Update output grid: x = x - eta * grad
+            output_grid = output_grid - eta * output_grad
             
             # Reconstruct x with updated output grid
             x = torch.cat([task_emb, input_grid, output_grid], dim=1)  # (batch_size, 51, d_model)
@@ -950,6 +953,10 @@ def optimize_output_grid(
             # Calculate grad norm for output grid only
             output_grad = grad[:, -25:, :]  # (batch_size, 25, d_model)
             grad_norm_per_sample = output_grad.pow(2).sum(dim=(1, 2)).sqrt()  # (batch_size,)
+            
+            # Print grad norm for debugging
+            mean_grad_norm = grad_norm_per_sample.mean().item()
+            print(f"Iteration {iteration}: mean grad norm = {mean_grad_norm:.6f}")
 
             # Update best result if current grad norm is lower
             improved_mask = grad_norm_per_sample < best_grad_norm  # (batch_size,)
@@ -1018,6 +1025,7 @@ def evaluate_denoising_accuracy(
     x_clean: torch.Tensor,
     task_indices: torch.Tensor,
     num_iterations: int,
+    eta: float,
 ) -> DenoisingResult:
     """Evaluate denoising accuracy by denoising output grids from random initialization.
 
@@ -1026,6 +1034,7 @@ def evaluate_denoising_accuracy(
         x_clean: Clean input tensor of shape (batch_size, 50) - tokens
         task_indices: Task indices of shape (batch_size,)
         num_iterations: Number of optimization iterations
+        eta: Learning rate for gradient descent updates
 
     Returns:
         DenoisingResult containing accuracies and predicted grids
@@ -1038,6 +1047,7 @@ def evaluate_denoising_accuracy(
         batch=x_clean,
         task_indices=task_indices,
         num_iterations=num_iterations,
+        eta=eta,
     )
 
     # Decode the optimized output grids (already decoded in optimize_output_grid)
@@ -1346,6 +1356,7 @@ def evaluate_denoising(
     test_loader: DataLoader,
     device: torch.device,
     eval_denoise_num_iterations: int,
+    eta: float,
     task_id_to_index: Dict[str, int],
     writer: Optional[SummaryWriter] = None,
     epoch: Optional[int] = None,
@@ -1358,6 +1369,7 @@ def evaluate_denoising(
         test_loader: Test dataloader
         device: Device to evaluate on
         eval_denoise_num_iterations: Number of optimization iterations
+        eta: Learning rate for gradient descent updates
         task_id_to_index: Mapping from task_id strings to integer indices
         writer: Optional tensorboard writer for logging
         epoch: Optional epoch number for logging
@@ -1373,7 +1385,9 @@ def evaluate_denoising(
     with torch.no_grad():
         # Process train tasks batch by batch
         train_results = []
-        for examples in train_loader:
+        for batch_idx, examples in enumerate(train_loader):
+            if batch_idx >= 2:  # Only process first 2 batches
+                break
             # Prepare batch
             batch_tensors = []
             batch_task_ids = []
@@ -1392,12 +1406,15 @@ def evaluate_denoising(
                 x_clean=batch,
                 task_indices=batch_task_indices,
                 num_iterations=eval_denoise_num_iterations,
+                eta=eta,
             )
             train_results.append(batch_result)
 
         # Process test tasks batch by batch
         test_results = []
-        for examples in test_loader:
+        for batch_idx, examples in enumerate(test_loader):
+            if batch_idx >= 2:  # Only process first 2 batches
+                break
             # Prepare batch
             batch_tensors = []
             batch_task_ids = []
@@ -1416,6 +1433,7 @@ def evaluate_denoising(
                 x_clean=batch,
                 task_indices=batch_task_indices,
                 num_iterations=eval_denoise_num_iterations,
+                eta=eta,
             )
             test_results.append(batch_result)
 
@@ -1662,6 +1680,7 @@ def train(config: Config):
             test_loader=test_loader_eval,
             device=device,
             eval_denoise_num_iterations=config.eval_denoise_num_iterations,
+            eta=config.eta,
             task_id_to_index=task_id_to_index,
         )
         return
@@ -1763,6 +1782,7 @@ def train(config: Config):
                 test_loader=test_loader_eval,
                 device=device,
                 eval_denoise_num_iterations=config.eval_denoise_num_iterations,
+                eta=config.eta,
                 task_id_to_index=task_id_to_index,
                 writer=writer,
                 epoch=epoch,
@@ -1840,8 +1860,9 @@ def main():
         # Data parameters
         vocab_size=10,
         # Denoising evaluation parameters
-        eval_denoise_epoch_interval=10,
+        eval_denoise_epoch_interval=1,
         eval_denoise_num_iterations=10,
+        eta=1,
         # Training parameters
         num_epochs=150,
         batch_size=32,
