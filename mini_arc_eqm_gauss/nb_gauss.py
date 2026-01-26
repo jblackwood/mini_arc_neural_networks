@@ -953,10 +953,6 @@ def optimize_output_grid(
             # Calculate grad norm for output grid only
             output_grad = grad[:, -25:, :]  # (batch_size, 25, d_model)
             grad_norm_per_sample = output_grad.pow(2).sum(dim=(1, 2)).sqrt()  # (batch_size,)
-            
-            # Print grad norm for debugging
-            mean_grad_norm = grad_norm_per_sample.mean().item()
-            print(f"Iteration {iteration}: mean grad norm = {mean_grad_norm:.6f}")
 
             # Update best result if current grad norm is lower
             improved_mask = grad_norm_per_sample < best_grad_norm  # (batch_size,)
@@ -1385,9 +1381,7 @@ def evaluate_denoising(
     with torch.no_grad():
         # Process train tasks batch by batch
         train_results = []
-        for batch_idx, examples in enumerate(train_loader):
-            if batch_idx >= 2:  # Only process first 2 batches
-                break
+        for examples in train_loader:
             # Prepare batch
             batch_tensors = []
             batch_task_ids = []
@@ -1412,9 +1406,7 @@ def evaluate_denoising(
 
         # Process test tasks batch by batch
         test_results = []
-        for batch_idx, examples in enumerate(test_loader):
-            if batch_idx >= 2:  # Only process first 2 batches
-                break
+        for examples in test_loader:
             # Prepare batch
             batch_tensors = []
             batch_task_ids = []
