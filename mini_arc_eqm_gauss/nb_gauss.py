@@ -801,6 +801,45 @@ class RoPE2D(nn.Module):
         return x_rotated.reshape(x.shape[0], 25, self.d_model)
 
 
+class NormalizedEmbedding(nn.Module):
+    """Embedding layer that normalizes outputs to have mean 0 and variance 1."""
+    
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        """Initialize normalized embedding.
+        
+        Args:
+            num_embeddings: Size of the embedding dictionary
+            embedding_dim: Dimension of embeddings
+        """
+        super().__init__()
+        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
+        self.embedding_dim = embedding_dim
+    
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """Forward pass with normalization.
+        
+        Args:
+            input: Tensor containing indices
+            
+        Returns:
+            Normalized embeddings with mean 0 and variance 1
+        """
+        # Get embeddings
+        emb = self.embedding(input)  # Shape: (..., embedding_dim)
+        
+        # Normalize to mean 0 and variance 1 across the embedding dimension
+        mean = emb.mean(dim=-1, keepdim=True)
+        var = emb.var(dim=-1, keepdim=True, unbiased=False)
+        emb_normalized = (emb - mean) / torch.sqrt(var + 1e-8)
+        
+        return emb_normalized
+    
+    @property
+    def weight(self):
+        """Access to underlying embedding weights."""
+        return self.embedding.weight
+
+
 class TransformerModel(nn.Module):
     """Non-causal transformer encoder for ARC tasks using continuous equilibrium matching."""
 
@@ -832,10 +871,10 @@ class TransformerModel(nn.Module):
         self.d_model = d_model
 
         # Task embedding layer (1 token per task)
-        self.task_embedding = nn.Embedding(num_tasks, d_model)
+        self.task_embedding = NormalizedEmbedding(num_tasks, d_model)
 
         # Token embedding layer (vocab_size -> d_model)
-        self.token_embedding = nn.Embedding(vocab_size, d_model)
+        self.token_embedding = NormalizedEmbedding(vocab_size, d_model)
 
         # Learnable position embeddings for grid types
         self.input_grid_embedding = nn.Parameter(torch.randn(d_model))
@@ -1860,8 +1899,8 @@ def main():
         batch_size=32,
         learning_rate=1e-4,
         task_embedding_lr=1e-2,
-        weight_decay=0.01,
-        task_embedding_weight_decay=0.01,
+        weight_decay=0,
+        task_embedding_weight_decay=0,
         mode="train",
         checkpoint_save_interval=30,
         # Google Drive location for Colab
