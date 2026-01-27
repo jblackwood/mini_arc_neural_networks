@@ -955,8 +955,22 @@ def optimize_output_grid(
             # Get new gradient
             grad = model(x)  # (batch_size, 51, d_model)
             
-            # Calculate grad norm for output grid only
+            # Calculate grad norm for all tokens and last 25 tokens for early stopping
+            total_grad = grad  # (batch_size, 51, d_model)
             output_grad = grad[:, -25:, :]  # (batch_size, 25, d_model)
+            
+            # Compute norms (averaged across batch)
+            total_grad_norm = total_grad.pow(2).sum(dim=(1, 2)).sqrt().mean().item()  # scalar
+            output_grad_norm = output_grad.pow(2).sum(dim=(1, 2)).sqrt().mean().item()  # scalar
+            
+            # Calculate percentage for early stopping
+            output_grad_pct = (output_grad_norm / total_grad_norm * 100) if total_grad_norm > 0 else 0.0
+            
+            # Early stopping: break if output grad is less than 90% of total grad
+            if output_grad_pct < 90.0:
+                break
+            
+            # Calculate grad norm for output grid only
             grad_norm_per_sample = output_grad.pow(2).sum(dim=(1, 2)).sqrt()  # (batch_size,)
 
             # Update best result if current grad norm is lower
