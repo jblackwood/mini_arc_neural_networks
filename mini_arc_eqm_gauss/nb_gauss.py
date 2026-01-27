@@ -1875,10 +1875,10 @@ def main():
         random_seed=42,
         max_augmentations=500,
         # Model parameters
-        d_model=256,
+        d_model=512,
         nhead=8,
-        num_layers=8,
-        dim_feedforward=1024,
+        num_layers=12,
+        dim_feedforward=2048,
         dropout=0.1,
         # Data parameters
         vocab_size=10,
