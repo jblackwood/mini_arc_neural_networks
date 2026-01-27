@@ -839,6 +839,8 @@ class TransformerModel(nn.Module):
 
         # Token embedding layer (vocab_size -> d_model)
         self.token_embedding = nn.Embedding(vocab_size, d_model)
+        # Freeze token embeddings - they should not be updated during training
+        self.token_embedding.weight.requires_grad = False
 
         # Learnable position embeddings for grid types
         self.input_grid_embedding = nn.Parameter(torch.randn(d_model))
@@ -1174,20 +1176,6 @@ def train_epoch(
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
-
-        # Normalize embedding matrices column-wise (mean=0, var=1 for each dimension)
-        with torch.no_grad():
-            # Normalize task embeddings
-            task_emb_weight = model.task_embedding.weight
-            task_mean = task_emb_weight.mean(dim=0, keepdim=True)
-            task_var = task_emb_weight.var(dim=0, keepdim=True, unbiased=False)
-            task_emb_weight.copy_((task_emb_weight - task_mean) / torch.sqrt(task_var + 1e-8))
-            
-            # Normalize token embeddings
-            token_emb_weight = model.token_embedding.weight
-            token_mean = token_emb_weight.mean(dim=0, keepdim=True)
-            token_var = token_emb_weight.var(dim=0, keepdim=True, unbiased=False)
-            token_emb_weight.copy_((token_emb_weight - token_mean) / torch.sqrt(token_var + 1e-8))
 
         total_loss += loss.item()
         num_batches += 1
@@ -1877,8 +1865,8 @@ def main():
         batch_size=32,
         learning_rate=1e-4,
         task_embedding_lr=1e-2,
-        weight_decay=0,
-        task_embedding_weight_decay=0,
+        weight_decay=0.01,
+        task_embedding_weight_decay=0.01,
         mode="train",
         checkpoint_save_interval=30,
         # Google Drive location for Colab
