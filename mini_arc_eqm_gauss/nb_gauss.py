@@ -1321,7 +1321,7 @@ def learning_rate_test(
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
 
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, task_indices, device)
+        loss, mse_loss, kl_loss = compute_loss_for_batch(model, batch, task_indices, device)
 
         # Backward pass
         opt.zero_grad()
@@ -1382,7 +1382,7 @@ def weight_decay_test(
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
 
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, task_indices, device)
+        loss, mse_loss, kl_loss = compute_loss_for_batch(model, batch, task_indices, device)
 
         # Backward pass
         opt.zero_grad()
