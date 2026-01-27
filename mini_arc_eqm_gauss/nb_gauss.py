@@ -1922,20 +1922,20 @@ def main():
         # Data parameters
         vocab_size=10,
         # Denoising evaluation parameters
-        eval_denoise_epoch_interval=5,
+        eval_denoise_epoch_interval=10,
         eval_denoise_num_iterations=10,
         eta=1,
         # Loss weighting parameters
         task_token_loss_weight=0.05,
         # Training parameters
-        num_epochs=75,
+        num_epochs=300,
         batch_size=32,
         learning_rate=1e-4,
         task_embedding_lr=1e-2,
         weight_decay=0,
         task_embedding_weight_decay=0,
         mode="train",
-        checkpoint_save_interval=25,
+        checkpoint_save_interval=50,
         # Google Drive location for Colab
         google_drive_dir="/content/drive/MyDrive/sparse_arc",
         # Optional: Load existing model to continue training
