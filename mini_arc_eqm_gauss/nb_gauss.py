@@ -1502,10 +1502,12 @@ def evaluate_denoising(
     # Aggregate train results
     train_accuracies = np.concatenate([result.accuracies.cpu().numpy() for result in train_results])
     train_best_iterations = np.concatenate([result.best_iteration.cpu().numpy() for result in train_results])
+    train_best_grad_norms = np.concatenate([result.best_grad_norm.cpu().numpy() for result in train_results])
 
     # Aggregate test results
     test_accuracies = np.concatenate([result.accuracies.cpu().numpy() for result in test_results])
     test_best_iterations = np.concatenate([result.best_iteration.cpu().numpy() for result in test_results])
+    test_best_grad_norms = np.concatenate([result.best_grad_norm.cpu().numpy() for result in test_results])
 
     # Compute average accuracies
     avg_train_acc = np.mean(train_accuracies) if len(train_accuracies) > 0 else 0.0
@@ -1525,6 +1527,10 @@ def evaluate_denoising(
     avg_test_iter = np.mean(test_best_iterations) if len(test_best_iterations) > 0 else 0.0
     std_test_iter = np.std(test_best_iterations) if len(test_best_iterations) > 0 else 0.0
 
+    # Compute average best grad norm
+    avg_train_grad_norm = np.mean(train_best_grad_norms) if len(train_best_grad_norms) > 0 else 0.0
+    avg_test_grad_norm = np.mean(test_best_grad_norms) if len(test_best_grad_norms) > 0 else 0.0
+
     # Calculate evaluation time
     eval_time = time.time() - eval_start_time
 
@@ -1539,6 +1545,10 @@ def evaluate_denoising(
             f"Test Best Iter: {avg_test_iter:.1f}±{std_test_iter:.1f} (max: {max_test_iter}), "
             f"Time: {eval_time:.2f}s"
         )
+        print(
+            f"  Train Avg Grad Norm: {avg_train_grad_norm:.6f}, "
+            f"Test Avg Grad Norm: {avg_test_grad_norm:.6f}"
+        )
     else:
         print(
             f"Train Accuracy: {avg_train_acc * 100:.2f}% (100% acc: {train_perfect_pct:.1f}%), "
@@ -1548,6 +1558,10 @@ def evaluate_denoising(
             f"Train Best Iter: {avg_train_iter:.1f}±{std_train_iter:.1f} (max: {max_train_iter}), "
             f"Test Best Iter: {avg_test_iter:.1f}±{std_test_iter:.1f} (max: {max_test_iter}), "
             f"Time: {eval_time:.2f}s"
+        )
+        print(
+            f"Train Avg Grad Norm: {avg_train_grad_norm:.6f}, "
+            f"Test Avg Grad Norm: {avg_test_grad_norm:.6f}"
         )
 
     # Log to tensorboard if writer provided
@@ -1575,6 +1589,12 @@ def evaluate_denoising(
         )
         writer.add_scalar(
             f"DenoiseBestIter/test_std", std_test_iter, epoch
+        )
+        writer.add_scalar(
+            f"DenoiseBestGradNorm/train", avg_train_grad_norm, epoch
+        )
+        writer.add_scalar(
+            f"DenoiseBestGradNorm/test", avg_test_grad_norm, epoch
         )
 
     return float(avg_train_acc), float(avg_test_acc)
