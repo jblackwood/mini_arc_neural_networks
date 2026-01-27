@@ -1085,6 +1085,9 @@ def compute_loss_for_batch(
 
     Looks up task and token embeddings, corrupts them with gaussian noise,
     and trains the model to predict the noise gradient (xg - x) using MSE loss.
+    
+    50% of the time, only the output grid (last 25 tokens) is corrupted, while
+    the task token and input grid remain clean.
 
     Args:
         model: The transformer model
@@ -1116,6 +1119,15 @@ def compute_loss_for_batch(
 
     # Create noised embeddings: xg = (1-gamma)*eps + gamma*x
     xg = (1 - gamma) * eps + gamma * x
+    
+    # 50% of the time (per sample), only corrupt the output grid (last 25 tokens)
+    batch_size = x.shape[0]
+    corrupt_only_output = torch.rand(batch_size, device=device) < 0.5  # (batch_size,)
+    
+    # For samples where we only corrupt output, set task and input tokens to clean values
+    # Expand mask to match dimensions: (batch_size, 1, 1) -> broadcasts to (batch_size, 26, d_model)
+    mask = corrupt_only_output.view(batch_size, 1, 1)
+    xg[:, :26, :] = torch.where(mask, x[:, :26, :], xg[:, :26, :])
 
     # Target is xg - x (the noise gradient)
     target = xg - x
