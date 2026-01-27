@@ -865,6 +865,9 @@ class TransformerModel(nn.Module):
             batch_first=True,
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
+        
+        # Output projection layer
+        self.output_projection = nn.Linear(d_model, d_model)
 
     def forward(self, x: torch.Tensor, mode: torch.Tensor) -> torch.Tensor:
         """Forward pass.
@@ -906,6 +909,9 @@ class TransformerModel(nn.Module):
 
         # Apply transformer encoder
         output = self.transformer_encoder(x)  # (batch_size, 52, d_model)
+        
+        # Apply output projection
+        output = self.output_projection(output)  # (batch_size, 52, d_model)
         
         # Return only the last 51 tokens (excluding mode token)
         return output[:, 1:, :]  # (batch_size, 51, d_model)
