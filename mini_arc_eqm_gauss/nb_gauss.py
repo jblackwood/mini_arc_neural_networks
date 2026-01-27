@@ -134,21 +134,6 @@ class DenoisingResult:
     best_iteration: Optional[torch.Tensor] = None
 
 
-@dataclass
-class LossComponents:
-    """Components of the training loss.
-
-    Attributes:
-        total_loss: Total combined loss
-        mse_loss: Mean squared error loss component
-        kl_loss: KL divergence regularization loss component
-    """
-
-    total_loss: float
-    mse_loss: float
-    kl_loss: float
-
-
 def parse_arc_json(file_path: Path) -> ARCTask:
     """Parse an ARC JSON file into an ARCTask dataclass.
 
@@ -854,14 +839,6 @@ class TransformerModel(nn.Module):
 
         # Token embedding layer (vocab_size -> d_model)
         self.token_embedding = nn.Embedding(vocab_size, d_model)
-        # Initialize with orthogonal rows using QR decomposition
-        with torch.no_grad():
-            W = torch.randn(vocab_size, d_model)
-            Q, R = torch.linalg.qr(W.T)
-            W_ortho = Q.T[:vocab_size]
-            # Scale to match N(0,1) variance
-            W_ortho = W_ortho * (d_model ** 0.5)
-            self.token_embedding.weight.copy_(W_ortho)
         # Freeze token embeddings - they should not be updated during training
         self.token_embedding.weight.requires_grad = False
 
@@ -1103,7 +1080,7 @@ def compute_loss_for_batch(
     batch: torch.Tensor,
     task_indices: torch.Tensor,
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """Compute loss for a single batch using equilibrium matching.
 
     Looks up task and token embeddings, corrupts them with gaussian noise,
@@ -1116,7 +1093,7 @@ def compute_loss_for_batch(
         device: Device to compute on
 
     Returns:
-        Tuple of (total_loss, mse_loss, kl_loss) as tensors
+        Loss tensor (scalar)
     """
     batch = batch.to(device)  # (batch_size, 50)
     task_indices = task_indices.to(device)  # (batch_size,)
@@ -1148,19 +1125,9 @@ def compute_loss_for_batch(
     predicted = model(xg)  # (batch_size, 51, d_model)
 
     # Compute MSE loss
-    mse_loss = torch.nn.functional.mse_loss(predicted, target)
+    loss = torch.nn.functional.mse_loss(predicted, target)
 
-    # Add KL divergence regularization for task embeddings to be near N(0,1)
-    # KL(N(μ, σ²) || N(0, 1)) = 0.5 * (σ² + μ² - 1 - log(σ²))
-    task_emb_weights = model.task_embedding.weight  # (num_tasks, d_model)
-    mean = task_emb_weights.mean(dim=0)  # (d_model,)
-    var = task_emb_weights.var(dim=0, unbiased=False)  # (d_model,)
-    kl_loss = 0.5 * (var + mean.pow(2) - 1 - torch.log(var + 1e-8)).mean()
-
-    # Combine losses
-    loss = mse_loss + kl_loss
-
-    return loss, mse_loss, kl_loss
+    return loss
 
 
 def train_epoch(
@@ -1169,7 +1136,7 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     task_id_to_index: Dict[str, int],
-) -> LossComponents:
+) -> float:
     """Train for one epoch.
 
     Args:
@@ -1180,12 +1147,10 @@ def train_epoch(
         task_id_to_index: Mapping from task_id strings to integer indices
 
     Returns:
-        LossComponents with averaged losses over all batches
+        Average training loss
     """
     model.train()
     total_loss = 0.0
-    total_mse_loss = 0.0
-    total_kl_loss = 0.0
     num_batches = 0
 
     for examples in train_loader:
@@ -1204,7 +1169,7 @@ def train_epoch(
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
         
         # Compute loss
-        loss, mse_loss, kl_loss = compute_loss_for_batch(model, batch, task_indices, device)
+        loss = compute_loss_for_batch(model, batch, task_indices, device)
 
         # Backward pass
         optimizer.zero_grad()
@@ -1213,15 +1178,9 @@ def train_epoch(
         optimizer.step()
 
         total_loss += loss.item()
-        total_mse_loss += mse_loss.item()
-        total_kl_loss += kl_loss.item()
         num_batches += 1
 
-    return LossComponents(
-        total_loss=total_loss / num_batches,
-        mse_loss=total_mse_loss / num_batches,
-        kl_loss=total_kl_loss / num_batches,
-    )
+    return total_loss / num_batches
 
 
 def test_epoch(
@@ -1229,7 +1188,7 @@ def test_epoch(
     test_loader: DataLoader,
     device: torch.device,
     task_id_to_index: Dict[str, int],
-) -> LossComponents:
+) -> float:
     """Evaluate on test set.
 
     Args:
@@ -1239,12 +1198,10 @@ def test_epoch(
         task_id_to_index: Mapping from task_id strings to integer indices
 
     Returns:
-        LossComponents with averaged losses over all batches
+        Average test loss
     """
     model.eval()
     total_loss = 0.0
-    total_mse_loss = 0.0
-    total_kl_loss = 0.0
     num_batches = 0
 
     with torch.no_grad():
@@ -1264,18 +1221,12 @@ def test_epoch(
             task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
             
             # Compute loss
-            loss, mse_loss, kl_loss = compute_loss_for_batch(model, batch, task_indices, device)
+            loss = compute_loss_for_batch(model, batch, task_indices, device)
 
             total_loss += loss.item()
-            total_mse_loss += mse_loss.item()
-            total_kl_loss += kl_loss.item()
             num_batches += 1
 
-    return LossComponents(
-        total_loss=total_loss / num_batches,
-        mse_loss=total_mse_loss / num_batches,
-        kl_loss=total_kl_loss / num_batches,
-    )
+    return total_loss / num_batches
 
 
 def learning_rate_test(
@@ -1321,7 +1272,7 @@ def learning_rate_test(
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
 
         # Compute loss
-        loss, mse_loss, kl_loss = compute_loss_for_batch(model, batch, task_indices, device)
+        loss = compute_loss_for_batch(model, batch, task_indices, device)
 
         # Backward pass
         opt.zero_grad()
@@ -1382,7 +1333,7 @@ def weight_decay_test(
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
 
         # Compute loss
-        loss, mse_loss, kl_loss = compute_loss_for_batch(model, batch, task_indices, device)
+        loss = compute_loss_for_batch(model, batch, task_indices, device)
 
         # Backward pass
         opt.zero_grad()
@@ -1744,10 +1695,10 @@ def train(config: Config):
         epoch_start_time = time.time()
 
         # Train
-        train_losses = train_epoch(model, train_loader, optimizer, device, task_id_to_index)
+        train_loss = train_epoch(model, train_loader, optimizer, device, task_id_to_index)
 
         # Test
-        test_losses = test_epoch(model, test_loader, device, task_id_to_index)
+        test_loss = test_epoch(model, test_loader, device, task_id_to_index)
 
         # Calculate epoch time
         epoch_time = time.time() - epoch_start_time
@@ -1779,8 +1730,7 @@ def train(config: Config):
         # Log to console
         print(
             f"Epoch {epoch + 1}/{start_epoch + config.num_epochs} - "
-            f"Train Loss: {train_losses.total_loss:.6f} (MSE: {train_losses.mse_loss:.6f}, KL: {train_losses.kl_loss:.6f}), "
-            f"Test Loss: {test_losses.total_loss:.6f} (MSE: {test_losses.mse_loss:.6f}, KL: {test_losses.kl_loss:.6f}), "
+            f"Train Loss: {train_loss:.6f}, Test Loss: {test_loss:.6f}, "
             f"Time: {epoch_time:.2f}s, "
             f"Weight Norm: {model_weight_norm:.4f}"
         )
@@ -1791,12 +1741,8 @@ def train(config: Config):
         )
 
         # Log to tensorboard
-        writer.add_scalar("Loss/train", train_losses.total_loss, epoch)
-        writer.add_scalar("Loss/test", test_losses.total_loss, epoch)
-        writer.add_scalar("Loss/train_mse", train_losses.mse_loss, epoch)
-        writer.add_scalar("Loss/test_mse", test_losses.mse_loss, epoch)
-        writer.add_scalar("Loss/train_kl", train_losses.kl_loss, epoch)
-        writer.add_scalar("Loss/test_kl", test_losses.kl_loss, epoch)
+        writer.add_scalar("Loss/train", train_loss, epoch)
+        writer.add_scalar("Loss/test", test_loss, epoch)
         writer.add_scalar("Time/epoch", epoch_time, epoch)
         writer.add_scalar("Model/weight_norm", model_weight_norm, epoch)
         
@@ -1849,8 +1795,8 @@ def train(config: Config):
                     "epoch": epoch + 1,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
-                    "train_loss": train_losses.total_loss,
-                    "test_loss": test_losses.total_loss,
+                    "train_loss": train_loss,
+                    "test_loss": test_loss,
                     "config": {
                         "d_model": config.d_model,
                         "nhead": config.nhead,
