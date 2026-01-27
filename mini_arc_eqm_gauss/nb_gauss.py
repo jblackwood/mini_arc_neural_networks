@@ -1883,7 +1883,7 @@ def main():
         # Data parameters
         vocab_size=10,
         # Denoising evaluation parameters
-        eval_denoise_epoch_interval=1,
+        eval_denoise_epoch_interval=5,
         eval_denoise_num_iterations=10,
         eta=1,
         # Training parameters
