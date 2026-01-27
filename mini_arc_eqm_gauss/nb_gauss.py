@@ -54,6 +54,9 @@ class Config:
     eval_denoise_num_iterations: int
     eta: float
 
+    # Loss weighting parameters
+    task_token_loss_weight: float
+
     # Google Drive location for Colab
     google_drive_dir: str
 
@@ -1094,6 +1097,7 @@ def compute_loss_for_batch(
     batch: torch.Tensor,
     task_indices: torch.Tensor,
     device: torch.device,
+    task_token_loss_weight: float,
 ) -> torch.Tensor:
     """Compute loss for a single batch using equilibrium matching.
 
@@ -1108,6 +1112,7 @@ def compute_loss_for_batch(
         batch: Batch of tokens, shape (batch_size, 50)
         task_indices: Task indices of shape (batch_size,)
         device: Device to compute on
+        task_token_loss_weight: Weight for task token loss relative to other tokens
 
     Returns:
         Loss tensor (scalar)
@@ -1150,8 +1155,17 @@ def compute_loss_for_batch(
     # Model will add RoPE and grid embeddings internally
     predicted = model(xg)  # (batch_size, 51, d_model)
 
-    # Compute MSE loss
-    loss = torch.nn.functional.mse_loss(predicted, target)
+    # Compute weighted MSE loss
+    # Task token (position 0) has different weight than other tokens (positions 1-50)
+    squared_errors = (predicted - target).pow(2)  # (batch_size, 51, d_model)
+    
+    # Create weight tensor: task token gets task_token_loss_weight, others get 1.0
+    weights = torch.ones(51, device=device)  # (51,)
+    weights[0] = task_token_loss_weight
+    
+    # Apply weights and compute mean
+    weighted_squared_errors = squared_errors * weights.view(1, 51, 1)  # (batch_size, 51, d_model)
+    loss = weighted_squared_errors.mean()
 
     return loss
 
@@ -1162,6 +1176,7 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     task_id_to_index: Dict[str, int],
+    task_token_loss_weight: float,
 ) -> float:
     """Train for one epoch.
 
@@ -1195,7 +1210,7 @@ def train_epoch(
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
         
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, task_indices, device)
+        loss = compute_loss_for_batch(model, batch, task_indices, device, task_token_loss_weight)
 
         # Backward pass
         optimizer.zero_grad()
@@ -1214,6 +1229,7 @@ def test_epoch(
     test_loader: DataLoader,
     device: torch.device,
     task_id_to_index: Dict[str, int],
+    task_token_loss_weight: float,
 ) -> float:
     """Evaluate on test set.
 
@@ -1247,7 +1263,7 @@ def test_epoch(
             task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
             
             # Compute loss
-            loss = compute_loss_for_batch(model, batch, task_indices, device)
+            loss = compute_loss_for_batch(model, batch, task_indices, device, task_token_loss_weight)
 
             total_loss += loss.item()
             num_batches += 1
@@ -1261,6 +1277,7 @@ def learning_rate_test(
     device: torch.device,
     weight_decay: float,
     task_id_to_index: Dict[str, int],
+    task_token_loss_weight: float,
 ):
     """Test learning rate by starting at 1e-7 and doubling every batch.
 
@@ -1298,7 +1315,7 @@ def learning_rate_test(
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
 
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, task_indices, device)
+        loss = compute_loss_for_batch(model, batch, task_indices, device, task_token_loss_weight)
 
         # Backward pass
         opt.zero_grad()
@@ -1322,6 +1339,7 @@ def weight_decay_test(
     device: torch.device,
     learning_rate: float,
     task_id_to_index: Dict[str, int],
+    task_token_loss_weight: float,
 ):
     """Test weight decay by starting at 1e-7 and doubling every batch.
 
@@ -1359,15 +1377,13 @@ def weight_decay_test(
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
 
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, task_indices, device)
+        loss = compute_loss_for_batch(model, batch, task_indices, device, task_token_loss_weight)
 
         # Backward pass
         opt.zero_grad()
         loss.backward()
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        opt.step()
-
-        # Print weight decay and loss
         print(f"Batch {batch_count + 1}: WD = {wd:.2e}, Loss = {loss.item():.6f}")
 
         # Double weight decay for next batch
@@ -1642,12 +1658,12 @@ def train(config: Config):
 
     # Check if running learning rate test
     if config.mode == "learning_rate_test":
-        learning_rate_test(model, train_loader, device, config.weight_decay, task_id_to_index)
+        learning_rate_test(model, train_loader, device, config.weight_decay, task_id_to_index, config.task_token_loss_weight)
         return
 
     # Check if running weight decay test
     if config.mode == "weight_decay_test":
-        weight_decay_test(model, train_loader, device, config.learning_rate, task_id_to_index)
+        weight_decay_test(model, train_loader, device, config.learning_rate, task_id_to_index, config.task_token_loss_weight)
         return
 
     # Create optimizer with separate learning rate and weight decay for task embeddings
@@ -1721,10 +1737,10 @@ def train(config: Config):
         epoch_start_time = time.time()
 
         # Train
-        train_loss = train_epoch(model, train_loader, optimizer, device, task_id_to_index)
+        train_loss = train_epoch(model, train_loader, optimizer, device, task_id_to_index, config.task_token_loss_weight)
 
         # Test
-        test_loss = test_epoch(model, test_loader, device, task_id_to_index)
+        test_loss = test_epoch(model, test_loader, device, task_id_to_index, config.task_token_loss_weight)
 
         # Calculate epoch time
         epoch_time = time.time() - epoch_start_time
@@ -1886,6 +1902,8 @@ def main():
         eval_denoise_epoch_interval=5,
         eval_denoise_num_iterations=10,
         eta=1,
+        # Loss weighting parameters
+        task_token_loss_weight=0.05,
         # Training parameters
         num_epochs=75,
         batch_size=32,
