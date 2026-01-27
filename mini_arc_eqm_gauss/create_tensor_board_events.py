@@ -329,8 +329,8 @@ def write_to_tensorboard(metrics, log_dir: Path, model_name: str):
 
 def main():
     # ============ Configure these variables ============
-    md_file = "mini_arc_eqm/results/20260126_014701_epoch_90_checkpoint.md"
-    log_dir = "output/mini_arc_eqm5/runs"
+    md_file = "mini_arc_eqm_gauss/results/20260127_200616_epoch_50_checkpoint.md"
+    log_dir = "output/mini_arc_eqm_gauss/runs"
     # ===================================================
     
     md_path = Path(md_file)
