@@ -849,6 +849,10 @@ class TransformerModel(nn.Module):
         self.input_grid_embedding = nn.Parameter(torch.randn(d_model))
         self.output_grid_embedding = nn.Parameter(torch.randn(d_model))
 
+        # Mode embeddings for explicit conditioning on corruption regime
+        self.full_noise_emb = nn.Parameter(torch.randn(d_model))
+        self.partial_noise_emb = nn.Parameter(torch.randn(d_model))
+
         # 2D Rotary Position Embeddings
         self.rope = RoPE2D(d_model=d_model, max_grid_size=5)
 
@@ -862,16 +866,28 @@ class TransformerModel(nn.Module):
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mode: torch.Tensor) -> torch.Tensor:
         """Forward pass.
 
         Args:
             x: Input tensor of shape (batch_size, 51, d_model) - noised embeddings for
                task token (1), input grid (25), and output grid (25)
+            mode: Mode tensor of shape (batch_size,) with values 0 (full corruption) or 1 (partial corruption)
 
         Returns:
             Tensor of shape (batch_size, 51, d_model) predicting the noise gradient (xg - x_clean)
         """
+        batch_size = x.shape[0]
+        
+        # Lookup mode embeddings based on mode values
+        # mode=0 -> full_noise_emb, mode=1 -> partial_noise_emb
+        mode_emb = torch.where(
+            mode.view(batch_size, 1) == 1,
+            self.partial_noise_emb.unsqueeze(0).expand(batch_size, -1),
+            self.full_noise_emb.unsqueeze(0).expand(batch_size, -1),
+        )  # (batch_size, d_model)
+        mode_token = mode_emb.unsqueeze(1)  # (batch_size, 1, d_model)
+        
         # Split into task token and grids
         task_token = x[:, :1, :]  # (batch_size, 1, d_model)
         input_grid = x[:, 1:26, :]  # (batch_size, 25, d_model)
@@ -885,13 +901,14 @@ class TransformerModel(nn.Module):
         input_grid = self.rope(input_grid)  # (batch_size, 25, d_model)
         output_grid = self.rope(output_grid)  # (batch_size, 25, d_model)
 
-        # Concatenate back together
-        x = torch.cat([task_token, input_grid, output_grid], dim=1)  # (batch_size, 51, d_model)
+        # Concatenate with mode token at the beginning
+        x = torch.cat([mode_token, task_token, input_grid, output_grid], dim=1)  # (batch_size, 52, d_model)
 
         # Apply transformer encoder
-        output = self.transformer_encoder(x)  # (batch_size, 51, d_model)
+        output = self.transformer_encoder(x)  # (batch_size, 52, d_model)
         
-        return output
+        # Return only the last 51 tokens (excluding mode token)
+        return output[:, 1:, :]  # (batch_size, 51, d_model)
 
 
 def optimize_output_grid(
@@ -937,13 +954,16 @@ def optimize_output_grid(
         # Model's forward will add RoPE and grid embeddings
         x = torch.cat([task_emb, input_grid, output_grid], dim=1)  # (batch_size, 51, d_model)
 
+        # Create mode tensor (1 = partial corruption for evaluation)
+        mode = torch.ones(batch_size, dtype=torch.long, device=device)
+
         # Track best result with lowest gradient norm
         best_grad_norm = torch.full((batch_size,), float("inf"), device=device)
         best_iteration = torch.zeros((batch_size,), dtype=torch.long, device=device)
         best_output = output_grid.clone()
 
         # Get initial gradient
-        grad = model(x)  # (batch_size, 51, d_model)
+        grad = model(x, mode)  # (batch_size, 51, d_model)
 
         for iteration in range(num_iterations):
             # Update only the output grid portion (last 25 tokens)
@@ -956,7 +976,7 @@ def optimize_output_grid(
             x = torch.cat([task_emb, input_grid, output_grid], dim=1)  # (batch_size, 51, d_model)
             
             # Get new gradient
-            grad = model(x)  # (batch_size, 51, d_model)
+            grad = model(x, mode)  # (batch_size, 51, d_model)
             
             # Calculate grad norm for all tokens and last 25 tokens for early stopping
             total_grad = grad  # (batch_size, 51, d_model)
@@ -1148,12 +1168,15 @@ def compute_loss_for_batch(
     mask = corrupt_only_output.view(batch_size, 1, 1)
     xg[:, :26, :] = torch.where(mask, x[:, :26, :], xg[:, :26, :])
 
+    # Create mode tensor: 1 for partial corruption, 0 for full corruption
+    mode = corrupt_only_output.long()  # (batch_size,)
+
     # Target is xg - x (the noise gradient)
     target = xg - x
 
     # Forward pass - model predicts the noise gradient
     # Model will add RoPE and grid embeddings internally
-    predicted = model(xg)  # (batch_size, 51, d_model)
+    predicted = model(xg, mode)  # (batch_size, 51, d_model)
 
     # Compute weighted MSE loss
     # Task token (position 0) has different weight than other tokens (positions 1-50)
