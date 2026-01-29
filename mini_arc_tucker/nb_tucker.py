@@ -31,7 +31,17 @@ class Config:
 
     # Model parameters
     task_embedding_dim: int
-    latent_dim: int
+    latent_dim: int  # Kept for compatibility, not used in new Tucker model
+    
+    # Tucker decomposition core tensor dimensions
+    core_dim_subject: int
+    core_dim_relation: int
+    core_dim_object: int
+    
+    # Task embedding 3D reshape dimensions
+    task_embedding_3d_dim1: int
+    task_embedding_3d_dim2: int
+    task_embedding_3d_dim3: int
 
     # Training parameters
     batch_size: int
@@ -677,31 +687,510 @@ def arc_collate_fn(batch: List[List[ARCTaskExample]]) -> List[ARCTaskExample]:
     return result
 
 
-class LinearAutoencoder(nn.Module):
-    """Linear denoising autoencoder for ARC tasks."""
+@dataclass
+class KnowledgeGraphDimensions:
+    """Dimensions for the knowledge graph tensor representation.
+    
+    Attributes:
+        num_cells: Number of cells (25 input + 25 output = 50)
+        num_integers: Number of integer subjects (0-9)
+        num_subjects: Total subjects = num_cells + num_integers
+        num_relations: Number of relation types
+        num_row_col_objects: Number of row/column objects (0-4)
+        num_color_objects: Number of color objects (0-9)
+        num_grid_type_objects: Number of grid type objects (input_grid, output_grid)
+        num_integer_objects: Number of integer objects for above/identity (0-9)
+        num_objects: Total objects
+    """
+    num_cells: int
+    num_integers: int
+    num_subjects: int
+    num_relations: int
+    num_row_col_objects: int
+    num_color_objects: int
+    num_grid_type_objects: int
+    num_integer_objects: int
+    num_objects: int
+
+
+# Subject indices:
+# - Cells 0-24: input grid cells (cell_0 to cell_24)
+# - Cells 25-49: output grid cells (cell_25 to cell_49)
+# - Integers 50-59: integer values 0-9
+
+# Relation indices:
+# 0: row
+# 1: column
+# 2: cell_value
+# 3: grid_type
+# 4: above
+# 5: identity
+
+# Object indices (organized into groups):
+# Row/Column objects (0-4): shared for rows and columns
+# Color objects (5-14): values 0-9 for cell_value relation
+# Grid type objects (15-16): input_grid, output_grid
+# Integer objects (17-26): values 0-9 for above/identity relations
+
+RELATION_ROW = 0
+RELATION_COLUMN = 1
+RELATION_CELL_VALUE = 2
+RELATION_GRID_TYPE = 3
+RELATION_ABOVE = 4
+RELATION_IDENTITY = 5
+
+NUM_RELATIONS = 6
+
+# Object group offsets
+OBJECT_ROW_COL_START = 0
+OBJECT_COLOR_START = 5
+OBJECT_GRID_TYPE_START = 15
+OBJECT_INTEGER_START = 17
+
+OBJECT_INPUT_GRID = OBJECT_GRID_TYPE_START + 0
+OBJECT_OUTPUT_GRID = OBJECT_GRID_TYPE_START + 1
+
+NUM_OBJECTS = 27  # 5 (row/col) + 10 (colors) + 2 (grid types) + 10 (integers)
+
+
+def get_knowledge_graph_dimensions() -> KnowledgeGraphDimensions:
+    """Get the dimensions for the knowledge graph tensor.
+    
+    Returns:
+        KnowledgeGraphDimensions with all dimension values
+    """
+    num_cells = 50  # 25 input + 25 output
+    num_integers = 10  # 0-9
+    num_subjects = num_cells + num_integers  # 60
+    num_relations = NUM_RELATIONS  # 6
+    num_row_col_objects = 5  # 0-4
+    num_color_objects = 10  # 0-9
+    num_grid_type_objects = 2  # input, output
+    num_integer_objects = 10  # 0-9
+    num_objects = NUM_OBJECTS  # 27
+    
+    return KnowledgeGraphDimensions(
+        num_cells=num_cells,
+        num_integers=num_integers,
+        num_subjects=num_subjects,
+        num_relations=num_relations,
+        num_row_col_objects=num_row_col_objects,
+        num_color_objects=num_color_objects,
+        num_grid_type_objects=num_grid_type_objects,
+        num_integer_objects=num_integer_objects,
+        num_objects=num_objects,
+    )
+
+
+def encode_arc_to_knowledge_graph(batch: torch.Tensor) -> torch.Tensor:
+    """Transform ARC task tokens into a knowledge graph binary tensor.
+    
+    Args:
+        batch: Tensor of shape (batch_size, 50) containing token values 0-9
+               First 25 are input grid, last 25 are output grid
+    
+    Returns:
+        Binary tensor of shape (batch_size, num_subjects, num_relations, num_objects)
+        where:
+        - num_subjects = 60 (50 cells + 10 integers)
+        - num_relations = 6 (row, column, cell_value, grid_type, above, identity)
+        - num_objects = 27 (5 row/col + 10 colors + 2 grid_types + 10 integers)
+    """
+    batch_size = batch.shape[0]
+    device = batch.device
+    dims = get_knowledge_graph_dimensions()
+    
+    # Initialize binary tensor
+    kg_tensor = torch.zeros(
+        batch_size, dims.num_subjects, dims.num_relations, dims.num_objects,
+        device=device, dtype=torch.float32
+    )
+    
+    # Process input grid cells (indices 0-24)
+    for cell_idx in range(25):
+        subject_idx = cell_idx
+        row = cell_idx // 5
+        col = cell_idx % 5
+        
+        # Row relation
+        kg_tensor[:, subject_idx, RELATION_ROW, OBJECT_ROW_COL_START + row] = 1.0
+        
+        # Column relation
+        kg_tensor[:, subject_idx, RELATION_COLUMN, OBJECT_ROW_COL_START + col] = 1.0
+        
+        # Cell value relation - depends on batch values
+        cell_values = batch[:, cell_idx]  # (batch_size,)
+        for b in range(batch_size):
+            color_obj = OBJECT_COLOR_START + cell_values[b].item()
+            kg_tensor[b, subject_idx, RELATION_CELL_VALUE, int(color_obj)] = 1.0
+        
+        # Grid type relation - input grid
+        kg_tensor[:, subject_idx, RELATION_GRID_TYPE, OBJECT_INPUT_GRID] = 1.0
+    
+    # Process output grid cells (indices 25-49)
+    for cell_idx in range(25, 50):
+        subject_idx = cell_idx
+        row = (cell_idx - 25) // 5
+        col = (cell_idx - 25) % 5
+        
+        # Row relation
+        kg_tensor[:, subject_idx, RELATION_ROW, OBJECT_ROW_COL_START + row] = 1.0
+        
+        # Column relation
+        kg_tensor[:, subject_idx, RELATION_COLUMN, OBJECT_ROW_COL_START + col] = 1.0
+        
+        # Cell value relation - depends on batch values
+        cell_values = batch[:, cell_idx]  # (batch_size,)
+        for b in range(batch_size):
+            color_obj = OBJECT_COLOR_START + cell_values[b].item()
+            kg_tensor[b, subject_idx, RELATION_CELL_VALUE, int(color_obj)] = 1.0
+        
+        # Grid type relation - output grid
+        kg_tensor[:, subject_idx, RELATION_GRID_TYPE, OBJECT_OUTPUT_GRID] = 1.0
+    
+    # Add integer subjects with above relations
+    # (1, above, 0), (2, above, 1), ..., (9, above, 8)
+    for i in range(1, 10):
+        subject_idx = 50 + i  # Integer subject
+        kg_tensor[:, subject_idx, RELATION_ABOVE, OBJECT_INTEGER_START + (i - 1)] = 1.0
+    
+    # Add integer subjects with identity relations
+    # (0, identity, 0), (1, identity, 1), ..., (9, identity, 9)
+    for i in range(10):
+        subject_idx = 50 + i  # Integer subject
+        kg_tensor[:, subject_idx, RELATION_IDENTITY, OBJECT_INTEGER_START + i] = 1.0
+    
+    return kg_tensor
+
+
+def encode_arc_to_knowledge_graph_vectorized(batch: torch.Tensor) -> torch.Tensor:
+    """Vectorized version: Transform ARC task tokens into a knowledge graph binary tensor.
+    
+    Args:
+        batch: Tensor of shape (batch_size, 50) containing token values 0-9
+               First 25 are input grid, last 25 are output grid
+    
+    Returns:
+        Binary tensor of shape (batch_size, num_subjects, num_relations, num_objects)
+    """
+    batch_size = batch.shape[0]
+    device = batch.device
+    dims = get_knowledge_graph_dimensions()
+    
+    # Initialize binary tensor
+    kg_tensor = torch.zeros(
+        batch_size, dims.num_subjects, dims.num_relations, dims.num_objects,
+        device=device, dtype=torch.float32
+    )
+    
+    # Create cell indices for input and output grids
+    input_cell_indices = torch.arange(25, device=device)
+    output_cell_indices = torch.arange(25, 50, device=device)
+    
+    # Compute rows and columns for input grid (5x5)
+    input_rows = input_cell_indices // 5
+    input_cols = input_cell_indices % 5
+    
+    # Compute rows and columns for output grid (5x5)
+    output_rows = (output_cell_indices - 25) // 5
+    output_cols = (output_cell_indices - 25) % 5
+    
+    # Set row relations for all cells
+    kg_tensor[:, input_cell_indices, RELATION_ROW, OBJECT_ROW_COL_START + input_rows] = 1.0
+    kg_tensor[:, output_cell_indices, RELATION_ROW, OBJECT_ROW_COL_START + output_rows] = 1.0
+    
+    # Set column relations for all cells
+    kg_tensor[:, input_cell_indices, RELATION_COLUMN, OBJECT_ROW_COL_START + input_cols] = 1.0
+    kg_tensor[:, output_cell_indices, RELATION_COLUMN, OBJECT_ROW_COL_START + output_cols] = 1.0
+    
+    # Set cell_value relations - use scatter for batch-wise setting
+    batch_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, 50)  # (batch_size, 50)
+    cell_indices = torch.arange(50, device=device).unsqueeze(0).expand(batch_size, -1)  # (batch_size, 50)
+    color_objects = OBJECT_COLOR_START + batch  # (batch_size, 50)
+    
+    kg_tensor[batch_indices, cell_indices, RELATION_CELL_VALUE, color_objects] = 1.0
+    
+    # Set grid type relations
+    kg_tensor[:, :25, RELATION_GRID_TYPE, OBJECT_INPUT_GRID] = 1.0
+    kg_tensor[:, 25:50, RELATION_GRID_TYPE, OBJECT_OUTPUT_GRID] = 1.0
+    
+    # Add integer subjects with above relations
+    # (1, above, 0), (2, above, 1), ..., (9, above, 8)
+    integer_above_subjects = torch.arange(51, 60, device=device)  # Integers 1-9
+    integer_above_objects = torch.arange(OBJECT_INTEGER_START, OBJECT_INTEGER_START + 9, device=device)
+    kg_tensor[:, integer_above_subjects, RELATION_ABOVE, integer_above_objects] = 1.0
+    
+    # Add integer subjects with identity relations
+    # (0, identity, 0), (1, identity, 1), ..., (9, identity, 9)
+    integer_identity_subjects = torch.arange(50, 60, device=device)  # Integers 0-9
+    integer_identity_objects = torch.arange(OBJECT_INTEGER_START, OBJECT_INTEGER_START + 10, device=device)
+    kg_tensor[:, integer_identity_subjects, RELATION_IDENTITY, integer_identity_objects] = 1.0
+    
+    return kg_tensor
+
+
+def decode_knowledge_graph_to_triples(kg_tensor: torch.Tensor) -> List[List[Tuple[str, str, str]]]:
+    """Decode a knowledge graph tensor back to (subject, relation, object) triples.
+    
+    Args:
+        kg_tensor: Binary tensor of shape (batch_size, num_subjects, num_relations, num_objects)
+    
+    Returns:
+        List of lists of tuples, one list per batch element, each tuple is (subject, relation, object)
+    """
+    batch_size = kg_tensor.shape[0]
+    dims = get_knowledge_graph_dimensions()
+    
+    # Relation names
+    relation_names = ["row", "column", "cell_value", "grid_type", "above", "identity"]
+    
+    result = []
+    for b in range(batch_size):
+        triples = []
+        
+        # Find all non-zero entries
+        non_zero = torch.nonzero(kg_tensor[b] > 0.5, as_tuple=False)
+        
+        for entry in non_zero:
+            subject_idx = entry[0].item()
+            relation_idx = entry[1].item()
+            object_idx = entry[2].item()
+            
+            # Decode subject
+            if subject_idx < 50:
+                subject = f"cell_{subject_idx}"
+            else:
+                subject = f"int_{subject_idx - 50}"
+            
+            # Decode relation
+            relation = relation_names[int(relation_idx)]
+            
+            # Decode object based on relation type
+            if relation_idx in [RELATION_ROW, RELATION_COLUMN]:
+                obj = str(object_idx - OBJECT_ROW_COL_START)
+            elif relation_idx == RELATION_CELL_VALUE:
+                obj = f"color_{object_idx - OBJECT_COLOR_START}"
+            elif relation_idx == RELATION_GRID_TYPE:
+                if object_idx == OBJECT_INPUT_GRID:
+                    obj = "input_grid"
+                else:
+                    obj = "output_grid"
+            elif relation_idx in [RELATION_ABOVE, RELATION_IDENTITY]:
+                obj = str(object_idx - OBJECT_INTEGER_START)
+            else:
+                obj = f"obj_{object_idx}"
+            
+            triples.append((subject, relation, obj))
+        
+        result.append(triples)
+    
+    return result
+
+
+def mask_output_grid_relations(
+    kg_tensor: torch.Tensor,
+    cell_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Mask all relations for specified output grid cells.
+    
+    Args:
+        kg_tensor: Binary tensor of shape (batch_size, num_subjects, num_relations, num_objects)
+        cell_mask: Boolean tensor of shape (batch_size, 25) indicating which output cells to mask
+    
+    Returns:
+        Masked tensor with specified output cell relations set to 0
+    """
+    masked = kg_tensor.clone()
+    batch_size = kg_tensor.shape[0]
+    
+    # Output cells are subjects 25-49
+    for b in range(batch_size):
+        for cell_offset in range(25):
+            if cell_mask[b, cell_offset]:
+                subject_idx = 25 + cell_offset  # Output grid cell index
+                masked[b, subject_idx, :, :] = 0.0
+    
+    return masked
+
+
+def mask_output_grid_relations_vectorized(
+    kg_tensor: torch.Tensor,
+    cell_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Vectorized: Mask all relations for specified output grid cells.
+    
+    Args:
+        kg_tensor: Binary tensor of shape (batch_size, num_subjects, num_relations, num_objects)
+        cell_mask: Boolean tensor of shape (batch_size, 25) indicating which output cells to mask
+    
+    Returns:
+        Masked tensor with specified output cell relations set to 0
+    """
+    masked = kg_tensor.clone()
+    
+    # Expand mask to cover all relations and objects
+    # cell_mask: (batch_size, 25) -> (batch_size, 25, num_relations, num_objects)
+    expanded_mask = cell_mask.unsqueeze(-1).unsqueeze(-1).expand_as(masked[:, 25:50, :, :])
+    
+    # Apply mask to output grid cells (subjects 25-49)
+    masked[:, 25:50, :, :] = masked[:, 25:50, :, :] * (~expanded_mask).float()
+    
+    return masked
+
+
+def get_output_cell_subject_indices() -> torch.Tensor:
+    """Get subject indices for output grid cells.
+    
+    Returns:
+        Tensor of shape (25,) with indices 25-49
+    """
+    return torch.arange(25, 50)
+
+
+def reshape_task_embedding_to_3d(
+    task_embedding: torch.Tensor,
+    target_shape: Tuple[int, int, int],
+) -> torch.Tensor:
+    """Reshape task embedding into a small rank-3 tensor with padding.
+    
+    Args:
+        task_embedding: Tensor of shape (batch_size, embedding_dim)
+        target_shape: Tuple of (dim1, dim2, dim3) for the reshaped tensor
+    
+    Returns:
+        Tensor of shape (batch_size, dim1, dim2, dim3) with embedding reshaped and padded
+    
+    Raises:
+        AssertionError: If embedding would be truncated (product of target dims < embedding_dim)
+    """
+    batch_size = task_embedding.shape[0]
+    embedding_dim = task_embedding.shape[1]
+    target_size = target_shape[0] * target_shape[1] * target_shape[2]
+    
+    # Assert that we don't truncate
+    assert target_size >= embedding_dim, (
+        f"Target size {target_size} is smaller than embedding dim {embedding_dim}. "
+        "Task embedding would be truncated."
+    )
+    
+    # Pad embedding with zeros to match target size
+    padded = torch.zeros(batch_size, target_size, device=task_embedding.device, dtype=task_embedding.dtype)
+    padded[:, :embedding_dim] = task_embedding
+    
+    # Reshape to 3D
+    reshaped = padded.view(batch_size, target_shape[0], target_shape[1], target_shape[2])
+    
+    return reshaped
+
+
+def concatenate_kg_and_task_embedding(
+    kg_tensor: torch.Tensor,
+    task_embedding_3d: torch.Tensor,
+) -> torch.Tensor:
+    """Concatenate knowledge graph tensor with reshaped task embedding.
+    
+    The task embedding is concatenated along all three dimensions of the KG tensor.
+    
+    Args:
+        kg_tensor: Binary tensor of shape (batch_size, num_subjects, num_relations, num_objects)
+        task_embedding_3d: Tensor of shape (batch_size, te_dim1, te_dim2, te_dim3)
+    
+    Returns:
+        Tensor of shape (batch_size, 
+                        num_subjects + te_dim1, 
+                        num_relations + te_dim2, 
+                        num_objects + te_dim3)
+    """
+    batch_size = kg_tensor.shape[0]
+    kg_s, kg_r, kg_o = kg_tensor.shape[1], kg_tensor.shape[2], kg_tensor.shape[3]
+    te_s, te_r, te_o = task_embedding_3d.shape[1], task_embedding_3d.shape[2], task_embedding_3d.shape[3]
+    
+    device = kg_tensor.device
+    dtype = kg_tensor.dtype
+    
+    # Create output tensor
+    out_s = kg_s + te_s
+    out_r = kg_r + te_r
+    out_o = kg_o + te_o
+    
+    output = torch.zeros(batch_size, out_s, out_r, out_o, device=device, dtype=dtype)
+    
+    # Place KG tensor in the first part
+    output[:, :kg_s, :kg_r, :kg_o] = kg_tensor
+    
+    # Place task embedding in the extended part
+    output[:, kg_s:, kg_r:, kg_o:] = task_embedding_3d
+    
+    return output
+
+
+def extract_kg_and_task_embedding(
+    combined_tensor: torch.Tensor,
+    kg_shape: Tuple[int, int, int],
+    te_shape: Tuple[int, int, int],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Extract knowledge graph tensor and task embedding from combined tensor.
+    
+    Args:
+        combined_tensor: Tensor of shape (batch_size, kg_s + te_s, kg_r + te_r, kg_o + te_o)
+        kg_shape: Tuple of (kg_subjects, kg_relations, kg_objects)
+        te_shape: Tuple of (te_dim1, te_dim2, te_dim3)
+    
+    Returns:
+        Tuple of (kg_tensor, task_embedding_3d)
+    """
+    kg_s, kg_r, kg_o = kg_shape
+    
+    kg_tensor = combined_tensor[:, :kg_s, :kg_r, :kg_o]
+    task_embedding_3d = combined_tensor[:, kg_s:, kg_r:, kg_o:]
+    
+    return kg_tensor, task_embedding_3d
+
+
+class TuckerAutoencoder(nn.Module):
+    """Tucker decomposition autoencoder for ARC knowledge graph tensors."""
 
     def __init__(
         self,
         task_embedding_dim: int,
         vocab_size: int,
         num_tasks: int,
-        latent_dim: int,
+        core_dim_subject: int,
+        core_dim_relation: int,
+        core_dim_object: int,
+        task_embedding_3d_shape: Tuple[int, int, int],
     ):
-        """Initialize the linear autoencoder.
+        """Initialize the Tucker autoencoder.
 
         Args:
             task_embedding_dim: Dimension of task embeddings
             vocab_size: Number of possible cell values (10 for ARC: 0-9 colors)
             num_tasks: Number of unique tasks for task embedding
-            latent_dim: Dimension of the autoencoder latent space
+            core_dim_subject: Dimension of core tensor along subject axis
+            core_dim_relation: Dimension of core tensor along relation axis
+            core_dim_object: Dimension of core tensor along object axis
+            task_embedding_3d_shape: Shape for 3D task embedding (dim1, dim2, dim3)
         """
         super().__init__()
 
-        # Store dimensions for later use
+        # Store dimensions
         self.vocab_size = vocab_size
         self.task_embedding_dim = task_embedding_dim
-        self.latent_dim = latent_dim
-        self.input_dim = task_embedding_dim + 50 * vocab_size  # task embedding + one-hot grids
+        self.core_dim_subject = core_dim_subject
+        self.core_dim_relation = core_dim_relation
+        self.core_dim_object = core_dim_object
+        self.task_embedding_3d_shape = task_embedding_3d_shape
+        
+        # Knowledge graph dimensions
+        kg_dims = get_knowledge_graph_dimensions()
+        self.kg_num_subjects = kg_dims.num_subjects
+        self.kg_num_relations = kg_dims.num_relations
+        self.kg_num_objects = kg_dims.num_objects
+        
+        # Combined dimensions (KG + task embedding 3D)
+        self.total_subjects = self.kg_num_subjects + task_embedding_3d_shape[0]
+        self.total_relations = self.kg_num_relations + task_embedding_3d_shape[1]
+        self.total_objects = self.kg_num_objects + task_embedding_3d_shape[2]
 
         # Task embedding layer
         self.task_embedding = nn.Embedding(num_tasks, task_embedding_dim)
@@ -710,44 +1199,83 @@ class LinearAutoencoder(nn.Module):
         with torch.no_grad():
             self.task_embedding.weight.data.normal_(mean=0.0, std=0.01)
 
-        # Encoder: input_dim -> latent_dim (no bias)
-        self.encoder = nn.Linear(self.input_dim, latent_dim, bias=False)
+        # Encoder factor matrices (no bias)
+        # These project each mode to the core tensor dimensions
+        self.encoder_subject = nn.Linear(self.total_subjects, core_dim_subject, bias=False)
+        self.encoder_relation = nn.Linear(self.total_relations, core_dim_relation, bias=False)
+        self.encoder_object = nn.Linear(self.total_objects, core_dim_object, bias=False)
         
-        # Decoder: latent_dim -> input_dim (no bias, separate from encoder)
-        self.decoder = nn.Linear(latent_dim, self.input_dim, bias=False)
+        # Decoder factor matrices (no bias)
+        # These project from core tensor dimensions back to original dimensions
+        self.decoder_subject = nn.Linear(core_dim_subject, self.total_subjects, bias=False)
+        self.decoder_relation = nn.Linear(core_dim_relation, self.total_relations, bias=False)
+        self.decoder_object = nn.Linear(core_dim_object, self.total_objects, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode input tensor to core tensor using Tucker decomposition.
 
         Args:
-            x: Input tensor of shape (batch_size, task_embedding_dim + 500)
-               Concatenation of task embedding and one-hot encoded grids
+            x: Input tensor of shape (batch_size, total_subjects, total_relations, total_objects)
 
         Returns:
-            Tensor of shape (batch_size, task_embedding_dim + 500) - denoised reconstruction
+            Core tensor of shape (batch_size, core_dim_subject, core_dim_relation, core_dim_object)
         """
-        # Encode to latent space
-        z = self.encoder(x)  # (batch_size, latent_dim)
+        # Apply factor matrices using einsum
+        # x: (batch, S, R, O) -> (batch, core_S, R, O)
+        z = torch.einsum('bsro,cs->bcro', x, self.encoder_subject.weight)
+        # z: (batch, core_S, R, O) -> (batch, core_S, core_R, O)
+        z = torch.einsum('bcro,dr->bcdo', z, self.encoder_relation.weight)
+        # z: (batch, core_S, core_R, O) -> (batch, core_S, core_R, core_O)
+        z = torch.einsum('bcdo,eo->bcde', z, self.encoder_object.weight)
+        
+        return z
 
-        # Decode back to input space using separate decoder
-        output = self.decoder(z)  # (batch_size, task_embedding_dim + 500)
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        """Decode core tensor back to original tensor space.
 
+        Args:
+            z: Core tensor of shape (batch_size, core_dim_subject, core_dim_relation, core_dim_object)
+
+        Returns:
+            Reconstructed tensor of shape (batch_size, total_subjects, total_relations, total_objects)
+        """
+        # Apply decoder factor matrices using einsum
+        # z: (batch, core_S, core_R, core_O) -> (batch, S, core_R, core_O)
+        x = torch.einsum('bcde,sc->bsde', z, self.decoder_subject.weight)
+        # x: (batch, S, core_R, core_O) -> (batch, S, R, core_O)
+        x = torch.einsum('bsde,rd->bsre', x, self.decoder_relation.weight)
+        # x: (batch, S, R, core_O) -> (batch, S, R, O)
+        x = torch.einsum('bsre,oe->bsro', x, self.decoder_object.weight)
+        
+        return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the Tucker autoencoder.
+
+        Args:
+            x: Input tensor of shape (batch_size, total_subjects, total_relations, total_objects)
+
+        Returns:
+            Reconstructed tensor of shape (batch_size, total_subjects, total_relations, total_objects)
+        """
+        z = self.encode(x)
+        output = self.decode(z)
         return output
 
 
 def optimize_output_grid(
-    model: LinearAutoencoder,
+    model: TuckerAutoencoder,
     batch: torch.Tensor,
     task_indices: torch.Tensor,
     num_iterations: int,
 ) -> DenoisingResult:
-    """Optimize the output grid by iteratively denoising with the autoencoder.
+    """Optimize the output grid by iteratively denoising with the Tucker autoencoder.
 
-    Initializes output grid as random gaussian noise and iteratively
-    replaces the last 250 dimensions (25 tokens * 10 one-hot) with the model's output.
+    Initializes output grid relations to zero and iteratively
+    updates them based on model output.
 
     Args:
-        model: The linear autoencoder to use for denoising
+        model: The Tucker autoencoder to use for denoising
         batch: Input tensor of shape (batch_size, 50) - clean tokens for input and output grids
         task_indices: Task indices of shape (batch_size,)
         num_iterations: Number of optimization iterations
@@ -757,41 +1285,46 @@ def optimize_output_grid(
     """
     batch_size = batch.shape[0]
     vocab_size = model.vocab_size
-    task_emb_dim = model.task_embedding_dim
     device = batch.device
 
     with torch.no_grad():
-        # Lookup task embedding (stays fixed during optimization)
+        # Encode full batch to knowledge graph (with actual output values)
+        kg_tensor_full = encode_arc_to_knowledge_graph_vectorized(batch)
+        
+        # Mask all output grid cells (subjects 25-49)
+        all_output_mask = torch.ones(batch_size, 25, dtype=torch.bool, device=device)
+        kg_tensor = mask_output_grid_relations_vectorized(kg_tensor_full, all_output_mask)
+        
+        # Lookup task embedding and reshape to 3D
         task_emb = model.task_embedding(task_indices)  # (batch_size, task_embedding_dim)
-
-        # One-hot encode input grid (first 25 tokens) - stays fixed
-        input_tokens = batch[:, :25]  # (batch_size, 25)
-        input_grid_onehot = torch.nn.functional.one_hot(input_tokens, num_classes=vocab_size).float()  # (batch_size, 25, 10)
-        input_grid_flat = input_grid_onehot.view(batch_size, -1)  # (batch_size, 250)
-
-        # Initialize output grid as random gaussian noise
-        output_grid_flat = torch.randn(batch_size, 250, device=device)  # (batch_size, 250)
-
+        task_emb_3d = reshape_task_embedding_to_3d(task_emb, model.task_embedding_3d_shape)
+        
+        # Combine KG and task embedding
+        x = concatenate_kg_and_task_embedding(kg_tensor, task_emb_3d)
+        
         # Track best result with lowest change between iterations
         best_change = torch.full((batch_size,), float("inf"), device=device)
         best_iteration = torch.zeros((batch_size,), dtype=torch.long, device=device)
-        best_output = output_grid_flat.clone()
+        best_kg_output = kg_tensor.clone()
 
         for iteration in range(num_iterations):
-            # Concatenate: task embedding, input grid, output grid
-            x = torch.cat([task_emb, input_grid_flat, output_grid_flat], dim=1)  # (batch_size, task_emb_dim + 500)
-
             # Get model's denoised output
-            denoised = model(x)  # (batch_size, task_emb_dim + 500)
-
-            # Extract the denoised output grid (last 250 dimensions)
-            new_output_grid = denoised[:, -250:]  # (batch_size, 250)
-
-            # Calculate MSE change from previous output grid
-            change_per_sample = (new_output_grid - output_grid_flat).pow(2).mean(dim=1)  # (batch_size,)
+            denoised = model(x)  # (batch_size, total_S, total_R, total_O)
+            
+            # Extract KG part from denoised output
+            denoised_kg, _ = extract_kg_and_task_embedding(
+                denoised,
+                kg_shape=(model.kg_num_subjects, model.kg_num_relations, model.kg_num_objects),
+                te_shape=model.task_embedding_3d_shape,
+            )
+            
+            # Calculate MSE change in output grid region (subjects 25-49)
+            new_output_relations = denoised_kg[:, 25:50, :, :]
+            old_output_relations = kg_tensor[:, 25:50, :, :]
+            change_per_sample = (new_output_relations - old_output_relations).pow(2).mean(dim=(1, 2, 3))
 
             # Update best result if current change is lower (more stable)
-            improved_mask = change_per_sample < best_change  # (batch_size,)
+            improved_mask = change_per_sample < best_change
 
             best_change = torch.where(improved_mask, change_per_sample, best_change)
             best_iteration = torch.where(
@@ -800,17 +1333,25 @@ def optimize_output_grid(
                 best_iteration,
             )
 
-            # Update best_output for improved samples
-            improved_mask_expanded = improved_mask.view(batch_size, 1).expand_as(new_output_grid)
-            best_output = torch.where(improved_mask_expanded, new_output_grid, best_output)
+            # Update best_kg_output for improved samples
+            for b in range(batch_size):
+                if improved_mask[b]:
+                    best_kg_output[b] = denoised_kg[b]
 
-            # Update output grid to model's output for next iteration
-            output_grid_flat = new_output_grid
+            # Update kg_tensor with denoised output for next iteration
+            kg_tensor = denoised_kg.clone()
+            
+            # Keep input grid fixed (subjects 0-24 from original)
+            kg_tensor[:, :25, :, :] = kg_tensor_full[:, :25, :, :]
+            
+            # Reconstruct combined tensor for next iteration
+            x = concatenate_kg_and_task_embedding(kg_tensor, task_emb_3d)
 
-        # Decode the best output to token values using argmax
-        # Reshape to (batch_size, 25, 10) and take argmax
-        best_output_reshaped = best_output.view(batch_size, 25, vocab_size)  # (batch_size, 25, 10)
-        decoded_tokens = best_output_reshaped.argmax(dim=-1)  # (batch_size, 25)
+        # Decode output grid cell values from best_kg_output
+        # For each output cell (subjects 25-49), look at cell_value relation
+        # and find which color object is highest
+        output_cell_values = best_kg_output[:, 25:50, 2, OBJECT_COLOR_START:OBJECT_COLOR_START + 10]  # (batch_size, 25, 10)
+        decoded_tokens = output_cell_values.argmax(dim=-1)  # (batch_size, 25)
 
     return DenoisingResult(
         optimized_output_tokens=decoded_tokens,
@@ -847,15 +1388,15 @@ def decode_grids(tokens: torch.Tensor, vocab_size: int) -> torch.Tensor:
 
 
 def evaluate_denoising_accuracy(
-    model: LinearAutoencoder,
+    model: TuckerAutoencoder,
     x_clean: torch.Tensor,
     task_indices: torch.Tensor,
     num_iterations: int,
 ) -> DenoisingResult:
-    """Evaluate denoising accuracy by denoising output grids from random initialization.
+    """Evaluate denoising accuracy by denoising output grids from zero initialization.
 
     Args:
-        model: The transformer model to use for denoising
+        model: The Tucker autoencoder model
         x_clean: Clean input tensor of shape (batch_size, 50) - tokens
         task_indices: Task indices of shape (batch_size,)
         num_iterations: Number of optimization iterations
@@ -865,7 +1406,7 @@ def evaluate_denoising_accuracy(
     """
     vocab_size = model.vocab_size
 
-    # Perform optimization to denoise (output grid initialized as random gaussian noise)
+    # Perform optimization to denoise (output grid initialized as zero)
     opt_result = optimize_output_grid(
         model=model,
         batch=x_clean,
@@ -898,19 +1439,18 @@ def evaluate_denoising_accuracy(
 
 
 def compute_loss_for_batch(
-    model: LinearAutoencoder,
+    model: TuckerAutoencoder,
     batch: torch.Tensor,
     task_indices: torch.Tensor,
     device: torch.device,
 ) -> torch.Tensor:
-    """Compute loss for a single batch using denoising autoencoder.
+    """Compute loss for a single batch using Tucker denoising autoencoder.
 
-    Looks up task embeddings and one-hot encodes grid tokens, randomly corrupts 0-25 tokens in the
-    output grid (last 250 dimensions) with gaussian noise, and trains the model to
-    reconstruct the clean input.
+    Encodes ARC task to knowledge graph tensor, randomly masks 0-25 output grid cells,
+    and trains the model to reconstruct the clean knowledge graph.
 
     Args:
-        model: The linear autoencoder
+        model: The Tucker autoencoder
         batch: Batch of tokens, shape (batch_size, 50)
         task_indices: Task indices of shape (batch_size,)
         device: Device to compute on
@@ -921,48 +1461,32 @@ def compute_loss_for_batch(
     batch = batch.to(device)  # (batch_size, 50)
     task_indices = task_indices.to(device)  # (batch_size,)
     batch_size = batch.shape[0]
-    vocab_size = model.vocab_size
 
-    # Lookup task embeddings
+    # Encode to knowledge graph tensor
+    kg_tensor_clean = encode_arc_to_knowledge_graph_vectorized(batch)  # (batch_size, 60, 6, 27)
+
+    # Lookup task embeddings and reshape to 3D
     task_emb = model.task_embedding(task_indices)  # (batch_size, task_embedding_dim)
+    task_emb_3d = reshape_task_embedding_to_3d(task_emb, model.task_embedding_3d_shape)
+    
+    # Combine KG and task embedding for clean target
+    x_clean = concatenate_kg_and_task_embedding(kg_tensor_clean, task_emb_3d)
 
-    # One-hot encode all tokens (input and output grids)
-    tokens_onehot = torch.nn.functional.one_hot(batch, num_classes=vocab_size).float()  # (batch_size, 50, 10)
-    tokens_flat = tokens_onehot.view(batch_size, -1)  # (batch_size, 500)
-
-    # Concatenate: task embedding, one-hot tokens
-    x_clean = torch.cat([task_emb, tokens_flat], dim=1)  # (batch_size, task_embedding_dim + 500)
-
-    # Randomly pick 0-25 tokens to corrupt in the output grid (last 250 dimensions)
-    num_tokens_to_corrupt = torch.randint(0, 26, (batch_size,), device=device)  # (batch_size,)
-
-    # Create corrupted version
-    x_corrupted = x_clean.clone()
-
-    # Vectorized corruption: create mask for which tokens to corrupt
-    # Generate random values to determine which tokens to corrupt (batch_size, 25)
+    # Randomly pick 0-25 output cells to mask
+    num_cells_to_mask = torch.randint(0, 26, (batch_size,), device=device)  # (batch_size,)
+    
+    # Create mask for output cells (batch_size, 25)
     rand_values = torch.rand(batch_size, 25, device=device)
+    cell_mask = rand_values.argsort(dim=1) < num_cells_to_mask.unsqueeze(1)
     
-    # Corrupt the tokens with the smallest random values (batch_size, 25)
-    corruption_mask = rand_values.argsort(dim=1) < num_tokens_to_corrupt.unsqueeze(1)
+    # Mask output grid cells
+    kg_tensor_masked = mask_output_grid_relations_vectorized(kg_tensor_clean, cell_mask)
     
-    # Generate gaussian noise for output tokens (batch_size, 25, 10)
-    noise = torch.randn(batch_size, 25, vocab_size, device=device)
-    noise_flat = noise.view(batch_size, 250)  # (batch_size, 250)
-    
-    # Apply corruption to output grid (last 250 dimensions)
-    # Expand mask to match the one-hot dimensions: (batch_size, 25) -> (batch_size, 250)
-    corruption_mask_expanded = corruption_mask.unsqueeze(-1).expand(-1, -1, vocab_size).reshape(batch_size, 250)
-    
-    output_start_idx = model.task_embedding_dim + 250  # After task embedding and input grid
-    x_corrupted[:, output_start_idx:] = torch.where(
-        corruption_mask_expanded,
-        noise_flat,
-        x_corrupted[:, output_start_idx:]
-    )
+    # Combine masked KG and task embedding
+    x_masked = concatenate_kg_and_task_embedding(kg_tensor_masked, task_emb_3d)
 
     # Forward pass - model outputs denoised reconstruction
-    predicted = model(x_corrupted)  # (batch_size, task_embedding_dim + 500)
+    predicted = model(x_masked)
 
     # Compute reconstruction MSE loss
     reconstruction_loss = (predicted - x_clean).pow(2).mean()
@@ -971,7 +1495,7 @@ def compute_loss_for_batch(
 
 
 def train_epoch(
-    model: LinearAutoencoder,
+    model: TuckerAutoencoder,
     train_loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
@@ -980,7 +1504,7 @@ def train_epoch(
     """Train for one epoch.
 
     Args:
-        model: The transformer model
+        model: The Tucker autoencoder model
         train_loader: Training data loader
         optimizer: Optimizer
         device: Device to train on
@@ -1024,7 +1548,7 @@ def train_epoch(
 
 
 def test_epoch(
-    model: LinearAutoencoder,
+    model: TuckerAutoencoder,
     test_loader: DataLoader,
     device: torch.device,
     task_id_to_index: Dict[str, int],
@@ -1032,7 +1556,7 @@ def test_epoch(
     """Evaluate on test set.
 
     Args:
-        model: The transformer model
+        model: The Tucker autoencoder model
         test_loader: Test data loader
         device: Device to evaluate on
         task_id_to_index: Mapping from task_id strings to integer indices
@@ -1070,7 +1594,7 @@ def test_epoch(
 
 
 def learning_rate_test(
-    model: LinearAutoencoder,
+    model: TuckerAutoencoder,
     train_loader: DataLoader,
     device: torch.device,
     weight_decay: float,
@@ -1079,7 +1603,7 @@ def learning_rate_test(
     """Test learning rate by starting at 1e-7 and doubling every batch.
 
     Args:
-        model: The transformer model
+        model: The Tucker autoencoder model
         train_loader: Training data loader
         device: Device to train on
         weight_decay: Weight decay parameter
@@ -1112,7 +1636,7 @@ def learning_rate_test(
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
 
         # Compute loss
-        loss, _, _ = compute_loss_for_batch(model, batch, task_indices, device)
+        loss = compute_loss_for_batch(model, batch, task_indices, device)
 
         # Backward pass
         opt.zero_grad()
@@ -1131,7 +1655,7 @@ def learning_rate_test(
 
 
 def weight_decay_test(
-    model: LinearAutoencoder,
+    model: TuckerAutoencoder,
     train_loader: DataLoader,
     device: torch.device,
     learning_rate: float,
@@ -1140,7 +1664,7 @@ def weight_decay_test(
     """Test weight decay by starting at 1e-7 and doubling every batch.
 
     Args:
-        model: The transformer model
+        model: The Tucker autoencoder model
         train_loader: Training data loader
         device: Device to train on
         learning_rate: Learning rate parameter
@@ -1189,19 +1713,19 @@ def weight_decay_test(
 
 
 def evaluate_denoising(
-    model: LinearAutoencoder,
+    model: TuckerAutoencoder,
     train_loader: DataLoader,
     test_loader: DataLoader,
     device: torch.device,
     eval_denoise_num_iterations: int,
     task_id_to_index: Dict[str, int],
-    writer: Optional[SummaryWriter] = None,
-    epoch: Optional[int] = None,
+    writer: Optional[SummaryWriter],
+    epoch: Optional[int],
 ) -> Tuple[float, float]:
     """Evaluate denoising accuracy on all tasks.
 
     Args:
-        model: The transformer model
+        model: The Tucker autoencoder model
         train_loader: Training dataloader
         test_loader: Test dataloader
         device: Device to evaluate on
@@ -1440,17 +1964,34 @@ def train(config: Config):
         collate_fn=arc_collate_fn,
     )
 
+    # Task embedding 3D shape for combining with knowledge graph
+    task_embedding_3d_shape = (
+        config.task_embedding_3d_dim1,
+        config.task_embedding_3d_dim2,
+        config.task_embedding_3d_dim3,
+    )
+    
+    # Assert task embedding is not truncated
+    task_embedding_3d_size = task_embedding_3d_shape[0] * task_embedding_3d_shape[1] * task_embedding_3d_shape[2]
+    assert task_embedding_3d_size >= config.task_embedding_dim, (
+        f"Task embedding 3D size {task_embedding_3d_size} is smaller than task_embedding_dim {config.task_embedding_dim}. "
+        "Task embedding would be truncated."
+    )
+
     # Create model
-    model = LinearAutoencoder(
+    model = TuckerAutoencoder(
         task_embedding_dim=config.task_embedding_dim,
         vocab_size=config.vocab_size,
         num_tasks=num_tasks,
-        latent_dim=config.latent_dim,
+        core_dim_subject=config.core_dim_subject,
+        core_dim_relation=config.core_dim_relation,
+        core_dim_object=config.core_dim_object,
+        task_embedding_3d_shape=task_embedding_3d_shape,
     ).to(device)
 
     # Compile model for better performance (PyTorch 2.0+)
     print("Compiling model with torch.compile...")
-    model = cast(LinearAutoencoder, torch.compile(model))
+    model = cast(TuckerAutoencoder, torch.compile(model))
 
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1527,6 +2068,8 @@ def train(config: Config):
             device=device,
             eval_denoise_num_iterations=config.eval_denoise_num_iterations,
             task_id_to_index=task_id_to_index,
+            writer=None,
+            epoch=None,
         )
         return
 
@@ -1559,8 +2102,9 @@ def train(config: Config):
 
         # Calculate layer-wise mean square
         task_emb_mean_sq = model.task_embedding.weight.pow(2).mean().item()
-        encoder_mean_sq = model.encoder.weight.pow(2).mean().item()
-        decoder_mean_sq = model.decoder.weight.pow(2).mean().item()
+        encoder_subject_mean_sq = model.encoder_subject.weight.pow(2).mean().item()
+        encoder_relation_mean_sq = model.encoder_relation.weight.pow(2).mean().item()
+        encoder_object_mean_sq = model.encoder_object.weight.pow(2).mean().item()
 
         # Log to console
         print(
@@ -1572,8 +2116,9 @@ def train(config: Config):
         print(
             f"  Layer Mean Squares - "
             f"Task Emb: {task_emb_mean_sq:.6f}, "
-            f"Encoder: {encoder_mean_sq:.6f}, "
-            f"Decoder: {decoder_mean_sq:.6f}"
+            f"Enc Subj: {encoder_subject_mean_sq:.6f}, "
+            f"Enc Rel: {encoder_relation_mean_sq:.6f}, "
+            f"Enc Obj: {encoder_object_mean_sq:.6f}"
         )
 
         # Log to tensorboard
@@ -1584,8 +2129,9 @@ def train(config: Config):
         
         # Log layer-wise mean squares
         writer.add_scalar("LayerMeanSquare/task_embedding", task_emb_mean_sq, epoch)
-        writer.add_scalar("LayerMeanSquare/encoder", encoder_mean_sq, epoch)
-        writer.add_scalar("LayerMeanSquare/decoder", decoder_mean_sq, epoch)
+        writer.add_scalar("LayerMeanSquare/encoder_subject", encoder_subject_mean_sq, epoch)
+        writer.add_scalar("LayerMeanSquare/encoder_relation", encoder_relation_mean_sq, epoch)
+        writer.add_scalar("LayerMeanSquare/encoder_object", encoder_object_mean_sq, epoch)
 
         # Evaluate denoising accuracy periodically
         if (epoch + 1) % config.eval_denoise_epoch_interval == 0:
@@ -1635,7 +2181,12 @@ def train(config: Config):
                     "config": {
                         "task_embedding_dim": config.task_embedding_dim,
                         "vocab_size": config.vocab_size,
-                        "latent_dim": config.latent_dim,
+                        "core_dim_subject": config.core_dim_subject,
+                        "core_dim_relation": config.core_dim_relation,
+                        "core_dim_object": config.core_dim_object,
+                        "task_embedding_3d_dim1": config.task_embedding_3d_dim1,
+                        "task_embedding_3d_dim2": config.task_embedding_3d_dim2,
+                        "task_embedding_3d_dim3": config.task_embedding_3d_dim3,
                     },
                 },
                 checkpoint_path,
@@ -1660,7 +2211,12 @@ def train(config: Config):
             "config": {
                 "task_embedding_dim": config.task_embedding_dim,
                 "vocab_size": config.vocab_size,
-                "latent_dim": config.latent_dim,
+                "core_dim_subject": config.core_dim_subject,
+                "core_dim_relation": config.core_dim_relation,
+                "core_dim_object": config.core_dim_object,
+                "task_embedding_3d_dim1": config.task_embedding_3d_dim1,
+                "task_embedding_3d_dim2": config.task_embedding_3d_dim2,
+                "task_embedding_3d_dim3": config.task_embedding_3d_dim3,
             },
         },
         config.model_save_path,
@@ -1673,13 +2229,21 @@ def main():
     config = Config(
         # Dataset creation parameters
         data_dir=Path("data/MINI-ARC"),
-        output_dir=Path("output/mini_arc_vae"),
+        output_dir=Path("output/mini_arc_tucker"),
         test_ratio=0.2,
         random_seed=42,
         max_augmentations=500,
         # Model parameters
         task_embedding_dim=32,
-        latent_dim=512,
+        latent_dim=512,  # Kept for compatibility, not used
+        # Tucker decomposition core tensor dimensions
+        core_dim_subject=10,
+        core_dim_relation=10,
+        core_dim_object=10,
+        # Task embedding 3D reshape dimensions
+        task_embedding_3d_dim1=4,
+        task_embedding_3d_dim2=4,
+        task_embedding_3d_dim3=3,  # 4*4*3 = 48 >= 32 task_embedding_dim
         # Data parameters
         vocab_size=10,
         # Denoising evaluation parameters
