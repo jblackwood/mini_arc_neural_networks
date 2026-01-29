@@ -711,8 +711,10 @@ class LinearAutoencoder(nn.Module):
             self.task_embedding.weight.data.normal_(mean=0.0, std=0.01)
 
         # Encoder: input_dim -> latent_dim (no bias)
-        # Decoder will use transpose of encoder weights
         self.encoder = nn.Linear(self.input_dim, latent_dim, bias=False)
+        
+        # Decoder: latent_dim -> input_dim (no bias, separate from encoder)
+        self.decoder = nn.Linear(latent_dim, self.input_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass.
@@ -727,8 +729,8 @@ class LinearAutoencoder(nn.Module):
         # Encode to latent space
         z = self.encoder(x)  # (batch_size, latent_dim)
 
-        # Decode back to input space using transpose of encoder weights
-        output = torch.matmul(z, self.encoder.weight)  # (batch_size, task_embedding_dim + 500)
+        # Decode back to input space using separate decoder
+        output = self.decoder(z)  # (batch_size, task_embedding_dim + 500)
 
         return output
 
@@ -1558,6 +1560,7 @@ def train(config: Config):
         # Calculate layer-wise mean square
         task_emb_mean_sq = model.task_embedding.weight.pow(2).mean().item()
         encoder_mean_sq = model.encoder.weight.pow(2).mean().item()
+        decoder_mean_sq = model.decoder.weight.pow(2).mean().item()
 
         # Log to console
         print(
@@ -1569,7 +1572,8 @@ def train(config: Config):
         print(
             f"  Layer Mean Squares - "
             f"Task Emb: {task_emb_mean_sq:.6f}, "
-            f"Encoder: {encoder_mean_sq:.6f}"
+            f"Encoder: {encoder_mean_sq:.6f}, "
+            f"Decoder: {decoder_mean_sq:.6f}"
         )
 
         # Log to tensorboard
@@ -1581,6 +1585,7 @@ def train(config: Config):
         # Log layer-wise mean squares
         writer.add_scalar("LayerMeanSquare/task_embedding", task_emb_mean_sq, epoch)
         writer.add_scalar("LayerMeanSquare/encoder", encoder_mean_sq, epoch)
+        writer.add_scalar("LayerMeanSquare/decoder", decoder_mean_sq, epoch)
 
         # Evaluate denoising accuracy periodically
         if (epoch + 1) % config.eval_denoise_epoch_interval == 0:
