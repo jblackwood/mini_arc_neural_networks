@@ -21,7 +21,6 @@ from mini_arc_tucker.nb_tucker import (
     OBJECT_ROW_COL_START,
     OBJECT_COLOR_START,
     OBJECT_GRID_TYPE_START,
-    OBJECT_INTEGER_START,
     OBJECT_INPUT_GRID,
     OBJECT_OUTPUT_GRID,
     NUM_RELATIONS,
@@ -36,14 +35,13 @@ class TestKnowledgeGraphDimensions:
         dims = get_knowledge_graph_dimensions()
         
         assert dims.num_cells == 50
-        assert dims.num_integers == 10
-        assert dims.num_subjects == 60
+        assert dims.num_rows_cols == 5
+        assert dims.num_subjects == 55
         assert dims.num_relations == 6
         assert dims.num_row_col_objects == 5
         assert dims.num_color_objects == 10
         assert dims.num_grid_type_objects == 2
-        assert dims.num_integer_objects == 10
-        assert dims.num_objects == 27
+        assert dims.num_objects == 17
 
 
 class TestEncodeArcToKnowledgeGraph:
@@ -56,14 +54,14 @@ class TestEncodeArcToKnowledgeGraph:
         
         dims = get_knowledge_graph_dimensions()
         assert kg_tensor.shape == (1, dims.num_subjects, dims.num_relations, dims.num_objects)
-        assert kg_tensor.shape == (1, 60, 6, 27)
+        assert kg_tensor.shape == (1, 55, 6, 17)
     
     def test_batch_size_multiple(self):
         """Test with larger batch size."""
         batch = torch.zeros(4, 50, dtype=torch.long)
         kg_tensor = encode_arc_to_knowledge_graph(batch)
         
-        assert kg_tensor.shape == (4, 60, 6, 27)
+        assert kg_tensor.shape == (4, 55, 6, 17)
     
     def test_cell_0_relations(self):
         """Test that cell_0 (first input cell) has correct relations."""
@@ -122,23 +120,23 @@ class TestEncodeArcToKnowledgeGraph:
             assert kg_tensor[0, cell_idx, RELATION_GRID_TYPE, OBJECT_INPUT_GRID] == 0.0
     
     def test_integer_above_relations(self):
-        """Test integer above relations: (1, above, 0), (2, above, 1), ..., (9, above, 8)."""
+        """Test integer above relations: (1, above, 0), (2, above, 1), ..., (4, above, 3)."""
         batch = torch.zeros(1, 50, dtype=torch.long)
         kg_tensor = encode_arc_to_knowledge_graph(batch)
         
-        for i in range(1, 10):
+        for i in range(1, 5):
             subject_idx = 50 + i
-            object_idx = OBJECT_INTEGER_START + (i - 1)
+            object_idx = OBJECT_ROW_COL_START + (i - 1)
             assert kg_tensor[0, subject_idx, RELATION_ABOVE, object_idx] == 1.0
     
     def test_integer_identity_relations(self):
-        """Test integer identity relations: (0, identity, 0), (1, identity, 1), ..., (9, identity, 9)."""
+        """Test integer identity relations: (0, identity, 0), (1, identity, 1), ..., (4, identity, 4)."""
         batch = torch.zeros(1, 50, dtype=torch.long)
         kg_tensor = encode_arc_to_knowledge_graph(batch)
         
-        for i in range(10):
+        for i in range(5):
             subject_idx = 50 + i
-            object_idx = OBJECT_INTEGER_START + i
+            object_idx = OBJECT_ROW_COL_START + i
             assert kg_tensor[0, subject_idx, RELATION_IDENTITY, object_idx] == 1.0
     
     def test_row_column_values_for_grid_positions(self):
@@ -203,11 +201,11 @@ class TestDecodeKnowledgeGraphToTriples:
         
         # Check integer above relations
         assert ("int_1", "above", "0") in triple_set
-        assert ("int_9", "above", "8") in triple_set
+        assert ("int_4", "above", "3") in triple_set
         
         # Check integer identity relations
         assert ("int_0", "identity", "0") in triple_set
-        assert ("int_9", "identity", "9") in triple_set
+        assert ("int_4", "identity", "4") in triple_set
     
     def test_roundtrip_encoding_decoding(self):
         """Test that encoding and then decoding produces expected triples."""
@@ -246,11 +244,11 @@ class TestDecodeKnowledgeGraphToTriples:
         
         # Expected triples:
         # - 50 cells * 4 relations (row, column, cell_value, grid_type) = 200 triples
-        # - 9 integers with above relation (1-9) = 9 triples
-        # - 10 integers with identity relation (0-9) = 10 triples
-        # Total = 219 triples
+        # - 4 integers with above relation (1-4) = 4 triples
+        # - 5 integers with identity relation (0-4) = 5 triples
+        # Total = 209 triples
         
-        expected_count = 50 * 4 + 9 + 10
+        expected_count = 50 * 4 + 4 + 5
         assert len(triples[0]) == expected_count
 
 
@@ -272,7 +270,7 @@ class TestVectorizedEncoding:
         batch = torch.zeros(8, 50, dtype=torch.long)
         kg_tensor = encode_arc_to_knowledge_graph_vectorized(batch)
         
-        assert kg_tensor.shape == (8, 60, 6, 27)
+        assert kg_tensor.shape == (8, 55, 6, 17)
 
 
 class TestMaskOutputGridRelations:
@@ -374,36 +372,36 @@ class TestConcatenateKgAndTaskEmbedding:
     
     def test_concatenation_shape(self):
         """Test that concatenation produces correct shape."""
-        kg_tensor = torch.randn(2, 60, 6, 27)
+        kg_tensor = torch.randn(2, 55, 6, 17)
         task_embedding_3d = torch.randn(2, 4, 4, 5)
         
         combined = concatenate_kg_and_task_embedding(kg_tensor, task_embedding_3d)
         
-        assert combined.shape == (2, 64, 10, 32)
+        assert combined.shape == (2, 59, 10, 22)
     
     def test_concatenation_preserves_values(self):
         """Test that concatenation preserves original values."""
-        kg_tensor = torch.randn(2, 60, 6, 27)
+        kg_tensor = torch.randn(2, 55, 6, 17)
         task_embedding_3d = torch.randn(2, 4, 4, 5)
         
         combined = concatenate_kg_and_task_embedding(kg_tensor, task_embedding_3d)
         
         # KG tensor should be in the first part
-        assert torch.allclose(combined[:, :60, :6, :27], kg_tensor)
+        assert torch.allclose(combined[:, :55, :6, :17], kg_tensor)
         
         # Task embedding should be in the extended part
-        assert torch.allclose(combined[:, 60:, 6:, 27:], task_embedding_3d)
+        assert torch.allclose(combined[:, 55:, 6:, 17:], task_embedding_3d)
     
     def test_extraction_roundtrip(self):
         """Test that extraction recovers original tensors."""
-        kg_tensor = torch.randn(2, 60, 6, 27)
+        kg_tensor = torch.randn(2, 55, 6, 17)
         task_embedding_3d = torch.randn(2, 4, 4, 5)
         
         combined = concatenate_kg_and_task_embedding(kg_tensor, task_embedding_3d)
         
         kg_extracted, te_extracted = extract_kg_and_task_embedding(
             combined,
-            kg_shape=(60, 6, 27),
+            kg_shape=(55, 6, 17),
             te_shape=(4, 4, 5),
         )
         
@@ -427,7 +425,7 @@ class TestIntegration:
         kg_tensor = encode_arc_to_knowledge_graph(batch)
         
         # Verify shape
-        assert kg_tensor.shape == (1, 60, 6, 27)
+        assert kg_tensor.shape == (1, 55, 6, 17)
         
         # Decode to triples
         triples = decode_knowledge_graph_to_triples(kg_tensor)
@@ -455,9 +453,9 @@ class TestIntegration:
         
         # Verify integer relations
         assert ("int_1", "above", "0") in triple_set
-        assert ("int_9", "above", "8") in triple_set
+        assert ("int_4", "above", "3") in triple_set
         assert ("int_0", "identity", "0") in triple_set
-        assert ("int_9", "identity", "9") in triple_set
+        assert ("int_4", "identity", "4") in triple_set
         
         # Create task embedding and combine
         task_embedding = torch.randn(1, 32)
@@ -466,12 +464,12 @@ class TestIntegration:
         combined = concatenate_kg_and_task_embedding(kg_tensor, task_embedding_3d)
         
         # Verify combined shape
-        assert combined.shape == (1, 64, 10, 30)
+        assert combined.shape == (1, 59, 10, 20)
         
         # Extract and verify
         kg_extracted, te_extracted = extract_kg_and_task_embedding(
             combined,
-            kg_shape=(60, 6, 27),
+            kg_shape=(55, 6, 17),
             te_shape=(4, 4, 3),
         )
         

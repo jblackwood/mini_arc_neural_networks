@@ -689,30 +689,28 @@ class KnowledgeGraphDimensions:
     
     Attributes:
         num_cells: Number of cells (25 input + 25 output = 50)
-        num_integers: Number of integer subjects (0-9)
-        num_subjects: Total subjects = num_cells + num_integers
+        num_rows_cols: Number of row/column subjects (0-4)
+        num_subjects: Total subjects = num_cells + num_rows_cols
         num_relations: Number of relation types
-        num_row_col_objects: Number of row/column objects (0-4)
+        num_row_col_objects: Number of row/column/integer objects (0-4)
         num_color_objects: Number of color objects (0-9)
         num_grid_type_objects: Number of grid type objects (input_grid, output_grid)
-        num_integer_objects: Number of integer objects for above/identity (0-9)
         num_objects: Total objects
     """
     num_cells: int
-    num_integers: int
+    num_rows_cols: int
     num_subjects: int
     num_relations: int
     num_row_col_objects: int
     num_color_objects: int
     num_grid_type_objects: int
-    num_integer_objects: int
     num_objects: int
 
 
 # Subject indices:
 # - Cells 0-24: input grid cells (cell_0 to cell_24)
 # - Cells 25-49: output grid cells (cell_25 to cell_49)
-# - Integers 50-59: integer values 0-9
+# - Row/Col integers 50-54: integer values 0-4 (shared with row/col objects)
 
 # Relation indices:
 # 0: row
@@ -723,10 +721,9 @@ class KnowledgeGraphDimensions:
 # 5: identity
 
 # Object indices (organized into groups):
-# Row/Column objects (0-4): shared for rows and columns
+# Row/Column/Integer objects (0-4): shared for rows, columns, and integer relations
 # Color objects (5-14): values 0-9 for cell_value relation
 # Grid type objects (15-16): input_grid, output_grid
-# Integer objects (17-26): values 0-9 for above/identity relations
 
 RELATION_ROW = 0
 RELATION_COLUMN = 1
@@ -741,12 +738,11 @@ NUM_RELATIONS = 6
 OBJECT_ROW_COL_START = 0
 OBJECT_COLOR_START = 5
 OBJECT_GRID_TYPE_START = 15
-OBJECT_INTEGER_START = 17
 
 OBJECT_INPUT_GRID = OBJECT_GRID_TYPE_START + 0
 OBJECT_OUTPUT_GRID = OBJECT_GRID_TYPE_START + 1
 
-NUM_OBJECTS = 27  # 5 (row/col) + 10 (colors) + 2 (grid types) + 10 (integers)
+NUM_OBJECTS = 17  # 5 (row/col/int) + 10 (colors) + 2 (grid types)
 
 
 def get_knowledge_graph_dimensions() -> KnowledgeGraphDimensions:
@@ -756,24 +752,22 @@ def get_knowledge_graph_dimensions() -> KnowledgeGraphDimensions:
         KnowledgeGraphDimensions with all dimension values
     """
     num_cells = 50  # 25 input + 25 output
-    num_integers = 10  # 0-9
-    num_subjects = num_cells + num_integers  # 60
+    num_rows_cols = 5  # 0-4 (shared with row/col objects)
+    num_subjects = num_cells + num_rows_cols  # 55
     num_relations = NUM_RELATIONS  # 6
-    num_row_col_objects = 5  # 0-4
+    num_row_col_objects = 5  # 0-4 (also used for integer relations)
     num_color_objects = 10  # 0-9
     num_grid_type_objects = 2  # input, output
-    num_integer_objects = 10  # 0-9
-    num_objects = NUM_OBJECTS  # 27
+    num_objects = NUM_OBJECTS  # 17
     
     return KnowledgeGraphDimensions(
         num_cells=num_cells,
-        num_integers=num_integers,
+        num_rows_cols=num_rows_cols,
         num_subjects=num_subjects,
         num_relations=num_relations,
         num_row_col_objects=num_row_col_objects,
         num_color_objects=num_color_objects,
         num_grid_type_objects=num_grid_type_objects,
-        num_integer_objects=num_integer_objects,
         num_objects=num_objects,
     )
 
@@ -845,16 +839,16 @@ def encode_arc_to_knowledge_graph(batch: torch.Tensor) -> torch.Tensor:
         kg_tensor[:, subject_idx, RELATION_GRID_TYPE, OBJECT_OUTPUT_GRID] = 1.0
     
     # Add integer subjects with above relations
-    # (1, above, 0), (2, above, 1), ..., (9, above, 8)
-    for i in range(1, 10):
+    # (1, above, 0), (2, above, 1), ..., (4, above, 3)
+    for i in range(1, 5):
         subject_idx = 50 + i  # Integer subject
-        kg_tensor[:, subject_idx, RELATION_ABOVE, OBJECT_INTEGER_START + (i - 1)] = 1.0
+        kg_tensor[:, subject_idx, RELATION_ABOVE, OBJECT_ROW_COL_START + (i - 1)] = 1.0
     
     # Add integer subjects with identity relations
-    # (0, identity, 0), (1, identity, 1), ..., (9, identity, 9)
-    for i in range(10):
+    # (0, identity, 0), (1, identity, 1), ..., (4, identity, 4)
+    for i in range(5):
         subject_idx = 50 + i  # Integer subject
-        kg_tensor[:, subject_idx, RELATION_IDENTITY, OBJECT_INTEGER_START + i] = 1.0
+        kg_tensor[:, subject_idx, RELATION_IDENTITY, OBJECT_ROW_COL_START + i] = 1.0
     
     return kg_tensor
 
@@ -911,15 +905,15 @@ def encode_arc_to_knowledge_graph_vectorized(batch: torch.Tensor) -> torch.Tenso
     kg_tensor[:, 25:50, RELATION_GRID_TYPE, OBJECT_OUTPUT_GRID] = 1.0
     
     # Add integer subjects with above relations
-    # (1, above, 0), (2, above, 1), ..., (9, above, 8)
-    integer_above_subjects = torch.arange(51, 60, device=device)  # Integers 1-9
-    integer_above_objects = torch.arange(OBJECT_INTEGER_START, OBJECT_INTEGER_START + 9, device=device)
+    # (1, above, 0), (2, above, 1), ..., (4, above, 3)
+    integer_above_subjects = torch.arange(51, 55, device=device)  # Integers 1-4
+    integer_above_objects = torch.arange(OBJECT_ROW_COL_START, OBJECT_ROW_COL_START + 4, device=device)
     kg_tensor[:, integer_above_subjects, RELATION_ABOVE, integer_above_objects] = 1.0
     
     # Add integer subjects with identity relations
-    # (0, identity, 0), (1, identity, 1), ..., (9, identity, 9)
-    integer_identity_subjects = torch.arange(50, 60, device=device)  # Integers 0-9
-    integer_identity_objects = torch.arange(OBJECT_INTEGER_START, OBJECT_INTEGER_START + 10, device=device)
+    # (0, identity, 0), (1, identity, 1), ..., (4, identity, 4)
+    integer_identity_subjects = torch.arange(50, 55, device=device)  # Integers 0-4
+    integer_identity_objects = torch.arange(OBJECT_ROW_COL_START, OBJECT_ROW_COL_START + 5, device=device)
     kg_tensor[:, integer_identity_subjects, RELATION_IDENTITY, integer_identity_objects] = 1.0
     
     return kg_tensor
@@ -962,7 +956,7 @@ def decode_knowledge_graph_to_triples(kg_tensor: torch.Tensor) -> List[List[Tupl
             relation = relation_names[int(relation_idx)]
             
             # Decode object based on relation type
-            if relation_idx in [RELATION_ROW, RELATION_COLUMN]:
+            if relation_idx in [RELATION_ROW, RELATION_COLUMN, RELATION_ABOVE, RELATION_IDENTITY]:
                 obj = str(object_idx - OBJECT_ROW_COL_START)
             elif relation_idx == RELATION_CELL_VALUE:
                 obj = f"color_{object_idx - OBJECT_COLOR_START}"
@@ -971,8 +965,6 @@ def decode_knowledge_graph_to_triples(kg_tensor: torch.Tensor) -> List[List[Tupl
                     obj = "input_grid"
                 else:
                     obj = "output_grid"
-            elif relation_idx in [RELATION_ABOVE, RELATION_IDENTITY]:
-                obj = str(object_idx - OBJECT_INTEGER_START)
             else:
                 obj = f"obj_{object_idx}"
             
