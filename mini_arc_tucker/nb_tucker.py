@@ -2212,17 +2212,17 @@ def main():
         random_seed=42,
         max_augmentations=500,
         # Tucker decomposition core tensor dimensions
-        core_dim_subject=10,
-        core_dim_relation=10,
-        core_dim_object=10,
-        # Task embedding 3D reshape dimensions (task_embedding_dim is derived as 4*4*3=48)
+        core_dim_subject=128,
+        core_dim_relation=128,
+        core_dim_object=128,
+        # Task embedding 3D reshape dimensions
         task_embedding_3d_dim1=4,
         task_embedding_3d_dim2=4,
-        task_embedding_3d_dim3=3,
+        task_embedding_3d_dim3=4,
         # Data parameters
         vocab_size=10,
         # Denoising evaluation parameters
-        eval_denoise_epoch_interval=10,
+        eval_denoise_epoch_interval=5,
         eval_denoise_num_iterations=10,
         # Training parameters
         num_epochs=300,
