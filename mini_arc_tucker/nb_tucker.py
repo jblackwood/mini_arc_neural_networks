@@ -2252,6 +2252,12 @@ def main():
     pprint.pprint(asdict(config), width=100, sort_dicts=False)
     print()
 
+    # Print knowledge graph dimensions
+    kg_dims = get_knowledge_graph_dimensions()
+    print("Knowledge Graph Dimensions:")
+    pprint.pprint(asdict(kg_dims), width=100, sort_dicts=False)
+    print()
+
     # Download dataset
     download_mini_arc(config.data_dir)
 
