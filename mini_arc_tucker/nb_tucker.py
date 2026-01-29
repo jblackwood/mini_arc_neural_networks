@@ -29,10 +29,6 @@ class Config:
     random_seed: int
     max_augmentations: int
 
-    # Model parameters
-    task_embedding_dim: int
-    latent_dim: int  # Kept for compatibility, not used in new Tucker model
-    
     # Tucker decomposition core tensor dimensions
     core_dim_subject: int
     core_dim_relation: int
@@ -1152,7 +1148,6 @@ class TuckerAutoencoder(nn.Module):
 
     def __init__(
         self,
-        task_embedding_dim: int,
         vocab_size: int,
         num_tasks: int,
         core_dim_subject: int,
@@ -1163,7 +1158,6 @@ class TuckerAutoencoder(nn.Module):
         """Initialize the Tucker autoencoder.
 
         Args:
-            task_embedding_dim: Dimension of task embeddings
             vocab_size: Number of possible cell values (10 for ARC: 0-9 colors)
             num_tasks: Number of unique tasks for task embedding
             core_dim_subject: Dimension of core tensor along subject axis
@@ -1175,11 +1169,13 @@ class TuckerAutoencoder(nn.Module):
 
         # Store dimensions
         self.vocab_size = vocab_size
-        self.task_embedding_dim = task_embedding_dim
         self.core_dim_subject = core_dim_subject
         self.core_dim_relation = core_dim_relation
         self.core_dim_object = core_dim_object
         self.task_embedding_3d_shape = task_embedding_3d_shape
+        
+        # Derive task_embedding_dim from 3D shape
+        self.task_embedding_dim = task_embedding_3d_shape[0] * task_embedding_3d_shape[1] * task_embedding_3d_shape[2]
         
         # Knowledge graph dimensions
         kg_dims = get_knowledge_graph_dimensions()
@@ -1193,7 +1189,7 @@ class TuckerAutoencoder(nn.Module):
         self.total_objects = self.kg_num_objects + task_embedding_3d_shape[2]
 
         # Task embedding layer
-        self.task_embedding = nn.Embedding(num_tasks, task_embedding_dim)
+        self.task_embedding = nn.Embedding(num_tasks, self.task_embedding_dim)
         
         # Initialize task embeddings with mean 0 and std 0.01
         with torch.no_grad():
@@ -1970,17 +1966,9 @@ def train(config: Config):
         config.task_embedding_3d_dim2,
         config.task_embedding_3d_dim3,
     )
-    
-    # Assert task embedding is not truncated
-    task_embedding_3d_size = task_embedding_3d_shape[0] * task_embedding_3d_shape[1] * task_embedding_3d_shape[2]
-    assert task_embedding_3d_size >= config.task_embedding_dim, (
-        f"Task embedding 3D size {task_embedding_3d_size} is smaller than task_embedding_dim {config.task_embedding_dim}. "
-        "Task embedding would be truncated."
-    )
 
     # Create model
     model = TuckerAutoencoder(
-        task_embedding_dim=config.task_embedding_dim,
         vocab_size=config.vocab_size,
         num_tasks=num_tasks,
         core_dim_subject=config.core_dim_subject,
@@ -2179,7 +2167,6 @@ def train(config: Config):
                     "train_loss": train_loss,
                     "test_loss": test_loss,
                     "config": {
-                        "task_embedding_dim": config.task_embedding_dim,
                         "vocab_size": config.vocab_size,
                         "core_dim_subject": config.core_dim_subject,
                         "core_dim_relation": config.core_dim_relation,
@@ -2209,7 +2196,6 @@ def train(config: Config):
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "config": {
-                "task_embedding_dim": config.task_embedding_dim,
                 "vocab_size": config.vocab_size,
                 "core_dim_subject": config.core_dim_subject,
                 "core_dim_relation": config.core_dim_relation,
@@ -2233,17 +2219,14 @@ def main():
         test_ratio=0.2,
         random_seed=42,
         max_augmentations=500,
-        # Model parameters
-        task_embedding_dim=32,
-        latent_dim=512,  # Kept for compatibility, not used
         # Tucker decomposition core tensor dimensions
         core_dim_subject=10,
         core_dim_relation=10,
         core_dim_object=10,
-        # Task embedding 3D reshape dimensions
+        # Task embedding 3D reshape dimensions (task_embedding_dim is derived as 4*4*3=48)
         task_embedding_3d_dim1=4,
         task_embedding_3d_dim2=4,
-        task_embedding_3d_dim3=3,  # 4*4*3 = 48 >= 32 task_embedding_dim
+        task_embedding_3d_dim3=3,
         # Data parameters
         vocab_size=10,
         # Denoising evaluation parameters
