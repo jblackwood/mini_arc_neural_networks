@@ -1182,22 +1182,31 @@ class TuckerAutoencoder(nn.Module):
 
         # Task embedding layer
         self.task_embedding = nn.Embedding(num_tasks, self.task_embedding_dim)
-        
-        # Initialize task embeddings with mean 0 and std 0.01
-        with torch.no_grad():
-            self.task_embedding.weight.data.normal_(mean=0.0, std=0.01)
 
-        # Encoder factor matrices (no bias)
-        # These project each mode to the core tensor dimensions
-        self.encoder_subject = nn.Linear(self.total_subjects, core_dim_subject, bias=False)
-        self.encoder_relation = nn.Linear(self.total_relations, core_dim_relation, bias=False)
-        self.encoder_object = nn.Linear(self.total_objects, core_dim_object, bias=False)
+        # Calculate fan-in for proper initialization to prevent exploding activations
+        encoder_fan_in = self.total_subjects * self.total_relations * self.total_objects
+        encoder_std = 1.0 / (encoder_fan_in ** 0.5)
         
-        # Decoder factor matrices (no bias)
-        # These project from core tensor dimensions back to original dimensions
-        self.decoder_subject = nn.Linear(core_dim_subject, self.total_subjects, bias=False)
-        self.decoder_relation = nn.Linear(core_dim_relation, self.total_relations, bias=False)
-        self.decoder_object = nn.Linear(core_dim_object, self.total_objects, bias=False)
+        core_fan_in = core_dim_subject * core_dim_relation * core_dim_object
+        core_std = 1.0 / (core_fan_in ** 0.5)
+
+        # Encoder weight tensor: transforms full input tensor to core tensor
+        # Shape: (total_subjects, total_relations, total_objects, core_dim_subject, core_dim_relation, core_dim_object)
+        self.encoder_weight = nn.Parameter(
+            torch.randn(
+                self.total_subjects, self.total_relations, self.total_objects,
+                core_dim_subject, core_dim_relation, core_dim_object
+            ) * encoder_std
+        )
+        
+        # Decoder weight tensor: transforms core tensor back to original space
+        # Shape: (core_dim_subject, core_dim_relation, core_dim_object, total_subjects, total_relations, total_objects)
+        self.decoder_weight = nn.Parameter(
+            torch.randn(
+                core_dim_subject, core_dim_relation, core_dim_object,
+                self.total_subjects, self.total_relations, self.total_objects
+            ) * core_std
+        )
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Encode input tensor to core tensor using Tucker decomposition.
@@ -1208,13 +1217,11 @@ class TuckerAutoencoder(nn.Module):
         Returns:
             Core tensor of shape (batch_size, core_dim_subject, core_dim_relation, core_dim_object)
         """
-        # Apply factor matrices using einsum
-        # x: (batch, S, R, O) -> (batch, core_S, R, O)
-        z = torch.einsum('bsro,cs->bcro', x, self.encoder_subject.weight)
-        # z: (batch, core_S, R, O) -> (batch, core_S, core_R, O)
-        z = torch.einsum('bcro,dr->bcdo', z, self.encoder_relation.weight)
-        # z: (batch, core_S, core_R, O) -> (batch, core_S, core_R, core_O)
-        z = torch.einsum('bcdo,eo->bcde', z, self.encoder_object.weight)
+        # Apply full tensor transformation with einsum
+        # Input X: (batch, S, R, O)
+        # Weight W: (S, R, O, core_S, core_R, core_O)
+        # Output: (batch, core_S, core_R, core_O)
+        z = torch.einsum('bsro,srouvw->buvw', x, self.encoder_weight)
         
         return z
 
@@ -1227,13 +1234,11 @@ class TuckerAutoencoder(nn.Module):
         Returns:
             Reconstructed tensor of shape (batch_size, total_subjects, total_relations, total_objects)
         """
-        # Apply decoder factor matrices using einsum
-        # z: (batch, core_S, core_R, core_O) -> (batch, S, core_R, core_O)
-        x = torch.einsum('bcde,sc->bsde', z, self.decoder_subject.weight)
-        # x: (batch, S, core_R, core_O) -> (batch, S, R, core_O)
-        x = torch.einsum('bsde,rd->bsre', x, self.decoder_relation.weight)
-        # x: (batch, S, R, core_O) -> (batch, S, R, O)
-        x = torch.einsum('bsre,oe->bsro', x, self.decoder_object.weight)
+        # Apply full tensor transformation with einsum
+        # Input Z: (batch, core_S, core_R, core_O)
+        # Weight W: (core_S, core_R, core_O, S, R, O)
+        # Output: (batch, S, R, O)
+        x = torch.einsum('buvw,uvwsro->bsro', z, self.decoder_weight)
         
         return x
 
@@ -2082,9 +2087,8 @@ def train(config: Config):
 
         # Calculate layer-wise mean square
         task_emb_mean_sq = model.task_embedding.weight.pow(2).mean().item()
-        encoder_subject_mean_sq = model.encoder_subject.weight.pow(2).mean().item()
-        encoder_relation_mean_sq = model.encoder_relation.weight.pow(2).mean().item()
-        encoder_object_mean_sq = model.encoder_object.weight.pow(2).mean().item()
+        encoder_weight_mean_sq = model.encoder_weight.pow(2).mean().item()
+        decoder_weight_mean_sq = model.decoder_weight.pow(2).mean().item()
 
         # Log to console
         print(
@@ -2096,9 +2100,8 @@ def train(config: Config):
         print(
             f"  Layer Mean Squares - "
             f"Task Emb: {task_emb_mean_sq:.6f}, "
-            f"Enc Subj: {encoder_subject_mean_sq:.6f}, "
-            f"Enc Rel: {encoder_relation_mean_sq:.6f}, "
-            f"Enc Obj: {encoder_object_mean_sq:.6f}"
+            f"Encoder: {encoder_weight_mean_sq:.6f}, "
+            f"Decoder: {decoder_weight_mean_sq:.6f}"
         )
 
         # Log to tensorboard
@@ -2109,9 +2112,8 @@ def train(config: Config):
         
         # Log layer-wise mean squares
         writer.add_scalar("LayerMeanSquare/task_embedding", task_emb_mean_sq, epoch)
-        writer.add_scalar("LayerMeanSquare/encoder_subject", encoder_subject_mean_sq, epoch)
-        writer.add_scalar("LayerMeanSquare/encoder_relation", encoder_relation_mean_sq, epoch)
-        writer.add_scalar("LayerMeanSquare/encoder_object", encoder_object_mean_sq, epoch)
+        writer.add_scalar("LayerMeanSquare/encoder_weight", encoder_weight_mean_sq, epoch)
+        writer.add_scalar("LayerMeanSquare/decoder_weight", decoder_weight_mean_sq, epoch)
 
         # Evaluate denoising accuracy periodically
         if (epoch + 1) % config.eval_denoise_epoch_interval == 0:
@@ -2212,9 +2214,9 @@ def main():
         random_seed=42,
         max_augmentations=500,
         # Tucker decomposition core tensor dimensions
-        core_dim_subject=64,
-        core_dim_relation=64,
-        core_dim_object=64,
+        core_dim_subject=10,
+        core_dim_relation=10,
+        core_dim_object=10,
         # Task embedding 3D reshape dimensions
         task_embedding_3d_dim1=4,
         task_embedding_3d_dim2=4,
