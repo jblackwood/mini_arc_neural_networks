@@ -1183,29 +1183,42 @@ class TuckerAutoencoder(nn.Module):
         # Task embedding layer
         self.task_embedding = nn.Embedding(num_tasks, self.task_embedding_dim)
 
-        # Calculate fan-in for proper initialization to prevent exploding activations
-        encoder_fan_in = self.total_subjects * self.total_relations * self.total_objects
-        encoder_std = 1.0 / (encoder_fan_in ** 0.5)
+        # Calculate proper initialization scale for factor matrices
+        # Each factor matrix operates on one dimension at a time
+        subject_std = 1.0 / (self.total_subjects ** 0.5)
+        relation_std = 1.0 / (self.total_relations ** 0.5)
+        object_std = 1.0 / (self.total_objects ** 0.5)
         
-        core_fan_in = core_dim_subject * core_dim_relation * core_dim_object
-        core_std = 1.0 / (core_fan_in ** 0.5)
+        core_subject_std = 1.0 / (core_dim_subject ** 0.5)
+        core_relation_std = 1.0 / (core_dim_relation ** 0.5)
+        core_object_std = 1.0 / (core_dim_object ** 0.5)
 
-        # Encoder weight tensor: transforms full input tensor to core tensor
-        # Shape: (total_subjects, total_relations, total_objects, core_dim_subject, core_dim_relation, core_dim_object)
-        self.encoder_weight = nn.Parameter(
-            torch.randn(
-                self.total_subjects, self.total_relations, self.total_objects,
-                core_dim_subject, core_dim_relation, core_dim_object
-            ) * encoder_std
+        # Encoder factor matrices: 3 separate transformations
+        # U_subject: transforms subject dimension from total_subjects to core_dim_subject
+        self.encoder_U_subject = nn.Parameter(
+            torch.randn(self.total_subjects, core_dim_subject) * subject_std
+        )
+        # U_relation: transforms relation dimension from total_relations to core_dim_relation
+        self.encoder_U_relation = nn.Parameter(
+            torch.randn(self.total_relations, core_dim_relation) * relation_std
+        )
+        # U_object: transforms object dimension from total_objects to core_dim_object
+        self.encoder_U_object = nn.Parameter(
+            torch.randn(self.total_objects, core_dim_object) * object_std
         )
         
-        # Decoder weight tensor: transforms core tensor back to original space
-        # Shape: (core_dim_subject, core_dim_relation, core_dim_object, total_subjects, total_relations, total_objects)
-        self.decoder_weight = nn.Parameter(
-            torch.randn(
-                core_dim_subject, core_dim_relation, core_dim_object,
-                self.total_subjects, self.total_relations, self.total_objects
-            ) * core_std
+        # Decoder factor matrices: 3 separate transformations (inverse of encoder)
+        # V_subject: transforms subject dimension from core_dim_subject to total_subjects
+        self.decoder_V_subject = nn.Parameter(
+            torch.randn(core_dim_subject, self.total_subjects) * core_subject_std
+        )
+        # V_relation: transforms relation dimension from core_dim_relation to total_relations
+        self.decoder_V_relation = nn.Parameter(
+            torch.randn(core_dim_relation, self.total_relations) * core_relation_std
+        )
+        # V_object: transforms object dimension from core_dim_object to total_objects
+        self.decoder_V_object = nn.Parameter(
+            torch.randn(core_dim_object, self.total_objects) * core_object_std
         )
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
@@ -1217,11 +1230,18 @@ class TuckerAutoencoder(nn.Module):
         Returns:
             Core tensor of shape (batch_size, core_dim_subject, core_dim_relation, core_dim_object)
         """
-        # Apply full tensor transformation with einsum
-        # Input X: (batch, S, R, O)
-        # Weight W: (S, R, O, core_S, core_R, core_O)
-        # Output: (batch, core_S, core_R, core_O)
-        z = torch.einsum('bsro,srouvw->buvw', x, self.encoder_weight)
+        # Apply 3 sequential factorized transformations
+        # Step 1: Contract along subject dimension
+        # (batch, S, R, O) x (S, core_S) -> (batch, core_S, R, O)
+        z = torch.einsum('bsro,su->buro', x, self.encoder_U_subject)
+        
+        # Step 2: Contract along relation dimension
+        # (batch, core_S, R, O) x (R, core_R) -> (batch, core_S, core_R, O)
+        z = torch.einsum('buro,rv->buvo', z, self.encoder_U_relation)
+        
+        # Step 3: Contract along object dimension
+        # (batch, core_S, core_R, O) x (O, core_O) -> (batch, core_S, core_R, core_O)
+        z = torch.einsum('buvo,ow->buvw', z, self.encoder_U_object)
         
         return z
 
@@ -1234,11 +1254,18 @@ class TuckerAutoencoder(nn.Module):
         Returns:
             Reconstructed tensor of shape (batch_size, total_subjects, total_relations, total_objects)
         """
-        # Apply full tensor transformation with einsum
-        # Input Z: (batch, core_S, core_R, core_O)
-        # Weight W: (core_S, core_R, core_O, S, R, O)
-        # Output: (batch, S, R, O)
-        x = torch.einsum('buvw,uvwsro->bsro', z, self.decoder_weight)
+        # Apply 3 sequential factorized transformations (inverse of encoder)
+        # Step 1: Expand along subject dimension
+        # (batch, core_S, core_R, core_O) x (core_S, S) -> (batch, S, core_R, core_O)
+        x = torch.einsum('buvw,us->bsvw', z, self.decoder_V_subject)
+        
+        # Step 2: Expand along relation dimension
+        # (batch, S, core_R, core_O) x (core_R, R) -> (batch, S, R, core_O)
+        x = torch.einsum('bsvw,vr->bsrw', x, self.decoder_V_relation)
+        
+        # Step 3: Expand along object dimension
+        # (batch, S, R, core_O) x (core_O, O) -> (batch, S, R, O)
+        x = torch.einsum('bsrw,wo->bsro', x, self.decoder_V_object)
         
         return x
 
@@ -2087,8 +2114,18 @@ def train(config: Config):
 
         # Calculate layer-wise mean square
         task_emb_mean_sq = model.task_embedding.weight.pow(2).mean().item()
-        encoder_weight_mean_sq = model.encoder_weight.pow(2).mean().item()
-        decoder_weight_mean_sq = model.decoder_weight.pow(2).mean().item()
+        # Average mean square across all encoder factor matrices
+        encoder_weight_mean_sq = (
+            model.encoder_U_subject.pow(2).mean().item() +
+            model.encoder_U_relation.pow(2).mean().item() +
+            model.encoder_U_object.pow(2).mean().item()
+        ) / 3.0
+        # Average mean square across all decoder factor matrices
+        decoder_weight_mean_sq = (
+            model.decoder_V_subject.pow(2).mean().item() +
+            model.decoder_V_relation.pow(2).mean().item() +
+            model.decoder_V_object.pow(2).mean().item()
+        ) / 3.0
 
         # Log to console
         print(
