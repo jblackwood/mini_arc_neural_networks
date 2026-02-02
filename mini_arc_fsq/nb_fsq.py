@@ -888,9 +888,20 @@ class TransformerModel(nn.Module):
         self.num_grid_latent_tokens = num_grid_latent_tokens
         self.num_fsq_channels = len(fsq_levels)
 
-        # Task embedding layer - directly encodes to FSQ space
+        # Task embedding layer - embeds to d_model dimension
+        self.task_embedding = nn.Embedding(num_tasks, d_model)
+        
+        # MLP layers to transform task embedding from d_model to FSQ space
         task_embedding_dim = num_task_latent_tokens * self.num_fsq_channels
-        self.task_embedding = nn.Embedding(num_tasks, task_embedding_dim)
+        self.task_mlp = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, task_embedding_dim),
+        )
 
         # Token embedding layer (vocab_size -> d_model)
         self.token_embedding = nn.Embedding(vocab_size, d_model)
@@ -981,10 +992,12 @@ class TransformerModel(nn.Module):
         batch_size = x.shape[0]
 
         # Process task embedding
-        # Lookup task embedding: (batch_size, num_task_latent_tokens * num_fsq_channels)
+        # Lookup task embedding: (batch_size, d_model)
         task_emb = self.task_embedding(task_indices)
+        # Pass through MLP layers: (batch_size, d_model) -> (batch_size, num_task_latent_tokens * num_fsq_channels)
+        task_mlp_output = self.task_mlp(task_emb)  # (batch_size, num_task_latent_tokens * num_fsq_channels)
         # Reshape to (batch_size, num_task_latent_tokens, num_fsq_channels)
-        task_latent = task_emb.view(batch_size, self.num_task_latent_tokens, self.num_fsq_channels)
+        task_latent = task_mlp_output.view(batch_size, self.num_task_latent_tokens, self.num_fsq_channels)
         # Apply FSQ quantization
         task_quantized = self.fsq(task_latent)  # (batch_size, num_task_latent_tokens, num_fsq_channels)
         # Project to d_model
@@ -1881,7 +1894,7 @@ def main():
         num_layers=8,
         dim_feedforward=1024,
         dropout=0.1,
-        fsq_levels=[6, 5],
+        fsq_levels=[8, 6, 5],
         num_task_latent_tokens=5,
         num_grid_latent_tokens=5,
         # Data parameters
@@ -1894,7 +1907,7 @@ def main():
         learning_rate=1e-4,
         task_embedding_lr=1e-2,
         weight_decay=0.001,
-        task_embedding_weight_decay=0,
+        task_embedding_weight_decay=0.001,
         label_smoothing=0.1,
         mode="train",
         checkpoint_save_interval=50,
