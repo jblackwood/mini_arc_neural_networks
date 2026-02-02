@@ -892,13 +892,12 @@ class TransformerModel(nn.Module):
         self.task_embedding = nn.Embedding(num_tasks, d_model)
         
         # MLP layers to transform task embedding from d_model to FSQ space
+        # Expand up by factor of 2, then contract back down
         task_embedding_dim = num_task_latent_tokens * self.num_fsq_channels
         self.task_mlp = nn.Sequential(
-            nn.Linear(d_model, d_model),
+            nn.Linear(d_model, d_model * 2),
             nn.ReLU(),
-            nn.Linear(d_model, d_model),
-            nn.ReLU(),
-            nn.Linear(d_model, d_model),
+            nn.Linear(d_model * 2, d_model),
             nn.ReLU(),
             nn.Linear(d_model, task_embedding_dim),
         )
