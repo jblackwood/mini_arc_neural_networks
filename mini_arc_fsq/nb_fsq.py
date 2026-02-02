@@ -857,13 +857,13 @@ class FSQCodebookLookup(nn.Module):
     
     codewords: torch.Tensor
     
-    def __init__(self, fsq_levels: List[int], d_model: int, tau: float = 0.1):
+    def __init__(self, fsq_levels: List[int], d_model: int, tau: float):
         """Initialize soft-attention codebook lookup.
         
         Args:
             fsq_levels: List of integers specifying the number of allowed values for each channel
             d_model: Output embedding dimension
-            tau: Temperature parameter for softmax (default 1.0)
+            tau: Temperature parameter for softmax
         """
         super().__init__()
         self.num_fsq_channels = len(fsq_levels)
@@ -1048,7 +1048,7 @@ class TransformerModel(nn.Module):
         self.decoder_from_fsq = FSQCodebookLookup(
             fsq_levels=fsq_levels,
             d_model=d_model,
-            tau=1.0,
+            tau=0.1,
         )
 
         # Learnable position embeddings for combined latent tokens
