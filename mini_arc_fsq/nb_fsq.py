@@ -947,11 +947,12 @@ class TransformerModel(nn.Module):
         # decoder_from_fsq is shared for both task and grid latents
         # Project from num_fsq_channels to d_model
         self.decoder_from_fsq = nn.Linear(self.num_fsq_channels, d_model)
-        # Project from (num_task_latent_tokens + num_grid_latent_tokens) to 50
-        total_latent_tokens = num_task_latent_tokens + num_grid_latent_tokens
-        self.decoder_from_latent_tokens = nn.Linear(total_latent_tokens, 50)
 
-        # Decoder transformer
+        # Learnable position embeddings for combined latent tokens
+        total_latent_tokens = num_task_latent_tokens + num_grid_latent_tokens
+        self.latent_position_embeddings = nn.Parameter(torch.randn(total_latent_tokens, d_model))
+
+        # Decoder transformer (operates on latent tokens)
         decoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -960,6 +961,9 @@ class TransformerModel(nn.Module):
             batch_first=True,
         )
         self.decoder_transformer = nn.TransformerEncoder(decoder_layer, num_layers)
+
+        # Project from (num_task_latent_tokens + num_grid_latent_tokens) to 25 after transformer
+        self.decoder_to_output_tokens = nn.Linear(total_latent_tokens, 25)
 
         # Output projection layer: project to logits for vocab_size classes
         self.output_projection = nn.Linear(d_model, vocab_size)
@@ -972,7 +976,7 @@ class TransformerModel(nn.Module):
             task_indices: Task indices of shape (batch_size,)
 
         Returns:
-            Tensor of shape (batch_size, 50, vocab_size) - logits for input and output grids
+            Tensor of shape (batch_size, 25, vocab_size) - logits for output grid only
         """
         batch_size = x.shape[0]
 
@@ -1006,16 +1010,19 @@ class TransformerModel(nn.Module):
         # Concatenate task and grid latents
         combined_latents = torch.cat([task_decoded, grid_decoded], dim=1)  # (batch_size, num_task_latent_tokens + num_grid_latent_tokens, d_model)
 
-        # Project sequence dimension to 50 tokens
-        latent_transposed = combined_latents.transpose(1, 2)  # (batch_size, d_model, num_task_latent_tokens + num_grid_latent_tokens)
-        decoder_output_transposed = self.decoder_from_latent_tokens(latent_transposed)  # (batch_size, d_model, 50)
-        decoder_output = decoder_output_transposed.transpose(1, 2)  # (batch_size, 50, d_model)
+        # Add position embeddings to combined latents
+        combined_latents = combined_latents + self.latent_position_embeddings.unsqueeze(0)  # (batch_size, num_task_latent_tokens + num_grid_latent_tokens, d_model)
 
-        # Apply decoder transformer to all 50 tokens
-        decoded = self.decoder_transformer(decoder_output)  # (batch_size, 50, d_model)
+        # Apply decoder transformer to latent tokens
+        decoded_latents = self.decoder_transformer(combined_latents)  # (batch_size, num_task_latent_tokens + num_grid_latent_tokens, d_model)
 
-        # Apply output projection to get logits for all 50 tokens
-        logits = self.output_projection(decoded)  # (batch_size, 50, vocab_size)
+        # Project sequence dimension from latent tokens to 25 output tokens
+        latent_transposed = decoded_latents.transpose(1, 2)  # (batch_size, d_model, num_task_latent_tokens + num_grid_latent_tokens)
+        output_tokens_transposed = self.decoder_to_output_tokens(latent_transposed)  # (batch_size, d_model, 25)
+        output_tokens = output_tokens_transposed.transpose(1, 2)  # (batch_size, 25, d_model)
+
+        # Apply output projection to get logits for all 25 tokens
+        logits = self.output_projection(output_tokens)  # (batch_size, 25, vocab_size)
 
         return logits
 
@@ -1044,13 +1051,10 @@ def optimize_output_grid(
         input_grid = model.token_embedding(input_tokens)  # (batch_size, 25, d_model)
 
         # Get model's predicted logits (pass task_indices separately)
-        logits = model(input_grid, task_indices)  # (batch_size, 50, vocab_size)
+        logits = model(input_grid, task_indices)  # (batch_size, 25, vocab_size)
 
-        # Extract output grid logits (last 25 tokens)
-        output_logits = logits[:, -25:, :]  # (batch_size, 25, vocab_size)
-
-        # Get predicted tokens from logits
-        predicted_tokens = output_logits.argmax(dim=-1)  # (batch_size, 25)
+        # Get predicted tokens from logits (all 25 tokens are output grid)
+        predicted_tokens = logits.argmax(dim=-1)  # (batch_size, 25)
 
     return DenoisingResult(
         optimized_output_tokens=predicted_tokens,
@@ -1141,7 +1145,7 @@ def compute_loss_for_batch(
 ) -> torch.Tensor:
     """Compute loss for a single batch using FSQ autoencoder.
 
-    Passes task embedding and input grid to model, trains to predict both input and output grids.
+    Passes task embedding and input grid to model, trains to predict output grid only.
 
     Args:
         model: The transformer model
@@ -1160,15 +1164,15 @@ def compute_loss_for_batch(
     input_tokens = batch[:, :25]  # (batch_size, 25)
     input_emb = model.token_embedding(input_tokens)  # (batch_size, 25, d_model)
 
-    # Forward pass - model outputs logits for 50 tokens (input + output grids)
+    # Forward pass - model outputs logits for 25 tokens (output grid only)
     # Pass task_indices separately to the model
-    logits = model(input_emb, task_indices)  # (batch_size, 50, vocab_size)
+    logits = model(input_emb, task_indices)  # (batch_size, 25, vocab_size)
 
-    # Get true tokens (input + output grids)
-    true_tokens = batch  # (batch_size, 50)
+    # Get true output tokens (last 25 tokens)
+    true_tokens = batch[:, 25:]  # (batch_size, 25)
 
     # Compute cross entropy loss
-    # Reshape logits to (batch_size * 50, vocab_size) and targets to (batch_size * 50)
+    # Reshape logits to (batch_size * 25, vocab_size) and targets to (batch_size * 25)
     loss = nn.functional.cross_entropy(
         logits.reshape(-1, model.vocab_size),
         true_tokens.reshape(-1),
