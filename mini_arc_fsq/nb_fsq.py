@@ -1881,7 +1881,7 @@ def main():
         num_layers=8,
         dim_feedforward=1024,
         dropout=0.1,
-        fsq_levels=[6, 5],
+        fsq_levels=[8, 6, 5],
         num_task_latent_tokens=5,
         num_grid_latent_tokens=5,
         # Data parameters
