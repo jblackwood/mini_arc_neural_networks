@@ -848,6 +848,95 @@ class FiniteScalarQuantization(nn.Module):
         return z_quantized
 
 
+class FSQCodebookLookup(nn.Module):
+    """Soft-attention based lookup from quantized vectors to embeddings.
+    
+    Pre-computes all possible FSQ codewords and uses temperature-scaled softmax
+    over negative distances to compute soft one-hot encodings.
+    """
+    
+    codewords: torch.Tensor
+    
+    def __init__(self, fsq_levels: List[int], d_model: int, tau: float = 0.1):
+        """Initialize soft-attention codebook lookup.
+        
+        Args:
+            fsq_levels: List of integers specifying the number of allowed values for each channel
+            d_model: Output embedding dimension
+            tau: Temperature parameter for softmax (default 1.0)
+        """
+        super().__init__()
+        self.num_fsq_channels = len(fsq_levels)
+        self.d_model = d_model
+        self.tau = tau
+        self.fsq_levels = fsq_levels
+        self.codebook_size = int(np.prod(fsq_levels))
+        
+        # Pre-compute all possible FSQ codewords
+        codewords = self._generate_fsq_codewords(fsq_levels)
+        self.register_buffer('codewords', codewords)  # (codebook_size, num_fsq_channels)
+        
+        # Learnable embedding matrix: (codebook_size, d_model)
+        self.embeddings = nn.Parameter(torch.randn(self.codebook_size, d_model))
+    
+    def _generate_fsq_codewords(self, levels: List[int]) -> torch.Tensor:
+        """Generate all possible FSQ codewords.
+        
+        Args:
+            levels: List of integers specifying the number of allowed values for each channel
+        
+        Returns:
+            Tensor of shape (codebook_size, num_channels) with all possible quantized values
+        """
+        # For each channel, generate the allowed values: -floor(L/2), ..., 0, ..., floor(L/2)
+        channel_values = []
+        for L in levels:
+            half_L = L // 2
+            values = torch.arange(-half_L, half_L + 1, dtype=torch.float32)
+            # Only keep L values (if L is even, we have L+1 values, so remove the largest)
+            if len(values) > L:
+                values = values[:-1]
+            channel_values.append(values)
+        
+        # Generate all combinations using meshgrid
+        grids = torch.meshgrid(*channel_values, indexing='ij')
+        
+        # Stack and reshape to (codebook_size, num_channels)
+        codewords = torch.stack([g.flatten() for g in grids], dim=1)
+        
+        return codewords
+    
+    def forward(self, z_quantized: torch.Tensor) -> torch.Tensor:
+        """Look up embeddings using soft-attention over distances.
+        
+        Args:
+            z_quantized: Quantized vectors of shape (batch_size, num_tokens, num_fsq_channels)
+        
+        Returns:
+            Embeddings of shape (batch_size, num_tokens, d_model)
+        """
+        batch_size, num_tokens, _ = z_quantized.shape
+        
+        # Reshape for broadcasting: (batch_size, num_tokens, 1, num_fsq_channels)
+        z_expanded = z_quantized.unsqueeze(2)
+        
+        # Codewords: (1, 1, codebook_size, num_fsq_channels)
+        codewords_expanded = self.codewords.unsqueeze(0).unsqueeze(0)
+        
+        # Compute squared distances: (batch_size, num_tokens, codebook_size)
+        squared_distances = torch.sum((z_expanded - codewords_expanded) ** 2, dim=-1)
+        
+        # Apply softmax over negative distances with temperature scaling
+        # (batch_size, num_tokens, codebook_size)
+        weights = torch.nn.functional.softmax(-squared_distances / self.tau, dim=-1)
+        
+        # Multiply by embedding matrix: (batch_size, num_tokens, d_model)
+        # output[b, t] = sum_c weights[b, t, c] * embeddings[c]
+        output = torch.matmul(weights, self.embeddings)
+        
+        return output
+
+
 class TransformerModel(nn.Module):
     """Denoising FSQ autoencoder transformer for ARC tasks."""
 
@@ -953,10 +1042,14 @@ class TransformerModel(nn.Module):
         # FSQ layer
         self.fsq = FiniteScalarQuantization(fsq_levels)
 
-        # Decoder projections from FSQ latent space
+        # Decoder: soft-attention codebook lookup from FSQ latent space
         # decoder_from_fsq is shared for both task and grid latents
-        # Project from num_fsq_channels to d_model
-        self.decoder_from_fsq = nn.Linear(self.num_fsq_channels, d_model)
+        # Uses temperature-scaled softmax over distances to pre-computed FSQ codewords
+        self.decoder_from_fsq = FSQCodebookLookup(
+            fsq_levels=fsq_levels,
+            d_model=d_model,
+            tau=1.0,
+        )
 
         # Learnable position embeddings for combined latent tokens
         total_latent_tokens = num_task_latent_tokens + num_grid_latent_tokens
