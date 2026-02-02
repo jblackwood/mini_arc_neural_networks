@@ -36,7 +36,8 @@ class Config:
     dim_feedforward: int
     dropout: float
     fsq_levels: List[int]
-    num_latent_tokens: int
+    num_task_latent_tokens: int
+    num_grid_latent_tokens: int
 
     # Training parameters
     batch_size: int
@@ -860,7 +861,8 @@ class TransformerModel(nn.Module):
         dropout: float,
         num_tasks: int,
         fsq_levels: List[int],
-        num_latent_tokens: int,
+        num_task_latent_tokens: int,
+        num_grid_latent_tokens: int,
     ):
         """Initialize the transformer model.
 
@@ -873,7 +875,8 @@ class TransformerModel(nn.Module):
             dropout: Dropout rate
             num_tasks: Number of unique tasks for task embedding (1 token per task)
             fsq_levels: List of number of allowed values for each FSQ channel (e.g., [8, 6, 5])
-            num_latent_tokens: Number of tokens in latent representation (e.g., 10)
+            num_task_latent_tokens: Number of task latent tokens
+            num_grid_latent_tokens: Number of grid latent tokens
         """
         super().__init__()
 
@@ -881,11 +884,13 @@ class TransformerModel(nn.Module):
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.fsq_levels = fsq_levels
-        self.num_latent_tokens = num_latent_tokens
+        self.num_task_latent_tokens = num_task_latent_tokens
+        self.num_grid_latent_tokens = num_grid_latent_tokens
         self.num_fsq_channels = len(fsq_levels)
 
-        # Task embedding layer (1 token per task)
-        self.task_embedding = nn.Embedding(num_tasks, d_model)
+        # Task embedding layer - directly encodes to FSQ space
+        task_embedding_dim = num_task_latent_tokens * self.num_fsq_channels
+        self.task_embedding = nn.Embedding(num_tasks, task_embedding_dim)
         
         # Initialize task embeddings with mean 0 and std 0.01
         with torch.no_grad():
@@ -918,7 +923,6 @@ class TransformerModel(nn.Module):
         self.token_embedding.weight.requires_grad = False
 
         # Learnable position embeddings for grid types
-        self.input_grid_embedding = nn.Parameter(torch.randn(d_model))
         self.output_grid_embedding = nn.Parameter(torch.randn(d_model))
 
         # 2D Rotary Position Embeddings
@@ -934,20 +938,22 @@ class TransformerModel(nn.Module):
         )
         self.encoder_transformer = nn.TransformerEncoder(encoder_layer, num_layers)
 
-        # Encoder projections to FSQ latent space
-        # Project from (26, d_model) to (num_latent_tokens, d_model) to (num_latent_tokens, num_fsq_channels)
-        # Use sequence-dimension projection: (d_model, 26) -> (d_model, num_latent_tokens)
-        self.encoder_to_latent_tokens = nn.Linear(26, num_latent_tokens)
-        self.encoder_to_fsq = nn.Linear(d_model, self.num_fsq_channels)
+        # Encoder projections to FSQ latent space (for grid only)
+        # Project from (25, d_model) to (num_grid_latent_tokens, d_model) to (num_grid_latent_tokens, num_fsq_channels)
+        # Use sequence-dimension projection: (d_model, 25) -> (d_model, num_grid_latent_tokens)
+        self.grid_encoder_to_latent_tokens = nn.Linear(25, num_grid_latent_tokens)
+        self.grid_encoder_to_fsq = nn.Linear(d_model, self.num_fsq_channels)
 
         # FSQ layer
         self.fsq = FiniteScalarQuantization(fsq_levels)
 
         # Decoder projections from FSQ latent space
-        # Project from (num_latent_tokens, num_fsq_channels) to (num_latent_tokens, d_model) to (50, d_model)
-        # Use sequence-dimension projection: (d_model, num_latent_tokens) -> (d_model, 50)
+        # decoder_from_fsq is shared for both task and grid latents
+        # Project from num_fsq_channels to d_model
         self.decoder_from_fsq = nn.Linear(self.num_fsq_channels, d_model)
-        self.decoder_from_latent_tokens = nn.Linear(num_latent_tokens, 50)
+        # Project from (num_task_latent_tokens + num_grid_latent_tokens) to 50
+        total_latent_tokens = num_task_latent_tokens + num_grid_latent_tokens
+        self.decoder_from_latent_tokens = nn.Linear(total_latent_tokens, 50)
 
         # Decoder transformer
         decoder_layer = nn.TransformerEncoderLayer(
@@ -962,52 +968,50 @@ class TransformerModel(nn.Module):
         # Output projection layer: project to logits for vocab_size classes
         self.output_projection = nn.Linear(d_model, vocab_size)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, task_indices: torch.Tensor) -> torch.Tensor:
         """Forward pass.
 
         Args:
-            x: Input tensor of shape (batch_size, 26, d_model) - embeddings for
-               task token (1) and input grid (25)
+            x: Input tensor of shape (batch_size, 25, d_model) - embeddings for input grid only
+            task_indices: Task indices of shape (batch_size,)
 
         Returns:
             Tensor of shape (batch_size, 50, vocab_size) - logits for input and output grids
         """
         batch_size = x.shape[0]
 
-        # Split into task token and input grid
-        task_token = x[:, :1, :]  # (batch_size, 1, d_model)
-        input_grid = x[:, 1:, :]  # (batch_size, 25, d_model)
-
-        # Add grid type embedding to input grid
-        input_grid = input_grid + self.input_grid_embedding  # (batch_size, 25, d_model)
-
-        # Apply 2D rotary position embeddings to input grid
-        input_grid = self.rope(input_grid)  # (batch_size, 25, d_model)
-
-        # Concatenate task token and input grid
-        encoder_input = torch.cat([task_token, input_grid], dim=1)  # (batch_size, 26, d_model)
-
-        # Apply encoder transformer
-        encoded = self.encoder_transformer(encoder_input)  # (batch_size, 26, d_model)
-
-        # Project sequence dimension: (batch_size, 26, d_model) -> (batch_size, num_latent_tokens, d_model)
-        # Transpose to (batch_size, d_model, 26), apply linear, transpose back
-        encoded_transposed = encoded.transpose(1, 2)  # (batch_size, d_model, 26)
-        latent_tokens_transposed = self.encoder_to_latent_tokens(encoded_transposed)  # (batch_size, d_model, num_latent_tokens)
-        latent_tokens = latent_tokens_transposed.transpose(1, 2)  # (batch_size, num_latent_tokens, d_model)
-
-        # Project to FSQ space: (batch_size, num_latent_tokens, d_model) -> (batch_size, num_latent_tokens, num_fsq_channels)
-        z_continuous = self.encoder_to_fsq(latent_tokens)  # (batch_size, num_latent_tokens, num_fsq_channels)
-
+        # Process task embedding
+        # Lookup task embedding: (batch_size, num_task_latent_tokens * num_fsq_channels)
+        task_emb = self.task_embedding(task_indices)
+        # Reshape to (batch_size, num_task_latent_tokens, num_fsq_channels)
+        task_latent = task_emb.view(batch_size, self.num_task_latent_tokens, self.num_fsq_channels)
         # Apply FSQ quantization
-        z_quantized = self.fsq(z_continuous)  # (batch_size, num_latent_tokens, num_fsq_channels)
+        task_quantized = self.fsq(task_latent)  # (batch_size, num_task_latent_tokens, num_fsq_channels)
+        # Project to d_model
+        task_decoded = self.decoder_from_fsq(task_quantized)  # (batch_size, num_task_latent_tokens, d_model)
 
-        # Project back from FSQ space: (batch_size, num_latent_tokens, num_fsq_channels) -> (batch_size, num_latent_tokens, d_model)
-        latent_tokens_decoded = self.decoder_from_fsq(z_quantized)  # (batch_size, num_latent_tokens, d_model)
+        # Process input grid
+        # x is already (batch_size, 25, d_model)
+        # Apply 2D rotary position embeddings
+        input_grid = self.rope(x)  # (batch_size, 25, d_model)
+        # Apply encoder transformer
+        grid_encoded = self.encoder_transformer(input_grid)  # (batch_size, 25, d_model)
+        # Project sequence dimension: (batch_size, 25, d_model) -> (batch_size, num_grid_latent_tokens, d_model)
+        grid_encoded_transposed = grid_encoded.transpose(1, 2)  # (batch_size, d_model, 25)
+        grid_latent_transposed = self.grid_encoder_to_latent_tokens(grid_encoded_transposed)  # (batch_size, d_model, num_grid_latent_tokens)
+        grid_latent = grid_latent_transposed.transpose(1, 2)  # (batch_size, num_grid_latent_tokens, d_model)
+        # Project to FSQ space
+        grid_fsq = self.grid_encoder_to_fsq(grid_latent)  # (batch_size, num_grid_latent_tokens, num_fsq_channels)
+        # Apply FSQ quantization
+        grid_quantized = self.fsq(grid_fsq)  # (batch_size, num_grid_latent_tokens, num_fsq_channels)
+        # Project to d_model
+        grid_decoded = self.decoder_from_fsq(grid_quantized)  # (batch_size, num_grid_latent_tokens, d_model)
 
-        # Project sequence dimension: (batch_size, num_latent_tokens, d_model) -> (batch_size, 50, d_model)
-        # Transpose to (batch_size, d_model, num_latent_tokens), apply linear, transpose back
-        latent_transposed = latent_tokens_decoded.transpose(1, 2)  # (batch_size, d_model, num_latent_tokens)
+        # Concatenate task and grid latents
+        combined_latents = torch.cat([task_decoded, grid_decoded], dim=1)  # (batch_size, num_task_latent_tokens + num_grid_latent_tokens, d_model)
+
+        # Project sequence dimension to 50 tokens
+        latent_transposed = combined_latents.transpose(1, 2)  # (batch_size, d_model, num_task_latent_tokens + num_grid_latent_tokens)
         decoder_output_transposed = self.decoder_from_latent_tokens(latent_transposed)  # (batch_size, d_model, 50)
         decoder_output = decoder_output_transposed.transpose(1, 2)  # (batch_size, 50, d_model)
 
@@ -1039,19 +1043,12 @@ def optimize_output_grid(
     device = batch.device
 
     with torch.no_grad():
-        # Lookup task embedding
-        task_emb = model.task_embedding(task_indices)  # (batch_size, d_model)
-        task_emb = task_emb.unsqueeze(1)  # (batch_size, 1, d_model)
-
         # Lookup input grid token embeddings
         input_tokens = batch[:, :25]  # (batch_size, 25)
         input_grid = model.token_embedding(input_tokens)  # (batch_size, 25, d_model)
 
-        # Concatenate: task token and input grid only
-        x = torch.cat([task_emb, input_grid], dim=1)  # (batch_size, 26, d_model)
-
-        # Get model's predicted logits
-        logits = model(x)  # (batch_size, 50, vocab_size)
+        # Get model's predicted logits (pass task_indices separately)
+        logits = model(input_grid, task_indices)  # (batch_size, 50, vocab_size)
 
         # Extract output grid logits (last 25 tokens)
         output_logits = logits[:, -25:, :]  # (batch_size, 25, vocab_size)
@@ -1163,19 +1160,13 @@ def compute_loss_for_batch(
     batch = batch.to(device)  # (batch_size, 50)
     task_indices = task_indices.to(device)  # (batch_size,)
 
-    # Lookup task embeddings
-    task_emb = model.task_embedding(task_indices)  # (batch_size, d_model)
-    task_emb = task_emb.unsqueeze(1)  # (batch_size, 1, d_model)
-
     # Lookup input grid token embeddings only (first 25 tokens)
     input_tokens = batch[:, :25]  # (batch_size, 25)
     input_emb = model.token_embedding(input_tokens)  # (batch_size, 25, d_model)
 
-    # Concatenate: task token and input grid only
-    x = torch.cat([task_emb, input_emb], dim=1)  # (batch_size, 26, d_model)
-
     # Forward pass - model outputs logits for 50 tokens (input + output grids)
-    logits = model(x)  # (batch_size, 50, vocab_size)
+    # Pass task_indices separately to the model
+    logits = model(input_emb, task_indices)  # (batch_size, 50, vocab_size)
 
     # Get true tokens (input + output grids)
     true_tokens = batch  # (batch_size, 50)
@@ -1623,7 +1614,8 @@ def train(config: Config):
         dropout=config.dropout,
         num_tasks=num_tasks,
         fsq_levels=config.fsq_levels,
-        num_latent_tokens=config.num_latent_tokens,
+        num_task_latent_tokens=config.num_task_latent_tokens,
+        num_grid_latent_tokens=config.num_grid_latent_tokens,
     ).to(device)
 
     # Compile model for better performance (PyTorch 2.0+)
@@ -1889,8 +1881,9 @@ def main():
         num_layers=8,
         dim_feedforward=1024,
         dropout=0.1,
-        fsq_levels=[8, 6, 5],
-        num_latent_tokens=10,
+        fsq_levels=[6, 5],
+        num_task_latent_tokens=5,
+        num_grid_latent_tokens=5,
         # Data parameters
         vocab_size=10,
         # Denoising evaluation parameters
