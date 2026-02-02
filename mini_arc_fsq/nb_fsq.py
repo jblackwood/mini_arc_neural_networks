@@ -891,10 +891,6 @@ class TransformerModel(nn.Module):
         # Task embedding layer - directly encodes to FSQ space
         task_embedding_dim = num_task_latent_tokens * self.num_fsq_channels
         self.task_embedding = nn.Embedding(num_tasks, task_embedding_dim)
-        
-        # Initialize task embeddings with mean 0 and std 0.01
-        with torch.no_grad():
-            self.task_embedding.weight.data.normal_(mean=0.0, std=0.01)
 
         # Token embedding layer (vocab_size -> d_model)
         self.token_embedding = nn.Embedding(vocab_size, d_model)
