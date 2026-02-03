@@ -2149,7 +2149,7 @@ def main():
         task_embedding_lr=1e-2,
         weight_decay=0,
         task_embedding_weight_decay=0,
-        label_smoothing=0.1,
+        label_smoothing=0,
         temperature=2.0,
         mode="train",
         checkpoint_save_interval=50,
