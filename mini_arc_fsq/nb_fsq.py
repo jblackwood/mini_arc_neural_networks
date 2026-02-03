@@ -35,7 +35,7 @@ class Config:
     num_layers: int
     dim_feedforward: int
     dropout: float
-    fsq_levels: List[int]
+    num_token_categories: int
     num_task_latent_tokens: int
     num_grid_latent_tokens: int
 
@@ -806,133 +806,53 @@ class RoPE2D(nn.Module):
 
 
 
-class FiniteScalarQuantization(nn.Module):
-    """Finite Scalar Quantization layer with straight-through estimator."""
-
-    def __init__(self, levels: List[int]):
-        """Initialize FSQ layer.
-
-        Args:
-            levels: List of integers specifying the number of allowed values for each channel.
-                   For example, [8, 6, 5] creates a codebook of size 8*6*5=240.
-        """
-        super().__init__()
-        self.levels = levels
-        self.num_channels = len(levels)
-        self.codebook_size = int(np.prod(levels))
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """Quantize input using FSQ with straight-through estimator.
-
-        Args:
-            z: Input tensor of shape (batch_size, num_tokens, num_channels)
-
-        Returns:
-            Quantized tensor of same shape, with gradients using straight-through estimator
-        """
-        # Convert levels to tensor for vectorized operations
-        # Shape: (num_channels,)
-        levels = torch.tensor(self.levels, dtype=z.dtype, device=z.device)
-        half_levels = torch.floor(levels / 2)  # floor(L/2) for each channel
-        
-        # Apply tanh to bound values to [-1, 1], then scale by floor(L/2)
-        # Shape: (batch_size, num_tokens, num_channels)
-        z_scaled = half_levels * torch.tanh(z)
-        
-        # Round to nearest integer to get discrete values
-        z_rounded = torch.round(z_scaled)
-        
-        # Apply straight-through estimator: use quantized in forward, original gradients in backward
-        z_quantized = z_scaled + (z_rounded - z_scaled).detach()
-        
-        return z_quantized
-
-
-class FSQCodebookLookup(nn.Module):
-    """Soft-attention based lookup from quantized vectors to embeddings.
+class GumbelSoftmaxQuantizer(nn.Module):
+    """Gumbel Softmax quantization with learnable embeddings.
     
-    Pre-computes all possible FSQ codewords and uses temperature-scaled softmax
-    over negative distances to compute soft one-hot encodings.
+    Projects input to logits, applies Gumbel Softmax, then looks up embeddings.
     """
     
-    codewords: torch.Tensor
-    
-    def __init__(self, fsq_levels: List[int], d_model: int, tau: float):
-        """Initialize soft-attention codebook lookup.
+    def __init__(self, d_model: int, num_categories: int):
+        """Initialize Gumbel Softmax quantizer.
         
         Args:
-            fsq_levels: List of integers specifying the number of allowed values for each channel
-            d_model: Output embedding dimension
-            tau: Temperature parameter for softmax
+            d_model: Model dimension (input and output)
+            num_categories: Number of discrete categories for quantization
         """
         super().__init__()
-        self.num_fsq_channels = len(fsq_levels)
         self.d_model = d_model
-        self.tau = tau
-        self.fsq_levels = fsq_levels
-        self.codebook_size = int(np.prod(fsq_levels))
+        self.num_categories = num_categories
         
-        # Pre-compute all possible FSQ codewords
-        codewords = self._generate_fsq_codewords(fsq_levels)
-        self.register_buffer('codewords', codewords)  # (codebook_size, num_fsq_channels)
+        # Project from d_model to logits
+        self.to_logits = nn.Linear(d_model, num_categories)
         
-        # Learnable embedding matrix: (codebook_size, d_model)
-        self.embeddings = nn.Parameter(torch.randn(self.codebook_size, d_model))
+        # Learnable embedding matrix: (num_categories, d_model)
+        self.embeddings = nn.Parameter(torch.randn(num_categories, d_model))
     
-    def _generate_fsq_codewords(self, levels: List[int]) -> torch.Tensor:
-        """Generate all possible FSQ codewords.
+    def forward(self, x: torch.Tensor, temperature: float, hard: bool) -> torch.Tensor:
+        """Apply Gumbel Softmax quantization.
         
         Args:
-            levels: List of integers specifying the number of allowed values for each channel
-        
-        Returns:
-            Tensor of shape (codebook_size, num_channels) with all possible quantized values
-        """
-        # For each channel, generate the allowed values: -floor(L/2), ..., 0, ..., floor(L/2)
-        channel_values = []
-        for L in levels:
-            half_L = L // 2
-            values = torch.arange(-half_L, half_L + 1, dtype=torch.float32)
-            # Only keep L values (if L is even, we have L+1 values, so remove the largest)
-            if len(values) > L:
-                values = values[:-1]
-            channel_values.append(values)
-        
-        # Generate all combinations using meshgrid
-        grids = torch.meshgrid(*channel_values, indexing='ij')
-        
-        # Stack and reshape to (codebook_size, num_channels)
-        codewords = torch.stack([g.flatten() for g in grids], dim=1)
-        
-        return codewords
-    
-    def forward(self, z_quantized: torch.Tensor) -> torch.Tensor:
-        """Look up embeddings using soft-attention over distances.
-        
-        Args:
-            z_quantized: Quantized vectors of shape (batch_size, num_tokens, num_fsq_channels)
+            x: Input tensor of shape (batch_size, num_tokens, d_model)
+            temperature: Temperature for Gumbel Softmax
+            hard: Whether to use hard (one-hot) or soft samples
         
         Returns:
             Embeddings of shape (batch_size, num_tokens, d_model)
         """
-        batch_size, num_tokens, _ = z_quantized.shape
+        # Project to logits: (batch_size, num_tokens, num_categories)
+        logits = self.to_logits(x)
         
-        # Reshape for broadcasting: (batch_size, num_tokens, 1, num_fsq_channels)
-        z_expanded = z_quantized.unsqueeze(2)
+        # Apply Gumbel Softmax: (batch_size, num_tokens, num_categories)
+        if self.training:
+            soft_one_hot = nn.functional.gumbel_softmax(logits, tau=temperature, hard=hard, dim=-1)
+        else:
+            # During eval, use argmax (hard one-hot)
+            indices = logits.argmax(dim=-1)
+            soft_one_hot = nn.functional.one_hot(indices, num_classes=self.num_categories).float()
         
-        # Codewords: (1, 1, codebook_size, num_fsq_channels)
-        codewords_expanded = self.codewords.unsqueeze(0).unsqueeze(0)
-        
-        # Compute squared distances: (batch_size, num_tokens, codebook_size)
-        squared_distances = torch.sum((z_expanded - codewords_expanded) ** 2, dim=-1)
-        
-        # Apply softmax over negative distances with temperature scaling
-        # (batch_size, num_tokens, codebook_size)
-        weights = torch.nn.functional.softmax(-squared_distances / self.tau, dim=-1)
-        
-        # Multiply by embedding matrix: (batch_size, num_tokens, d_model)
-        # output[b, t] = sum_c weights[b, t, c] * embeddings[c]
-        output = torch.matmul(weights, self.embeddings)
+        # Look up embeddings: (batch_size, num_tokens, d_model)
+        output = torch.matmul(soft_one_hot, self.embeddings)
         
         return output
 
@@ -949,7 +869,7 @@ class TransformerModel(nn.Module):
         vocab_size: int,
         dropout: float,
         num_tasks: int,
-        fsq_levels: List[int],
+        num_token_categories: int,
         num_task_latent_tokens: int,
         num_grid_latent_tokens: int,
     ):
@@ -963,7 +883,7 @@ class TransformerModel(nn.Module):
             vocab_size: Number of possible cell values (10 for ARC: 0-9 colors)
             dropout: Dropout rate
             num_tasks: Number of unique tasks for task embedding (1 token per task)
-            fsq_levels: List of number of allowed values for each FSQ channel (e.g., [8, 6, 5])
+            num_token_categories: Number of discrete categories for Gumbel Softmax quantization
             num_task_latent_tokens: Number of task latent tokens
             num_grid_latent_tokens: Number of grid latent tokens
         """
@@ -972,17 +892,16 @@ class TransformerModel(nn.Module):
         # Store dimensions for later use
         self.vocab_size = vocab_size
         self.d_model = d_model
-        self.fsq_levels = fsq_levels
+        self.num_token_categories = num_token_categories
         self.num_task_latent_tokens = num_task_latent_tokens
         self.num_grid_latent_tokens = num_grid_latent_tokens
-        self.num_fsq_channels = len(fsq_levels)
 
         # Task embedding layer - embeds to d_model dimension
         self.task_embedding = nn.Embedding(num_tasks, d_model)
         
-        # MLP layers to transform task embedding from d_model to FSQ space
+        # MLP layers to transform task embedding to task latent tokens
         # Expand by 4x, then contract to 2x, then to final dimension
-        task_embedding_dim = num_task_latent_tokens * self.num_fsq_channels
+        task_embedding_dim = num_task_latent_tokens * d_model
         self.task_mlp = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
             nn.ReLU(),
@@ -1033,23 +952,16 @@ class TransformerModel(nn.Module):
         )
         self.encoder_transformer = nn.TransformerEncoder(encoder_layer, num_layers)
 
-        # Encoder projections to FSQ latent space (for grid only)
-        # Project from (25, d_model) to (num_grid_latent_tokens, d_model) to (num_grid_latent_tokens, num_fsq_channels)
+        # Encoder projections to latent space (for grid only)
+        # Project from (25, d_model) to (num_grid_latent_tokens, d_model)
         # Use sequence-dimension projection: (d_model, 25) -> (d_model, num_grid_latent_tokens)
         self.grid_encoder_to_latent_tokens = nn.Linear(25, num_grid_latent_tokens)
-        self.grid_encoder_to_fsq = nn.Linear(d_model, self.num_fsq_channels)
 
-        # FSQ layer
-        self.fsq = FiniteScalarQuantization(fsq_levels)
+        # Gumbel Softmax quantizer for task latents
+        self.task_quantizer = GumbelSoftmaxQuantizer(d_model, num_token_categories)
 
-        # Decoder: soft-attention codebook lookup from FSQ latent space
-        # decoder_from_fsq is shared for both task and grid latents
-        # Uses temperature-scaled softmax over distances to pre-computed FSQ codewords
-        self.decoder_from_fsq = FSQCodebookLookup(
-            fsq_levels=fsq_levels,
-            d_model=d_model,
-            tau=0.1,
-        )
+        # Gumbel Softmax quantizer for grid latents
+        self.grid_quantizer = GumbelSoftmaxQuantizer(d_model, num_token_categories)
 
         # Learnable position embeddings for combined latent tokens
         total_latent_tokens = num_task_latent_tokens + num_grid_latent_tokens
@@ -1071,12 +983,14 @@ class TransformerModel(nn.Module):
         # Output projection layer: project to logits for vocab_size classes
         self.output_projection = nn.Linear(d_model, vocab_size)
 
-    def forward(self, x: torch.Tensor, task_indices: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, task_indices: torch.Tensor, temperature: float, hard: bool) -> torch.Tensor:
         """Forward pass.
 
         Args:
             x: Input tensor of shape (batch_size, 25, d_model) - embeddings for input grid only
             task_indices: Task indices of shape (batch_size,)
+            temperature: Temperature for Gumbel Softmax
+            hard: Whether to use hard (one-hot) or soft samples in Gumbel Softmax
 
         Returns:
             Tensor of shape (batch_size, 25, vocab_size) - logits for output grid only
@@ -1086,14 +1000,12 @@ class TransformerModel(nn.Module):
         # Process task embedding
         # Lookup task embedding: (batch_size, d_model)
         task_emb = self.task_embedding(task_indices)
-        # Pass through MLP layers: (batch_size, d_model) -> (batch_size, num_task_latent_tokens * num_fsq_channels)
-        task_mlp_output = self.task_mlp(task_emb)  # (batch_size, num_task_latent_tokens * num_fsq_channels)
-        # Reshape to (batch_size, num_task_latent_tokens, num_fsq_channels)
-        task_latent = task_mlp_output.view(batch_size, self.num_task_latent_tokens, self.num_fsq_channels)
-        # Apply FSQ quantization
-        task_quantized = self.fsq(task_latent)  # (batch_size, num_task_latent_tokens, num_fsq_channels)
-        # Project to d_model
-        task_decoded = self.decoder_from_fsq(task_quantized)  # (batch_size, num_task_latent_tokens, d_model)
+        # Pass through MLP layers: (batch_size, d_model) -> (batch_size, num_task_latent_tokens * d_model)
+        task_mlp_output = self.task_mlp(task_emb)  # (batch_size, num_task_latent_tokens * d_model)
+        # Reshape to (batch_size, num_task_latent_tokens, d_model)
+        task_latent = task_mlp_output.view(batch_size, self.num_task_latent_tokens, self.d_model)
+        # Apply Gumbel Softmax quantization
+        task_quantized = self.task_quantizer(task_latent, temperature, hard)  # (batch_size, num_task_latent_tokens, d_model)
 
         # Process input grid
         # x is already (batch_size, 25, d_model)
@@ -1105,15 +1017,11 @@ class TransformerModel(nn.Module):
         grid_encoded_transposed = grid_encoded.transpose(1, 2)  # (batch_size, d_model, 25)
         grid_latent_transposed = self.grid_encoder_to_latent_tokens(grid_encoded_transposed)  # (batch_size, d_model, num_grid_latent_tokens)
         grid_latent = grid_latent_transposed.transpose(1, 2)  # (batch_size, num_grid_latent_tokens, d_model)
-        # Project to FSQ space
-        grid_fsq = self.grid_encoder_to_fsq(grid_latent)  # (batch_size, num_grid_latent_tokens, num_fsq_channels)
-        # Apply FSQ quantization
-        grid_quantized = self.fsq(grid_fsq)  # (batch_size, num_grid_latent_tokens, num_fsq_channels)
-        # Project to d_model
-        grid_decoded = self.decoder_from_fsq(grid_quantized)  # (batch_size, num_grid_latent_tokens, d_model)
+        # Apply Gumbel Softmax quantization
+        grid_quantized = self.grid_quantizer(grid_latent, temperature, hard)  # (batch_size, num_grid_latent_tokens, d_model)
 
         # Concatenate task and grid latents
-        combined_latents = torch.cat([task_decoded, grid_decoded], dim=1)  # (batch_size, num_task_latent_tokens + num_grid_latent_tokens, d_model)
+        combined_latents = torch.cat([task_quantized, grid_quantized], dim=1)  # (batch_size, num_task_latent_tokens + num_grid_latent_tokens, d_model)
 
         # Add position embeddings to combined latents
         combined_latents = combined_latents + self.latent_position_embeddings.unsqueeze(0)  # (batch_size, num_task_latent_tokens + num_grid_latent_tokens, d_model)
@@ -1155,8 +1063,8 @@ def optimize_output_grid(
         input_tokens = batch[:, :25]  # (batch_size, 25)
         input_grid = model.token_embedding(input_tokens)  # (batch_size, 25, d_model)
 
-        # Get model's predicted logits (pass task_indices separately)
-        logits = model(input_grid, task_indices)  # (batch_size, 25, vocab_size)
+        # Get model's predicted logits (use low temperature for sharp predictions)
+        logits = model(input_grid, task_indices, temperature=0.1, hard=True)  # (batch_size, 25, vocab_size)
 
         # Get predicted tokens from logits (all 25 tokens are output grid)
         predicted_tokens = logits.argmax(dim=-1)  # (batch_size, 25)
@@ -1247,8 +1155,10 @@ def compute_loss_for_batch(
     task_indices: torch.Tensor,
     device: torch.device,
     label_smoothing: float,
+    temperature: float,
+    hard: bool,
 ) -> torch.Tensor:
-    """Compute loss for a single batch using FSQ autoencoder.
+    """Compute loss for a single batch using Gumbel Softmax quantization.
 
     Passes task embedding and input grid to model, trains to predict output grid only.
 
@@ -1258,6 +1168,8 @@ def compute_loss_for_batch(
         task_indices: Task indices of shape (batch_size,)
         device: Device to compute on
         label_smoothing: Label smoothing value for cross entropy loss
+        temperature: Temperature for Gumbel Softmax
+        hard: Whether to use hard (one-hot) or soft samples in Gumbel Softmax
 
     Returns:
         Loss tensor (scalar)
@@ -1270,8 +1182,8 @@ def compute_loss_for_batch(
     input_emb = model.token_embedding(input_tokens)  # (batch_size, 25, d_model)
 
     # Forward pass - model outputs logits for 25 tokens (output grid only)
-    # Pass task_indices separately to the model
-    logits = model(input_emb, task_indices)  # (batch_size, 25, vocab_size)
+    # Pass task_indices, temperature, and hard separately to the model
+    logits = model(input_emb, task_indices, temperature, hard)  # (batch_size, 25, vocab_size)
 
     # Get true output tokens (last 25 tokens)
     true_tokens = batch[:, 25:]  # (batch_size, 25)
@@ -1294,6 +1206,8 @@ def train_epoch(
     device: torch.device,
     task_id_to_index: Dict[str, int],
     label_smoothing: float,
+    temperature: float,
+    hard: bool,
 ) -> float:
     """Train for one epoch.
 
@@ -1304,6 +1218,8 @@ def train_epoch(
         device: Device to train on
         task_id_to_index: Mapping from task_id strings to integer indices
         label_smoothing: Label smoothing value for cross entropy loss
+        temperature: Temperature for Gumbel Softmax
+        hard: Whether to use hard (one-hot) or soft samples in Gumbel Softmax
 
     Returns:
         Average loss
@@ -1328,7 +1244,7 @@ def train_epoch(
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
         
         # Compute loss
-        loss = compute_loss_for_batch(model, batch, task_indices, device, label_smoothing)
+        loss = compute_loss_for_batch(model, batch, task_indices, device, label_smoothing, temperature, hard)
 
         # Backward pass
         optimizer.zero_grad()
@@ -1381,8 +1297,8 @@ def test_epoch(
             # Convert task_ids to indices
             task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
             
-            # Compute loss
-            loss = compute_loss_for_batch(model, batch, task_indices, device, label_smoothing)
+            # Compute loss (use low temperature and hard=True for eval)
+            loss = compute_loss_for_batch(model, batch, task_indices, device, label_smoothing, temperature=0.1, hard=True)
 
             total_loss_sum += loss.item()
             num_batches += 1
@@ -1434,8 +1350,8 @@ def learning_rate_test(
         batch = torch.stack(batch_tensors, dim=0)  # (batch_size, 50)
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
 
-        # Compute loss
-        loss = compute_loss_for_batch(model, batch, task_indices, device, label_smoothing)
+        # Compute loss (use temperature=1.0 for test)
+        loss = compute_loss_for_batch(model, batch, task_indices, device, label_smoothing, temperature=1.0, hard=False)
 
         # Backward pass
         opt.zero_grad()
@@ -1497,8 +1413,8 @@ def weight_decay_test(
         batch = torch.stack(batch_tensors, dim=0)  # (batch_size, 50)
         task_indices = torch.tensor([task_id_to_index[tid] for tid in task_ids], dtype=torch.long)
 
-        # Compute loss
-        loss = compute_loss_for_batch(model, batch, task_indices, device, label_smoothing)
+        # Compute loss (use temperature=1.0 for test)
+        loss = compute_loss_for_batch(model, batch, task_indices, device, label_smoothing, temperature=1.0, hard=False)
 
         # Backward pass
         opt.zero_grad()
@@ -1718,7 +1634,7 @@ def train(config: Config):
         vocab_size=config.vocab_size,
         dropout=config.dropout,
         num_tasks=num_tasks,
-        fsq_levels=config.fsq_levels,
+        num_token_categories=config.num_token_categories,
         num_task_latent_tokens=config.num_task_latent_tokens,
         num_grid_latent_tokens=config.num_grid_latent_tokens,
     ).to(device)
@@ -1817,8 +1733,19 @@ def train(config: Config):
     for epoch in range(start_epoch, start_epoch + config.num_epochs):
         epoch_start_time = time.time()
 
+        # Compute temperature for Gumbel Softmax (anneal from 2.0 to 0.1)
+        # Linear annealing: temp = start_temp - (start_temp - end_temp) * (epoch / total_epochs)
+        start_temp = 2.0
+        end_temp = 0.1
+        progress = epoch / (start_epoch + config.num_epochs)
+        temperature = start_temp - (start_temp - end_temp) * progress
+        temperature = max(temperature, end_temp)  # Clamp to minimum
+        
+        # Use hard=False (soft) during training
+        hard = False
+
         # Train
-        train_loss = train_epoch(model, train_loader, optimizer, device, task_id_to_index, config.label_smoothing)
+        train_loss = train_epoch(model, train_loader, optimizer, device, task_id_to_index, config.label_smoothing, temperature, hard)
 
         # Test
         test_loss = test_epoch(model, test_loader, device, task_id_to_index, config.label_smoothing)
@@ -1866,7 +1793,8 @@ def train(config: Config):
             f"Epoch {epoch + 1}/{start_epoch + config.num_epochs} - "
             f"Train Loss: {train_loss:.6f}, Test Loss: {test_loss:.6f}, "
             f"Time: {epoch_time:.2f}s, "
-            f"Weight Norm: {model_weight_norm:.4f}"
+            f"Weight Norm: {model_weight_norm:.4f}, "
+            f"Temperature: {temperature:.3f}"
         )
         print(
             f"  Layer Mean Squares - "
@@ -1879,6 +1807,7 @@ def train(config: Config):
         writer.add_scalar("Loss/test", test_loss, epoch)
         writer.add_scalar("Time/epoch", epoch_time, epoch)
         writer.add_scalar("Model/weight_norm", model_weight_norm, epoch)
+        writer.add_scalar("GumbelSoftmax/temperature", temperature, epoch)
         
         # Log layer-wise mean squares
         writer.add_scalar("LayerMeanSquare/task_embedding", task_emb_mean_sq, epoch)
@@ -1986,7 +1915,7 @@ def main():
         num_layers=8,
         dim_feedforward=1024,
         dropout=0.1,
-        fsq_levels=[8, 6, 5],
+        num_token_categories=256,
         num_task_latent_tokens=5,
         num_grid_latent_tokens=5,
         # Data parameters
