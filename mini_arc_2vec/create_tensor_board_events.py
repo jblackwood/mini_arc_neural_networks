@@ -23,51 +23,24 @@ from torch.utils.tensorboard import SummaryWriter
 def parse_epoch_line(line: str):
     """Parse an epoch summary line.
     
-    Example formats:
-    - "Epoch 1/300 - Train Loss: 0.045345, Test Loss: 0.031181, Time: 154.78s, Weight Norm: 378.6285, Logit Scale: 8.1446"
-    - "Epoch 1/150 - Train Loss: 635.124390 (CE: 1.578391, KL: 633.546021), Test Loss: 470.223816 (CE: 1.351296, KL: 468.872528), Time: 127.30s"
+    Example format:
+    - "Epoch 1/150 - Train Loss: 1.777958, Test Loss: 1.534351, Temp: 2.000, Time: 149.65s, Weight Norm: 131.9295, Logit Scale (Grid): 1.8584, (Task): 4.4697"
     
     Returns:
-        dict with keys: epoch, train_loss, test_loss, time, weight_norm (optional), logit_scale (optional), 
-                        train_ce (optional), train_kl (optional), test_ce (optional), test_kl (optional)
+        dict with keys: epoch, train_loss, test_loss, temp, time, weight_norm, logit_scale_grid, logit_scale_task
     """
-    # Try the format with CE/KL breakdown
-    pattern_ce_kl = r"Epoch (\d+)/\d+ - Train Loss: ([\d.]+) \(CE: ([\d.]+), KL: ([-\d.]+)\), Test Loss: ([\d.]+) \(CE: ([\d.]+), KL: ([-\d.]+)\), Time: ([\d.]+)s"
-    match = re.match(pattern_ce_kl, line)
-    if match:
-        return {
-            'epoch': int(match.group(1)),
-            'train_loss': float(match.group(2)),
-            'train_ce': float(match.group(3)),
-            'train_kl': float(match.group(4)),
-            'test_loss': float(match.group(5)),
-            'test_ce': float(match.group(6)),
-            'test_kl': float(match.group(7)),
-            'time': float(match.group(8))
-        }
-    
-    # Try the format with Weight Norm and Logit Scale
-    pattern_new = r"Epoch (\d+)/\d+ - Train Loss: ([\d.]+), Test Loss: ([\d.]+), Time: ([\d.]+)s, Weight Norm: ([\d.]+), Logit Scale: ([\d.]+)"
-    match = re.match(pattern_new, line)
+    pattern = r"Epoch (\d+)/\d+ - Train Loss: ([\d.]+), Test Loss: ([\d.]+), Temp: ([\d.]+), Time: ([\d.]+)s, Weight Norm: ([\d.]+), Logit Scale \(Grid\): ([\d.]+), \(Task\): ([\d.]+)"
+    match = re.match(pattern, line)
     if match:
         return {
             'epoch': int(match.group(1)),
             'train_loss': float(match.group(2)),
             'test_loss': float(match.group(3)),
-            'time': float(match.group(4)),
-            'weight_norm': float(match.group(5)),
-            'logit_scale': float(match.group(6))
-        }
-    
-    # Try the old format without Weight Norm and Logit Scale
-    pattern_old = r"Epoch (\d+)/\d+ - Train Loss: ([\d.]+), Test Loss: ([\d.]+), Time: ([\d.]+)s"
-    match = re.match(pattern_old, line)
-    if match:
-        return {
-            'epoch': int(match.group(1)),
-            'train_loss': float(match.group(2)),
-            'test_loss': float(match.group(3)),
-            'time': float(match.group(4))
+            'temp': float(match.group(4)),
+            'time': float(match.group(5)),
+            'weight_norm': float(match.group(6)),
+            'logit_scale_grid': float(match.group(7)),
+            'logit_scale_task': float(match.group(8))
         }
     return None
 
@@ -115,19 +88,19 @@ def parse_best_iter_line(line: str):
 def parse_layer_mean_squares_line(line: str):
     """Parse a layer mean squares line.
     
-    Example: "  Layer Mean Squares - Task Emb: 0.003909, Token Emb: 0.001299, Out Proj 1: 0.001515, Out Proj 2: 0.006631, Transformer: 0.001155"
+    Example: "  Layer Mean Squares - Task Emb: 0.971150, Token Emb: 0.964938, Grid Out: 0.001226, Task Out: 0.001219, Transformer: 0.001166"
     
     Returns:
-        dict with keys: task_emb, token_emb, out_proj_1, out_proj_2, transformer (or None if no match)
+        dict with keys: task_emb, token_emb, grid_out, task_out, transformer (or None if no match)
     """
-    pattern = r"\s+Layer Mean Squares - Task Emb: ([\d.]+), Token Emb: ([\d.]+), Out Proj 1: ([\d.]+), Out Proj 2: ([\d.]+), Transformer: ([\d.]+)"
+    pattern = r"\s+Layer Mean Squares - Task Emb: ([\d.]+), Token Emb: ([\d.]+), Grid Out: ([\d.]+), Task Out: ([\d.]+), Transformer: ([\d.]+)"
     match = re.match(pattern, line)
     if match:
         return {
             'task_emb': float(match.group(1)),
             'token_emb': float(match.group(2)),
-            'out_proj_1': float(match.group(3)),
-            'out_proj_2': float(match.group(4)),
+            'grid_out': float(match.group(3)),
+            'task_out': float(match.group(4)),
             'transformer': float(match.group(5))
         }
     return None
@@ -171,23 +144,18 @@ def parse_loss_components_line(line: str):
 
 
 def extract_model_name(md_path: Path):
-    """Extract model name from the checkpoint filename.
+    """Extract model name from the result file.
     
-    Example: "20260105_010813_epoch_150_checkpoint.md" -> "20260105_010813_model"
+    Example: "result.md" -> "result_model"
     
     Args:
-        md_path: Path to the .md checkpoint file
+        md_path: Path to the .md file
         
     Returns:
         Model name string
     """
     filename = md_path.stem  # Gets filename without extension
-    # Extract timestamp (part before _epoch_)
-    match = re.match(r'(\d{8}_\d{6})_epoch_\d+_checkpoint', filename)
-    if match:
-        return f"{match.group(1)}_model"
-    # Fallback: just use the filename stem
-    return filename
+    return f"{filename}_model"
 
 
 def parse_md_file(md_path: Path):
@@ -289,8 +257,12 @@ def write_to_tensorboard(metrics, log_dir: Path, model_name: str):
         # Write model metrics if available
         if 'weight_norm' in epoch_data:
             writer.add_scalar("Model/weight_norm", epoch_data['weight_norm'], epoch)
-        if 'logit_scale' in epoch_data:
-            writer.add_scalar("Model/logit_scale", epoch_data['logit_scale'], epoch)
+        if 'temp' in epoch_data:
+            writer.add_scalar("Model/temperature", epoch_data['temp'], epoch)
+        if 'logit_scale_grid' in epoch_data:
+            writer.add_scalar("Model/logit_scale_grid", epoch_data['logit_scale_grid'], epoch)
+        if 'logit_scale_task' in epoch_data:
+            writer.add_scalar("Model/logit_scale_task", epoch_data['logit_scale_task'], epoch)
         
         # Write denoising metrics if available (convert accuracy percentages to decimals)
         if 'train_acc' in epoch_data:
@@ -310,8 +282,8 @@ def write_to_tensorboard(metrics, log_dir: Path, model_name: str):
         if 'task_emb' in epoch_data:
             writer.add_scalar("LayerMeanSquare/task_embedding", epoch_data['task_emb'], epoch)
             writer.add_scalar("LayerMeanSquare/token_embedding", epoch_data['token_emb'], epoch)
-            writer.add_scalar("LayerMeanSquare/output_proj_1", epoch_data['out_proj_1'], epoch)
-            writer.add_scalar("LayerMeanSquare/output_proj_2", epoch_data['out_proj_2'], epoch)
+            writer.add_scalar("LayerMeanSquare/grid_out", epoch_data['grid_out'], epoch)
+            writer.add_scalar("LayerMeanSquare/task_out", epoch_data['task_out'], epoch)
             writer.add_scalar("LayerMeanSquare/transformer_avg", epoch_data['transformer'], epoch)
         
         # Write sparsity if available
@@ -329,8 +301,8 @@ def write_to_tensorboard(metrics, log_dir: Path, model_name: str):
 
 def main():
     # ============ Configure these variables ============
-    md_file = "mini_arc_eqm/results/20260129_011136_epoch_100_checkpoint.md"
-    log_dir = "output/mini_arc_eqm5/runs"
+    md_file = "mini_arc_2vec/results/20260203_172512_epoch_50_checkpoint.md"
+    log_dir = "output/mini_arc_2vec/runs"
     # ===================================================
     
     md_path = Path(md_file)
