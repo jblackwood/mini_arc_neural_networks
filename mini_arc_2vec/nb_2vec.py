@@ -990,7 +990,7 @@ def optimize_output_grid(
     x_input: torch.Tensor,
     task_indices: torch.Tensor,
 ) -> DenoisingResult:
-    """Generate output grid by running model once.
+    """Generate output grid by iteratively replacing mask tokens with most confident predictions.
 
     Args:
         model: The transformer model to use for prediction
@@ -1005,17 +1005,54 @@ def optimize_output_grid(
         # Get task one-hot vectors from TaskTokenModel (hard=True for inference)
         task_one_hot = task_token_model(task_indices, temperature=0.1, hard=True)
         
-        # Forward pass through model
-        grid_logits, task_logits = model(x_input, task_one_hot)
-        # grid_logits: (batch_size, 50, vocab_size)
-        # task_logits: (batch_size, num_task_latent_tokens, num_token_categories)
+        # Clone input to avoid modifying original
+        x_current = x_input.clone()
+        batch_size = x_current.shape[0]
         
-        # Get predicted tokens for output grid (last 25 positions)
-        output_grid_logits = grid_logits[:, 25:, :]  # (batch_size, 25, vocab_size)
-        predicted_tokens = torch.argmax(output_grid_logits, dim=2)  # (batch_size, 25)
+        # Run for 25 iterations (one for each output grid position)
+        for iteration in range(25):
+            # Forward pass through model
+            grid_logits, task_logits = model(x_current, task_one_hot)
+            # grid_logits: (batch_size, 50, vocab_size)
+            # task_logits: (batch_size, num_task_latent_tokens, num_token_categories)
+            
+            # Get predicted tokens and confidences for output grid (last 25 positions)
+            output_grid_logits = grid_logits[:, 25:, :]  # (batch_size, 25, vocab_size)
+            
+            # Get max probabilities (confidence) for each position
+            max_probs, predicted_tokens = torch.max(torch.softmax(output_grid_logits, dim=2), dim=2)
+            # max_probs: (batch_size, 25)
+            # predicted_tokens: (batch_size, 25)
+            
+            # Find mask token positions (token value 10) in output grid
+            mask = (x_current[:, 25:] == 10)  # (batch_size, 25)
+            
+            # Check which samples still have mask tokens
+            has_masks = mask.any(dim=1)  # (batch_size,)
+            
+            if not has_masks.any():
+                # No more mask tokens to replace in any sample
+                break
+            
+            # Only consider mask positions for confidence scoring
+            masked_probs = max_probs.clone()
+            masked_probs[~mask] = -float('inf')  # Set non-mask positions to -inf
+            
+            # Find the most confident mask position for each sample
+            most_confident_positions = torch.argmax(masked_probs, dim=1)  # (batch_size,)
+            
+            # Get the predicted tokens at these positions
+            batch_indices = torch.arange(batch_size, device=x_current.device)
+            predicted_at_confident = predicted_tokens[batch_indices, most_confident_positions]
+            
+            # Replace mask tokens at these positions (only for samples with masks)
+            x_current[batch_indices[has_masks], 25 + most_confident_positions[has_masks]] = predicted_at_confident[has_masks]
+        
+        # Extract final predicted tokens for output grid
+        final_predicted_tokens = x_current[:, 25:]  # (batch_size, 25)
     
     return DenoisingResult(
-        optimized_output_tokens=predicted_tokens,
+        optimized_output_tokens=final_predicted_tokens,
     )
 
 
