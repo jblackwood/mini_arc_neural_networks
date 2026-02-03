@@ -46,6 +46,7 @@ class Config:
     weight_decay: float
     task_embedding_weight_decay: float
     label_smoothing: float
+    temperature: float
     mode: Literal["train", "learning_rate_test", "weight_decay_test", "eval"]
     checkpoint_save_interval: int
 
@@ -1902,9 +1903,8 @@ def train(config: Config):
     for epoch in range(start_epoch, start_epoch + config.num_epochs):
         epoch_start_time = time.time()
 
-        # Temperature annealing: 2.0 -> 0.1 over training
-        # Linear schedule from 2.0 to 0.1
-        temperature = 2.0 - (2.0 - 0.1) * (epoch / config.num_epochs)
+        # Use constant temperature from config
+        temperature = config.temperature
         hard = False  # Use soft Gumbel softmax during training
 
         # Train
@@ -2123,6 +2123,7 @@ def main():
         weight_decay=0.001,
         task_embedding_weight_decay=0.001,
         label_smoothing=0.1,
+        temperature=2.0,
         mode="train",
         checkpoint_save_interval=50,
         # Google Drive location for Colab
