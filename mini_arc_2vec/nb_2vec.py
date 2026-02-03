@@ -1171,7 +1171,6 @@ def compute_loss_for_batch(
     device: torch.device,
     label_smoothing: float,
     temperature: float,
-    hard: bool,
 ) -> torch.Tensor:
     """Compute loss for a single batch using BERT-style masking.
 
@@ -1183,7 +1182,6 @@ def compute_loss_for_batch(
         device: Device to compute on
         label_smoothing: Label smoothing value
         temperature: Temperature for Gumbel softmax
-        hard: Whether to use hard or soft Gumbel softmax
 
     Returns:
         Loss tensor (scalar)
@@ -1194,8 +1192,8 @@ def compute_loss_for_batch(
     num_task_latent_tokens = model.num_task_latent_tokens
     num_token_categories = model.num_token_categories
 
-    # Get task one-hot vectors from TaskTokenModel
-    task_one_hot = task_token_model(task_indices, temperature, hard)  # (batch_size, num_task_latent_tokens, num_token_categories)
+    # Get task one-hot vectors from TaskTokenModel (always use hard=True)
+    task_one_hot = task_token_model(task_indices, temperature, hard=True)  # (batch_size, num_task_latent_tokens, num_token_categories)
 
     # Create masked inputs (BERT-style)
     masked_task_one_hot, masked_grid_tokens, mask_positions = create_masked_inputs(
@@ -1283,7 +1281,6 @@ def train_epoch(
     task_id_to_index: Dict[str, int],
     label_smoothing: float,
     temperature: float,
-    hard: bool,
 ) -> float:
     """Train for one epoch.
 
@@ -1296,7 +1293,6 @@ def train_epoch(
         task_id_to_index: Mapping from task_id strings to integer indices
         label_smoothing: Label smoothing value
         temperature: Temperature for Gumbel softmax
-        hard: Whether to use hard or soft Gumbel softmax
 
     Returns:
         Average training loss
@@ -1330,7 +1326,6 @@ def train_epoch(
             device=device,
             label_smoothing=label_smoothing,
             temperature=temperature,
-            hard=hard,
         )
 
         # Backward pass
@@ -1397,7 +1392,6 @@ def test_epoch(
                 device=device,
                 label_smoothing=label_smoothing,
                 temperature=0.1,
-                hard=True,
             )
 
             total_loss += loss.item()
@@ -1462,7 +1456,6 @@ def learning_rate_test(
             device=device,
             label_smoothing=label_smoothing,
             temperature=0.5,
-            hard=False,
         )
 
         # Backward pass
@@ -1540,7 +1533,6 @@ def weight_decay_test(
             device=device,
             label_smoothing=label_smoothing,
             temperature=0.5,
-            hard=False,
         )
 
         # Backward pass
@@ -1905,7 +1897,6 @@ def train(config: Config):
 
         # Use constant temperature from config
         temperature = config.temperature
-        hard = False  # Use soft Gumbel softmax during training
 
         # Train
         train_loss = train_epoch(
@@ -1917,7 +1908,6 @@ def train(config: Config):
             task_id_to_index=task_id_to_index,
             label_smoothing=config.label_smoothing,
             temperature=temperature,
-            hard=hard,
         )
 
         # Test
