@@ -1926,8 +1926,8 @@ def main():
         dim_feedforward=1024,
         dropout=0.1,
         num_token_categories=256,
-        num_task_latent_tokens=5,
-        num_grid_latent_tokens=5,
+        num_task_latent_tokens=25,
+        num_grid_latent_tokens=25,
         # Data parameters
         vocab_size=10,
         # Denoising evaluation parameters
