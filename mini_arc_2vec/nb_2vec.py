@@ -2109,13 +2109,13 @@ def main():
         random_seed=42,
         max_augmentations=500,
         # Model parameters
-        d_model=384,
-        nhead=6,
-        num_layers=16,
-        dim_feedforward=1536,
+        d_model=256,
+        nhead=8,
+        num_layers=8,
+        dim_feedforward=1024,
         dropout=0.1,
-        num_token_categories=32,
-        num_task_latent_tokens=8,
+        num_token_categories=64,
+        num_task_latent_tokens=10,
         # Data parameters
         vocab_size=11,
         # Denoising evaluation parameters
@@ -2123,8 +2123,8 @@ def main():
         # Training parameters
         num_epochs=150,
         batch_size=32,
-        learning_rate=5e-5,
-        task_embedding_lr=5e-3,
+        learning_rate=1e-4,
+        task_embedding_lr=1e-2,
         weight_decay=0.001,
         task_embedding_weight_decay=0.001,
         label_smoothing=0.1,
