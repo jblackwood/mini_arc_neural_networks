@@ -807,9 +807,10 @@ class RoPE2D(nn.Module):
 
 
 class GumbelSoftmaxQuantizer(nn.Module):
-    """Gumbel Softmax quantization with learnable embeddings.
+    """Gumbel Softmax quantization with low-rank learnable embeddings.
     
-    Projects input to logits, applies Gumbel Softmax, then looks up embeddings.
+    Projects input to logits, applies Gumbel Softmax, then looks up low-rank embeddings
+    and projects to d_model.
     """
     
     def __init__(self, d_model: int, num_categories: int):
@@ -823,11 +824,17 @@ class GumbelSoftmaxQuantizer(nn.Module):
         self.d_model = d_model
         self.num_categories = num_categories
         
+        # Compute low-rank embedding dimension: num_categories^(1/3)
+        self.embedding_dim = int(num_categories ** (1/3))
+        
         # Project from d_model to logits
         self.to_logits = nn.Linear(d_model, num_categories)
         
-        # Learnable embedding matrix: (num_categories, d_model)
-        self.embeddings = nn.Parameter(torch.randn(num_categories, d_model))
+        # Low-rank learnable embedding matrix: (num_categories, embedding_dim)
+        self.embeddings = nn.Parameter(torch.randn(num_categories, self.embedding_dim))
+        
+        # Project from embedding_dim to d_model
+        self.to_d_model = nn.Linear(self.embedding_dim, d_model)
     
     def forward(self, x: torch.Tensor, temperature: float, hard: bool) -> torch.Tensor:
         """Apply Gumbel Softmax quantization.
@@ -851,8 +858,11 @@ class GumbelSoftmaxQuantizer(nn.Module):
             indices = logits.argmax(dim=-1)
             soft_one_hot = nn.functional.one_hot(indices, num_classes=self.num_categories).float()
         
-        # Look up embeddings: (batch_size, num_tokens, d_model)
-        output = torch.matmul(soft_one_hot, self.embeddings)
+        # Look up low-rank embeddings: (batch_size, num_tokens, embedding_dim)
+        low_rank_output = torch.matmul(soft_one_hot, self.embeddings)
+        
+        # Project to d_model: (batch_size, num_tokens, d_model)
+        output = self.to_d_model(low_rank_output)
         
         return output
 
