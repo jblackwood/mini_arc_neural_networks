@@ -824,13 +824,17 @@ class TaskTokenModel(nn.Module):
         # Task embedding layer
         self.task_embedding = nn.Embedding(num_tasks, d_model)
         
-        # MLP layers
+        # MLP layers with large hidden dimensions (>1M parameters excluding embedding)
+        # Hidden dimension of d_model*4 gives large capacity
+        hidden_dim = d_model * 4
         self.mlp = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
+            nn.Linear(d_model, hidden_dim),
             nn.ReLU(),
-            nn.Linear(d_model * 2, d_model * 2),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(d_model * 2, num_task_latent_tokens * num_token_categories)
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_task_latent_tokens * num_token_categories)
         )
     
     def forward(self, task_indices: torch.Tensor, temperature: float, hard: bool) -> torch.Tensor:
