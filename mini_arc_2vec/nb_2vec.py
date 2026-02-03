@@ -822,7 +822,6 @@ class TaskTokenModel(nn.Module):
         
         # Task embedding layer
         self.task_embedding = nn.Embedding(num_tasks, d_model)
-        nn.init.normal_(self.task_embedding.weight, mean=0.0, std=0.01)
         
         # MLP layers
         self.mlp = nn.Sequential(
@@ -901,10 +900,11 @@ class TransformerModel(nn.Module):
         # Task token projection layer: (num_token_categories, d_model)
         self.task_token_proj = nn.Linear(num_token_categories, d_model)
 
+        # Task token position embeddings
+        self.task_token_position_embedding = nn.Parameter(torch.randn(num_task_latent_tokens, d_model))
+
         # Token embedding layer (vocab_size -> d_model)
         self.token_embedding = nn.Embedding(vocab_size, d_model)
-        # Initialize token embeddings with mean 0 and std 0.01
-        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.01)
 
         # Learnable position embeddings for grid types
         self.input_grid_embedding = nn.Parameter(torch.randn(d_model))
@@ -945,6 +945,9 @@ class TransformerModel(nn.Module):
         
         # Project task one-hot vectors to d_model: (batch_size, num_task_latent_tokens, d_model)
         task_emb = self.task_token_proj(task_one_hot)
+        
+        # Add position embeddings to task tokens
+        task_emb = task_emb + self.task_token_position_embedding
         
         # Apply token embedding to grid tokens
         x = self.token_embedding(x)  # (batch_size, 50, d_model)
@@ -1097,14 +1100,6 @@ def evaluate_denoising_accuracy(
         accuracies=accuracies,
         predicted_grids=predicted_grids,
     )
-    accuracies = (predicted_grids == true_grids).float().mean(dim=(1, 2))
-
-    # Use replace to add accuracies and predicted_grids to the result
-    return replace(
-        opt_result,
-        accuracies=accuracies,
-        predicted_grids=predicted_grids,
-    )
 
 
 def create_masked_inputs(
@@ -1113,7 +1108,7 @@ def create_masked_inputs(
     device: torch.device,
     vocab_size: int,
     num_task_latent_tokens: int,
-    mask_token: int = 10,
+    mask_token: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Create masked inputs for BERT-style training.
     
