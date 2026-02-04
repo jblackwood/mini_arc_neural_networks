@@ -48,7 +48,6 @@ class Config:
     weight_decay: float
     task_embedding_weight_decay: float
     label_smoothing: float
-    temperature: float
     mode: Literal["train", "learning_rate_test", "weight_decay_test", "eval"]
     checkpoint_save_interval: int
 
@@ -2096,7 +2095,6 @@ def main():
         weight_decay=0,
         task_embedding_weight_decay=0,
         label_smoothing=0,
-        temperature=2.0,
         mode="train",
         checkpoint_save_interval=50,
         # Google Drive location for Colab
