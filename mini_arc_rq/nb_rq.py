@@ -841,9 +841,11 @@ class TransformerModel(nn.Module):
         self.task_codebook_dim = task_codebook_dim
         self.num_task_codebooks = num_task_codebooks
 
-        # Task embedding layer: maps task index to embedding vector
+        # Task embedding layers: separate embedding layer per codebook
         task_emb_dim = task_codebook_dim * num_task_latent_tokens
-        self.task_embedding = nn.Embedding(num_tasks, task_emb_dim)
+        self.task_embeddings = nn.ModuleList([
+            nn.Embedding(num_tasks, task_emb_dim) for _ in range(num_task_codebooks)
+        ])
 
         # Task codebooks: multiple codebooks (num_task_codebooks, task_codebook_size, task_codebook_dim) with unit L2 norm
         for i in range(num_task_codebooks):
@@ -958,9 +960,9 @@ def optimize_output_grid(
         DenoisingResult with optimized_output_tokens (predicted tokens from model output)
     """
     with torch.no_grad():
-        # Get task embeddings and reshape
-        task_emb = model.task_embedding(task_indices)  # (batch_size, task_codebook_dim * num_task_latent_tokens)
-        task_embeddings = task_emb.view(-1, model.num_task_latent_tokens, model.task_codebook_dim)
+        # Get task embeddings from each codebook layer and add them together
+        task_emb_sum = torch.stack([emb_layer(task_indices) for emb_layer in model.task_embeddings]).sum(dim=0)  # (batch_size, task_codebook_dim * num_task_latent_tokens)
+        task_embeddings = task_emb_sum.view(-1, model.num_task_latent_tokens, model.task_codebook_dim)
         
         # Clone input to avoid modifying original
         x_current = x_input.clone()
@@ -1184,13 +1186,20 @@ def compute_loss_for_batch(
     task_codebook_dim = model.task_codebook_dim
     num_task_codebooks = model.num_task_codebooks
 
-    # Get task embeddings and reshape
-    task_emb = model.task_embedding(task_indices)  # (batch_size, task_codebook_dim * num_task_latent_tokens)
-    task_embeddings = task_emb.view(-1, num_task_latent_tokens, task_codebook_dim)  # (batch_size, num_task_latent_tokens, task_codebook_dim)
+    # Get task embeddings from each codebook layer
+    # For model input: sum all embeddings
+    task_emb_sum = torch.stack([emb_layer(task_indices) for emb_layer in model.task_embeddings]).sum(dim=0)  # (batch_size, task_codebook_dim * num_task_latent_tokens)
+    task_embeddings_sum = task_emb_sum.view(-1, num_task_latent_tokens, task_codebook_dim)  # (batch_size, num_task_latent_tokens, task_codebook_dim)
+    
+    # For target calculation: get individual embeddings per codebook
+    task_embeddings_per_codebook = [
+        emb_layer(task_indices).view(-1, num_task_latent_tokens, task_codebook_dim)
+        for emb_layer in model.task_embeddings
+    ]  # List of (batch_size, num_task_latent_tokens, task_codebook_dim)
 
     # Create masked inputs (BERT-style)
     masked_task_embeddings, masked_grid_tokens, mask_positions = create_masked_inputs(
-        task_embeddings=task_embeddings,
+        task_embeddings=task_embeddings_sum,
         grid_tokens=x,
         device=device,
         vocab_size=vocab_size,
@@ -1215,24 +1224,26 @@ def compute_loss_for_batch(
     # Task token loss (only on masked positions)
     if task_mask.any():
         # Get targets by finding closest codebook entry for each codebook (vectorized)
-        # task_embeddings: (batch_size, num_task_latent_tokens, task_codebook_dim)
-        task_emb_flat = task_embeddings.reshape(-1, task_codebook_dim)  # (batch_size * num_task_latent_tokens, task_codebook_dim)
+        # Stack embeddings from all codebooks: (num_task_codebooks, batch_size, num_task_latent_tokens, task_codebook_dim)
+        all_embeddings = torch.stack(task_embeddings_per_codebook, dim=0)
+        # Flatten: (num_task_codebooks, batch_size * num_task_latent_tokens, task_codebook_dim)
+        all_embeddings_flat = all_embeddings.reshape(num_task_codebooks, -1, task_codebook_dim)
         
         # Stack all codebooks: (num_task_codebooks, task_codebook_size, task_codebook_dim)
         all_codebooks = torch.stack([
             cast(torch.Tensor, getattr(model, f'task_codebook_{i}')) for i in range(num_task_codebooks)
         ], dim=0)
         
-        # Expand task embeddings to have batch dimension for codebooks
-        task_emb_expanded = task_emb_flat.unsqueeze(0).expand(num_task_codebooks, -1, -1)  # (num_task_codebooks, batch_size * num_task_latent_tokens, task_codebook_dim)
+        # Compute distances for all codebooks at once: (num_task_codebooks, batch_size * num_task_latent_tokens, task_codebook_size)
+        all_dists = torch.cdist(all_embeddings_flat, all_codebooks)
         
-        # Compute distances for all codebooks at once
-        distances = torch.cdist(task_emb_expanded, all_codebooks)  # (num_task_codebooks, batch_size * num_task_latent_tokens, task_codebook_size)
+        # Get targets: (num_task_codebooks, batch_size * num_task_latent_tokens)
+        all_targets = torch.argmin(all_dists, dim=-1)
         
-        # Get targets and reshape
-        task_targets = torch.argmin(distances, dim=-1)  # (num_task_codebooks, batch_size * num_task_latent_tokens)
-        task_targets = task_targets.transpose(0, 1)  # (batch_size * num_task_latent_tokens, num_task_codebooks)
-        task_targets = task_targets.view(-1, num_task_latent_tokens, num_task_codebooks)  # (batch_size, num_task_latent_tokens, num_task_codebooks)
+        # Transpose to get: (batch_size * num_task_latent_tokens, num_task_codebooks)
+        task_targets = all_targets.transpose(0, 1)
+        # Reshape: (batch_size, num_task_latent_tokens, num_task_codebooks)
+        task_targets = task_targets.view(-1, num_task_latent_tokens, num_task_codebooks)
         
         # Flatten and select only masked positions
         # task_logits: (batch_size, num_task_latent_tokens, num_task_codebooks, task_codebook_size)
@@ -1245,16 +1256,14 @@ def compute_loss_for_batch(
         masked_task_targets = task_targets_flat[task_mask_flat]  # (num_masked, num_task_codebooks)
         
         if masked_task_logits.shape[0] > 0:
-            # Compute loss for each codebook separately and sum
-            task_loss = torch.tensor(0.0, device=device)
-            for i in range(num_task_codebooks):
-                codebook_loss = torch.nn.functional.cross_entropy(
-                    masked_task_logits[:, i, :],  # (num_masked, task_codebook_size)
-                    masked_task_targets[:, i],  # (num_masked,)
-                    label_smoothing=label_smoothing,
-                    reduction='sum'
-                )
-                task_loss = task_loss + codebook_loss
+            # Compute loss for all codebooks at once (vectorized)
+            # Reshape: (num_masked * num_task_codebooks, task_codebook_size) and (num_masked * num_task_codebooks,)
+            task_loss = torch.nn.functional.cross_entropy(
+                masked_task_logits.reshape(-1, task_codebook_size),
+                masked_task_targets.reshape(-1),
+                label_smoothing=label_smoothing,
+                reduction='sum'
+            )
             total_loss = total_loss + task_loss
             num_masked += masked_task_logits.shape[0] * num_task_codebooks
     
@@ -1771,7 +1780,7 @@ def train(config: Config):
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     codebook_params = sum(cast(torch.Tensor, getattr(model, f'task_codebook_{i}')).numel() for i in range(config.num_task_codebooks))
     
-    task_emb_params = sum(p.numel() for p in model.task_embedding.parameters())
+    task_emb_params = sum(p.numel() for emb_layer in model.task_embeddings for p in emb_layer.parameters())
     rope_params = 0  # RoPE buffers are not trainable
     
     embedding_params = task_emb_params + rope_params
@@ -1914,7 +1923,9 @@ def train(config: Config):
 
         # Calculate layer-wise mean square using vectorized operations
         # Embedding layers
-        task_emb_mean_sq = model.task_embedding.weight.pow(2).mean().item()
+        task_emb_mean_sq = torch.mean(torch.stack([
+            cast(nn.Embedding, emb_layer).weight.pow(2).mean() for emb_layer in model.task_embeddings
+        ])).item()
         token_emb_mean_sq = model.token_embedding.weight.pow(2).mean().item()
         
         # Linear layers
