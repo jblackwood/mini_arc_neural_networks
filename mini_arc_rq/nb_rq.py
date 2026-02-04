@@ -2090,8 +2090,8 @@ def main():
         # Training parameters
         num_epochs=300,
         batch_size=256,
-        learning_rate=1e-4,
-        task_embedding_lr=1e-2,
+        learning_rate=5e-5,
+        task_embedding_lr=5e-3,
         weight_decay=0,
         task_embedding_weight_decay=0,
         label_smoothing=0,
