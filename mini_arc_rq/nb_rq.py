@@ -2091,7 +2091,7 @@ def main():
         dim_feedforward=1024,
         dropout=0.1,
         task_codebook_size=64,
-        task_codebook_dim=8,
+        task_codebook_dim=16,
         num_task_codebooks=16,
         num_task_latent_tokens=10,
         # Data parameters
