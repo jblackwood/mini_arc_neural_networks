@@ -37,7 +37,6 @@ class Config:
     dropout: float
     task_codebook_size: int
     task_codebook_dim: int
-    num_task_codebooks: int
     num_task_latent_tokens: int
 
     # Training parameters
@@ -48,6 +47,7 @@ class Config:
     weight_decay: float
     task_embedding_weight_decay: float
     label_smoothing: float
+    temperature: float
     mode: Literal["train", "learning_rate_test", "weight_decay_test", "eval"]
     checkpoint_save_interval: int
 
@@ -813,7 +813,6 @@ class TransformerModel(nn.Module):
         dropout: float,
         task_codebook_size: int,
         task_codebook_dim: int,
-        num_task_codebooks: int,
         num_task_latent_tokens: int,
         num_tasks: int,
     ):
@@ -828,7 +827,6 @@ class TransformerModel(nn.Module):
             dropout: Dropout rate
             task_codebook_size: Number of discrete categories in task codebook
             task_codebook_dim: Dimension of each codebook entry
-            num_task_codebooks: Number of codebooks for multiple quantization
             num_task_latent_tokens: Number of task latent tokens
             num_tasks: Number of unique tasks
         """
@@ -839,19 +837,15 @@ class TransformerModel(nn.Module):
         self.num_task_latent_tokens = num_task_latent_tokens
         self.task_codebook_size = task_codebook_size
         self.task_codebook_dim = task_codebook_dim
-        self.num_task_codebooks = num_task_codebooks
 
-        # Task embedding layers: separate embedding layer per codebook
+        # Task embedding layer: maps task index to embedding vector
         task_emb_dim = task_codebook_dim * num_task_latent_tokens
-        self.task_embeddings = nn.ModuleList([
-            nn.Embedding(num_tasks, task_emb_dim) for _ in range(num_task_codebooks)
-        ])
+        self.task_embedding = nn.Embedding(num_tasks, task_emb_dim)
 
-        # Task codebooks: multiple codebooks (num_task_codebooks, task_codebook_size, task_codebook_dim) with unit L2 norm
-        for i in range(num_task_codebooks):
-            codebook = torch.randn(task_codebook_size, task_codebook_dim)
-            codebook = torch.nn.functional.normalize(codebook, p=2, dim=1)
-            self.register_buffer(f'task_codebook_{i}', codebook)
+        # Task codebook: (task_codebook_size, task_codebook_dim) with unit L2 norm
+        codebook = torch.randn(task_codebook_size, task_codebook_dim)
+        codebook = torch.nn.functional.normalize(codebook, p=2, dim=1)
+        self.register_buffer('task_codebook', codebook)
 
         # Task token projection layer: (task_codebook_dim, d_model)
         self.task_token_proj = nn.Linear(task_codebook_dim, d_model)
@@ -882,11 +876,8 @@ class TransformerModel(nn.Module):
         # Output projection layers
         # Grid prediction: (batch_size, 50, d_model) -> (batch_size, 50, vocab_size)
         self.grid_output_proj = nn.Linear(d_model, vocab_size)
-        # Task token predictions: multiple output projections, one per codebook
-        # Each: (batch_size, num_task_latent_tokens, d_model) -> (batch_size, num_task_latent_tokens, task_codebook_size)
-        self.task_output_projs = nn.ModuleList([
-            nn.Linear(d_model, task_codebook_size) for _ in range(num_task_codebooks)
-        ])
+        # Task token prediction: (batch_size, num_task_latent_tokens, d_model) -> (batch_size, num_task_latent_tokens, task_codebook_size)
+        self.task_output_proj = nn.Linear(d_model, task_codebook_size)
 
     def forward(self, x: torch.Tensor, task_embeddings: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass.
@@ -935,11 +926,8 @@ class TransformerModel(nn.Module):
         # Predict grid tokens: (batch_size, 50, d_model) -> (batch_size, 50, vocab_size)
         grid_logits = self.grid_output_proj(grid_features)
         
-        # Predict task tokens for each codebook: (batch_size, num_task_latent_tokens, num_task_codebooks, task_codebook_size)
-        task_logits_list = []
-        for task_output_proj in self.task_output_projs:
-            task_logits_list.append(task_output_proj(task_features))  # (batch_size, num_task_latent_tokens, task_codebook_size)
-        task_logits = torch.stack(task_logits_list, dim=2)  # (batch_size, num_task_latent_tokens, num_task_codebooks, task_codebook_size)
+        # Predict task tokens: (batch_size, num_task_latent_tokens, d_model) -> (batch_size, num_task_latent_tokens, task_codebook_size)
+        task_logits = self.task_output_proj(task_features)
         
         return grid_logits, task_logits
 
@@ -960,9 +948,9 @@ def optimize_output_grid(
         DenoisingResult with optimized_output_tokens (predicted tokens from model output)
     """
     with torch.no_grad():
-        # Get task embeddings from each codebook layer and add them together
-        task_emb_sum = torch.stack([emb_layer(task_indices) for emb_layer in model.task_embeddings]).sum(dim=0)  # (batch_size, task_codebook_dim * num_task_latent_tokens)
-        task_embeddings = task_emb_sum.view(-1, model.num_task_latent_tokens, model.task_codebook_dim)
+        # Get task embeddings and reshape
+        task_emb = model.task_embedding(task_indices)  # (batch_size, task_codebook_dim * num_task_latent_tokens)
+        task_embeddings = task_emb.view(-1, model.num_task_latent_tokens, model.task_codebook_dim)
         
         # Clone input to avoid modifying original
         x_current = x_input.clone()
@@ -973,7 +961,7 @@ def optimize_output_grid(
             # Forward pass through model
             grid_logits, task_logits = model(x_current, task_embeddings)
             # grid_logits: (batch_size, 50, vocab_size)
-            # task_logits: (batch_size, num_task_latent_tokens, num_task_codebooks, task_codebook_size)
+            # task_logits: (batch_size, num_task_latent_tokens, task_codebook_size)
             
             # Get predicted tokens and confidences for output grid (last 25 positions)
             output_grid_logits = grid_logits[:, 25:, :]  # (batch_size, 25, vocab_size)
@@ -1184,22 +1172,14 @@ def compute_loss_for_batch(
     num_task_latent_tokens = model.num_task_latent_tokens
     task_codebook_size = model.task_codebook_size
     task_codebook_dim = model.task_codebook_dim
-    num_task_codebooks = model.num_task_codebooks
 
-    # Get task embeddings from each codebook layer
-    # For model input: sum all embeddings
-    task_emb_sum = torch.stack([emb_layer(task_indices) for emb_layer in model.task_embeddings]).sum(dim=0)  # (batch_size, task_codebook_dim * num_task_latent_tokens)
-    task_embeddings_sum = task_emb_sum.view(-1, num_task_latent_tokens, task_codebook_dim)  # (batch_size, num_task_latent_tokens, task_codebook_dim)
-    
-    # For target calculation: get individual embeddings per codebook
-    task_embeddings_per_codebook = [
-        emb_layer(task_indices).view(-1, num_task_latent_tokens, task_codebook_dim)
-        for emb_layer in model.task_embeddings
-    ]  # List of (batch_size, num_task_latent_tokens, task_codebook_dim)
+    # Get task embeddings and reshape
+    task_emb = model.task_embedding(task_indices)  # (batch_size, task_codebook_dim * num_task_latent_tokens)
+    task_embeddings = task_emb.view(-1, num_task_latent_tokens, task_codebook_dim)  # (batch_size, num_task_latent_tokens, task_codebook_dim)
 
     # Create masked inputs (BERT-style)
     masked_task_embeddings, masked_grid_tokens, mask_positions = create_masked_inputs(
-        task_embeddings=task_embeddings_sum,
+        task_embeddings=task_embeddings,
         grid_tokens=x,
         device=device,
         vocab_size=vocab_size,
@@ -1211,7 +1191,7 @@ def compute_loss_for_batch(
     # Forward pass - model returns grid logits and task logits
     grid_logits, task_logits = model(masked_grid_tokens, masked_task_embeddings)
     # grid_logits: (batch_size, 50, vocab_size)
-    # task_logits: (batch_size, num_task_latent_tokens, num_task_codebooks, task_codebook_size)
+    # task_logits: (batch_size, num_task_latent_tokens, task_codebook_size)
 
     # Split mask_positions into task and grid masks
     task_mask = mask_positions[:, :num_task_latent_tokens]  # (batch_size, num_task_latent_tokens)
@@ -1223,49 +1203,34 @@ def compute_loss_for_batch(
     
     # Task token loss (only on masked positions)
     if task_mask.any():
-        # Get targets by finding closest codebook entry for each codebook (vectorized)
-        # Stack embeddings from all codebooks: (num_task_codebooks, batch_size, num_task_latent_tokens, task_codebook_dim)
-        all_embeddings = torch.stack(task_embeddings_per_codebook, dim=0)
-        # Flatten: (num_task_codebooks, batch_size * num_task_latent_tokens, task_codebook_dim)
-        all_embeddings_flat = all_embeddings.reshape(num_task_codebooks, -1, task_codebook_dim)
+        # Get targets by finding closest codebook entry (vectorized)
+        # task_embeddings: (batch_size, num_task_latent_tokens, task_codebook_dim)
+        # task_codebook: (task_codebook_size, task_codebook_dim)
         
-        # Stack all codebooks: (num_task_codebooks, task_codebook_size, task_codebook_dim)
-        all_codebooks = torch.stack([
-            cast(torch.Tensor, getattr(model, f'task_codebook_{i}')) for i in range(num_task_codebooks)
-        ], dim=0)
-        
-        # Compute distances for all codebooks at once: (num_task_codebooks, batch_size * num_task_latent_tokens, task_codebook_size)
-        all_dists = torch.cdist(all_embeddings_flat, all_codebooks)
-        
-        # Get targets: (num_task_codebooks, batch_size * num_task_latent_tokens)
-        all_targets = torch.argmin(all_dists, dim=-1)
-        
-        # Transpose to get: (batch_size * num_task_latent_tokens, num_task_codebooks)
-        task_targets = all_targets.transpose(0, 1)
-        # Reshape: (batch_size, num_task_latent_tokens, num_task_codebooks)
-        task_targets = task_targets.view(-1, num_task_latent_tokens, num_task_codebooks)
+        # Compute distances: (batch_size, num_task_latent_tokens, task_codebook_size)
+        task_emb_flat = task_embeddings.reshape(-1, task_codebook_dim)  # (batch_size * num_task_latent_tokens, task_codebook_dim)
+        distances = torch.cdist(task_emb_flat, cast(torch.Tensor, model.task_codebook))  # (batch_size * num_task_latent_tokens, task_codebook_size)
+        task_targets = torch.argmin(distances, dim=-1)  # (batch_size * num_task_latent_tokens,)
+        task_targets = task_targets.view(-1, num_task_latent_tokens)  # (batch_size, num_task_latent_tokens)
         
         # Flatten and select only masked positions
-        # task_logits: (batch_size, num_task_latent_tokens, num_task_codebooks, task_codebook_size)
-        task_logits_flat = task_logits.reshape(-1, num_task_codebooks, task_codebook_size)  # (batch_size * num_task_latent_tokens, num_task_codebooks, task_codebook_size)
-        task_targets_flat = task_targets.reshape(-1, num_task_codebooks)  # (batch_size * num_task_latent_tokens, num_task_codebooks)
+        task_logits_flat = task_logits.reshape(-1, task_codebook_size)  # (batch_size * num_task_latent_tokens, task_codebook_size)
+        task_targets_flat = task_targets.reshape(-1)  # (batch_size * num_task_latent_tokens,)
         task_mask_flat = task_mask.reshape(-1)  # (batch_size * num_task_latent_tokens,)
         
         # Select masked positions
-        masked_task_logits = task_logits_flat[task_mask_flat]  # (num_masked, num_task_codebooks, task_codebook_size)
-        masked_task_targets = task_targets_flat[task_mask_flat]  # (num_masked, num_task_codebooks)
+        masked_task_logits = task_logits_flat[task_mask_flat]
+        masked_task_targets = task_targets_flat[task_mask_flat]
         
         if masked_task_logits.shape[0] > 0:
-            # Compute loss for all codebooks at once (vectorized)
-            # Reshape: (num_masked * num_task_codebooks, task_codebook_size) and (num_masked * num_task_codebooks,)
             task_loss = torch.nn.functional.cross_entropy(
-                masked_task_logits.reshape(-1, task_codebook_size),
-                masked_task_targets.reshape(-1),
+                masked_task_logits,
+                masked_task_targets,
                 label_smoothing=label_smoothing,
                 reduction='sum'
             )
             total_loss = total_loss + task_loss
-            num_masked += masked_task_logits.shape[0] * num_task_codebooks
+            num_masked += masked_task_logits.shape[0]
     
     # Grid token loss (only on masked positions)
     if grid_mask.any():
@@ -1766,7 +1731,6 @@ def train(config: Config):
         dropout=config.dropout,
         task_codebook_size=config.task_codebook_size,
         task_codebook_dim=config.task_codebook_dim,
-        num_task_codebooks=config.num_task_codebooks,
         num_task_latent_tokens=config.num_task_latent_tokens,
         num_tasks=num_tasks,
     ).to(device)
@@ -1778,9 +1742,9 @@ def train(config: Config):
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    codebook_params = sum(cast(torch.Tensor, getattr(model, f'task_codebook_{i}')).numel() for i in range(config.num_task_codebooks))
+    codebook_params = cast(torch.Tensor, model.task_codebook).numel()
     
-    task_emb_params = sum(p.numel() for emb_layer in model.task_embeddings for p in emb_layer.parameters())
+    task_emb_params = sum(p.numel() for p in model.task_embedding.parameters())
     rope_params = 0  # RoPE buffers are not trainable
     
     embedding_params = task_emb_params + rope_params
@@ -1915,26 +1879,18 @@ def train(config: Config):
         logit_scale_grid = torch.sqrt(
             model.grid_output_proj.weight.pow(2).sum()
         ).item()
-        # Average across all task output projections
-        task_output_projs = cast(TransformerModel, model).task_output_projs
-        logit_scale_task = torch.mean(torch.stack([
-            torch.sqrt(cast(nn.Linear, proj).weight.pow(2).sum()) for proj in task_output_projs
-        ])).item()
+        logit_scale_task = torch.sqrt(
+            model.task_output_proj.weight.pow(2).sum()
+        ).item()
 
         # Calculate layer-wise mean square using vectorized operations
         # Embedding layers
-        task_emb_mean_sq = torch.mean(torch.stack([
-            cast(nn.Embedding, emb_layer).weight.pow(2).mean() for emb_layer in model.task_embeddings
-        ])).item()
+        task_emb_mean_sq = model.task_embedding.weight.pow(2).mean().item()
         token_emb_mean_sq = model.token_embedding.weight.pow(2).mean().item()
         
         # Linear layers
         grid_output_proj_mean_sq = model.grid_output_proj.weight.pow(2).mean().item()
-        # Average across all task output projections
-        task_output_projs = cast(TransformerModel, model).task_output_projs
-        task_output_proj_mean_sq = torch.mean(torch.stack([
-            cast(nn.Linear, proj).weight.pow(2).mean() for proj in task_output_projs
-        ])).item()
+        task_output_proj_mean_sq = model.task_output_proj.weight.pow(2).mean().item()
         task_token_proj_mean_sq = model.task_token_proj.weight.pow(2).mean().item()
         
         # Transformer layers (vectorized - concatenate all weights and compute mean)
@@ -2034,7 +1990,6 @@ def train(config: Config):
                         "dropout": config.dropout,
                         "task_codebook_size": config.task_codebook_size,
                         "task_codebook_dim": config.task_codebook_dim,
-                        "num_task_codebooks": config.num_task_codebooks,
                         "num_task_latent_tokens": config.num_task_latent_tokens,
                     },
                 },
@@ -2066,7 +2021,6 @@ def train(config: Config):
                 "dropout": config.dropout,
                 "task_codebook_size": config.task_codebook_size,
                 "task_codebook_dim": config.task_codebook_dim,
-                "num_task_codebooks": config.num_task_codebooks,
                 "num_task_latent_tokens": config.num_task_latent_tokens,
             },
         },
@@ -2092,7 +2046,6 @@ def main():
         dropout=0.1,
         task_codebook_size=64,
         task_codebook_dim=16,
-        num_task_codebooks=16,
         num_task_latent_tokens=10,
         # Data parameters
         vocab_size=11,
@@ -2100,12 +2053,13 @@ def main():
         eval_denoise_epoch_interval=10,
         # Training parameters
         num_epochs=300,
-        batch_size=256,
+        batch_size=32,
         learning_rate=1e-4,
         task_embedding_lr=1e-2,
         weight_decay=0,
         task_embedding_weight_decay=0,
         label_smoothing=0,
+        temperature=2.0,
         mode="train",
         checkpoint_save_interval=50,
         # Google Drive location for Colab
