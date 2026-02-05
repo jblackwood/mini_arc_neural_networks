@@ -2048,9 +2048,9 @@ def main():
         num_layers=8,
         dim_feedforward=1024,
         dropout=0.1,
-        task_codebook_size=64,
+        task_codebook_size=256,
         task_codebook_dim=16,
-        num_task_latent_tokens=10,
+        num_task_latent_tokens=25,
         # Data parameters
         vocab_size=11,
         # Denoising evaluation parameters
@@ -2060,8 +2060,8 @@ def main():
         batch_size=32,
         learning_rate=1e-4,
         task_embedding_lr=1e-2,
-        weight_decay=0,
-        task_embedding_weight_decay=0,
+        weight_decay=0.01,
+        task_embedding_weight_decay=0.01,
         label_smoothing=0,
         mode="train",
         checkpoint_save_interval=50,
