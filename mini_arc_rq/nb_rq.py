@@ -37,7 +37,6 @@ class Config:
     dropout: float
     task_codebook_size: int
     task_codebook_dim: int
-    num_task_codebooks: int
     num_task_latent_tokens: int
 
     # Training parameters
@@ -813,7 +812,6 @@ class TransformerModel(nn.Module):
         dropout: float,
         task_codebook_size: int,
         task_codebook_dim: int,
-        num_task_codebooks: int,
         num_task_latent_tokens: int,
         num_tasks: int,
     ):
@@ -828,7 +826,6 @@ class TransformerModel(nn.Module):
             dropout: Dropout rate
             task_codebook_size: Number of discrete categories in task codebook
             task_codebook_dim: Dimension of each codebook entry
-            num_task_codebooks: Number of codebooks for multiple quantization
             num_task_latent_tokens: Number of task latent tokens
             num_tasks: Number of unique tasks
         """
@@ -839,17 +836,15 @@ class TransformerModel(nn.Module):
         self.num_task_latent_tokens = num_task_latent_tokens
         self.task_codebook_size = task_codebook_size
         self.task_codebook_dim = task_codebook_dim
-        self.num_task_codebooks = num_task_codebooks
 
         # Task embedding layer: maps task index to embedding vector
         task_emb_dim = task_codebook_dim * num_task_latent_tokens
         self.task_embedding = nn.Embedding(num_tasks, task_emb_dim)
 
-        # Task codebooks: multiple codebooks (num_task_codebooks, task_codebook_size, task_codebook_dim) with unit L2 norm
-        for i in range(num_task_codebooks):
-            codebook = torch.randn(task_codebook_size, task_codebook_dim)
-            codebook = torch.nn.functional.normalize(codebook, p=2, dim=1)
-            self.register_buffer(f'task_codebook_{i}', codebook)
+        # Task codebook: (task_codebook_size, task_codebook_dim) with unit L2 norm
+        codebook = torch.randn(task_codebook_size, task_codebook_dim)
+        codebook = torch.nn.functional.normalize(codebook, p=2, dim=1)
+        self.register_buffer('task_codebook', codebook)
 
         # Task token projection layer: (task_codebook_dim, d_model)
         self.task_token_proj = nn.Linear(task_codebook_dim, d_model)
@@ -880,11 +875,8 @@ class TransformerModel(nn.Module):
         # Output projection layers
         # Grid prediction: (batch_size, 50, d_model) -> (batch_size, 50, vocab_size)
         self.grid_output_proj = nn.Linear(d_model, vocab_size)
-        # Task token predictions: multiple output projections, one per codebook
-        # Each: (batch_size, num_task_latent_tokens, d_model) -> (batch_size, num_task_latent_tokens, task_codebook_size)
-        self.task_output_projs = nn.ModuleList([
-            nn.Linear(d_model, task_codebook_size) for _ in range(num_task_codebooks)
-        ])
+        # Task token prediction: (batch_size, num_task_latent_tokens, d_model) -> (batch_size, num_task_latent_tokens, task_codebook_size)
+        self.task_output_proj = nn.Linear(d_model, task_codebook_size)
 
     def forward(self, x: torch.Tensor, task_embeddings: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass.
@@ -933,11 +925,8 @@ class TransformerModel(nn.Module):
         # Predict grid tokens: (batch_size, 50, d_model) -> (batch_size, 50, vocab_size)
         grid_logits = self.grid_output_proj(grid_features)
         
-        # Predict task tokens for each codebook: (batch_size, num_task_latent_tokens, num_task_codebooks, task_codebook_size)
-        task_logits_list = []
-        for task_output_proj in self.task_output_projs:
-            task_logits_list.append(task_output_proj(task_features))  # (batch_size, num_task_latent_tokens, task_codebook_size)
-        task_logits = torch.stack(task_logits_list, dim=2)  # (batch_size, num_task_latent_tokens, num_task_codebooks, task_codebook_size)
+        # Predict task tokens: (batch_size, num_task_latent_tokens, d_model) -> (batch_size, num_task_latent_tokens, task_codebook_size)
+        task_logits = self.task_output_proj(task_features)
         
         return grid_logits, task_logits
 
@@ -971,7 +960,7 @@ def optimize_output_grid(
             # Forward pass through model
             grid_logits, task_logits = model(x_current, task_embeddings)
             # grid_logits: (batch_size, 50, vocab_size)
-            # task_logits: (batch_size, num_task_latent_tokens, num_task_codebooks, task_codebook_size)
+            # task_logits: (batch_size, num_task_latent_tokens, task_codebook_size)
             
             # Get predicted tokens and confidences for output grid (last 25 positions)
             output_grid_logits = grid_logits[:, 25:, :]  # (batch_size, 25, vocab_size)
@@ -1182,7 +1171,6 @@ def compute_loss_for_batch(
     num_task_latent_tokens = model.num_task_latent_tokens
     task_codebook_size = model.task_codebook_size
     task_codebook_dim = model.task_codebook_dim
-    num_task_codebooks = model.num_task_codebooks
 
     # Get task embeddings and reshape
     task_emb = model.task_embedding(task_indices)  # (batch_size, task_codebook_dim * num_task_latent_tokens)
@@ -1202,7 +1190,7 @@ def compute_loss_for_batch(
     # Forward pass - model returns grid logits and task logits
     grid_logits, task_logits = model(masked_grid_tokens, masked_task_embeddings)
     # grid_logits: (batch_size, 50, vocab_size)
-    # task_logits: (batch_size, num_task_latent_tokens, num_task_codebooks, task_codebook_size)
+    # task_logits: (batch_size, num_task_latent_tokens, task_codebook_size)
 
     # Split mask_positions into task and grid masks
     task_mask = mask_positions[:, :num_task_latent_tokens]  # (batch_size, num_task_latent_tokens)
@@ -1214,49 +1202,34 @@ def compute_loss_for_batch(
     
     # Task token loss (only on masked positions)
     if task_mask.any():
-        # Get targets by finding closest codebook entry for each codebook (vectorized)
+        # Get targets by finding closest codebook entry (vectorized)
         # task_embeddings: (batch_size, num_task_latent_tokens, task_codebook_dim)
+        # task_codebook: (task_codebook_size, task_codebook_dim)
+        
+        # Compute distances: (batch_size, num_task_latent_tokens, task_codebook_size)
         task_emb_flat = task_embeddings.reshape(-1, task_codebook_dim)  # (batch_size * num_task_latent_tokens, task_codebook_dim)
-        
-        # Stack all codebooks: (num_task_codebooks, task_codebook_size, task_codebook_dim)
-        all_codebooks = torch.stack([
-            cast(torch.Tensor, getattr(model, f'task_codebook_{i}')) for i in range(num_task_codebooks)
-        ], dim=0)
-        
-        # Expand task embeddings to have batch dimension for codebooks
-        task_emb_expanded = task_emb_flat.unsqueeze(0).expand(num_task_codebooks, -1, -1)  # (num_task_codebooks, batch_size * num_task_latent_tokens, task_codebook_dim)
-        
-        # Compute distances for all codebooks at once
-        distances = torch.cdist(task_emb_expanded, all_codebooks)  # (num_task_codebooks, batch_size * num_task_latent_tokens, task_codebook_size)
-        
-        # Get targets and reshape
-        task_targets = torch.argmin(distances, dim=-1)  # (num_task_codebooks, batch_size * num_task_latent_tokens)
-        task_targets = task_targets.transpose(0, 1)  # (batch_size * num_task_latent_tokens, num_task_codebooks)
-        task_targets = task_targets.view(-1, num_task_latent_tokens, num_task_codebooks)  # (batch_size, num_task_latent_tokens, num_task_codebooks)
+        distances = torch.cdist(task_emb_flat, cast(torch.Tensor, model.task_codebook))  # (batch_size * num_task_latent_tokens, task_codebook_size)
+        task_targets = torch.argmin(distances, dim=-1)  # (batch_size * num_task_latent_tokens,)
+        task_targets = task_targets.view(-1, num_task_latent_tokens)  # (batch_size, num_task_latent_tokens)
         
         # Flatten and select only masked positions
-        # task_logits: (batch_size, num_task_latent_tokens, num_task_codebooks, task_codebook_size)
-        task_logits_flat = task_logits.reshape(-1, num_task_codebooks, task_codebook_size)  # (batch_size * num_task_latent_tokens, num_task_codebooks, task_codebook_size)
-        task_targets_flat = task_targets.reshape(-1, num_task_codebooks)  # (batch_size * num_task_latent_tokens, num_task_codebooks)
+        task_logits_flat = task_logits.reshape(-1, task_codebook_size)  # (batch_size * num_task_latent_tokens, task_codebook_size)
+        task_targets_flat = task_targets.reshape(-1)  # (batch_size * num_task_latent_tokens,)
         task_mask_flat = task_mask.reshape(-1)  # (batch_size * num_task_latent_tokens,)
         
         # Select masked positions
-        masked_task_logits = task_logits_flat[task_mask_flat]  # (num_masked, num_task_codebooks, task_codebook_size)
-        masked_task_targets = task_targets_flat[task_mask_flat]  # (num_masked, num_task_codebooks)
+        masked_task_logits = task_logits_flat[task_mask_flat]
+        masked_task_targets = task_targets_flat[task_mask_flat]
         
         if masked_task_logits.shape[0] > 0:
-            # Compute loss for each codebook separately and sum
-            task_loss = torch.tensor(0.0, device=device)
-            for i in range(num_task_codebooks):
-                codebook_loss = torch.nn.functional.cross_entropy(
-                    masked_task_logits[:, i, :],  # (num_masked, task_codebook_size)
-                    masked_task_targets[:, i],  # (num_masked,)
-                    label_smoothing=label_smoothing,
-                    reduction='sum'
-                )
-                task_loss = task_loss + codebook_loss
+            task_loss = torch.nn.functional.cross_entropy(
+                masked_task_logits,
+                masked_task_targets,
+                label_smoothing=label_smoothing,
+                reduction='sum'
+            )
             total_loss = total_loss + task_loss
-            num_masked += masked_task_logits.shape[0] * num_task_codebooks
+            num_masked += masked_task_logits.shape[0]
     
     # Grid token loss (only on masked positions)
     if grid_mask.any():
@@ -1757,7 +1730,6 @@ def train(config: Config):
         dropout=config.dropout,
         task_codebook_size=config.task_codebook_size,
         task_codebook_dim=config.task_codebook_dim,
-        num_task_codebooks=config.num_task_codebooks,
         num_task_latent_tokens=config.num_task_latent_tokens,
         num_tasks=num_tasks,
     ).to(device)
@@ -1769,7 +1741,7 @@ def train(config: Config):
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    codebook_params = sum(cast(torch.Tensor, getattr(model, f'task_codebook_{i}')).numel() for i in range(config.num_task_codebooks))
+    codebook_params = cast(torch.Tensor, model.task_codebook).numel()
     
     task_emb_params = sum(p.numel() for p in model.task_embedding.parameters())
     rope_params = 0  # RoPE buffers are not trainable
@@ -1906,11 +1878,9 @@ def train(config: Config):
         logit_scale_grid = torch.sqrt(
             model.grid_output_proj.weight.pow(2).sum()
         ).item()
-        # Average across all task output projections
-        task_output_projs = cast(TransformerModel, model).task_output_projs
-        logit_scale_task = torch.mean(torch.stack([
-            torch.sqrt(cast(nn.Linear, proj).weight.pow(2).sum()) for proj in task_output_projs
-        ])).item()
+        logit_scale_task = torch.sqrt(
+            model.task_output_proj.weight.pow(2).sum()
+        ).item()
 
         # Calculate layer-wise mean square using vectorized operations
         # Embedding layers
@@ -1919,11 +1889,7 @@ def train(config: Config):
         
         # Linear layers
         grid_output_proj_mean_sq = model.grid_output_proj.weight.pow(2).mean().item()
-        # Average across all task output projections
-        task_output_projs = cast(TransformerModel, model).task_output_projs
-        task_output_proj_mean_sq = torch.mean(torch.stack([
-            cast(nn.Linear, proj).weight.pow(2).mean() for proj in task_output_projs
-        ])).item()
+        task_output_proj_mean_sq = model.task_output_proj.weight.pow(2).mean().item()
         task_token_proj_mean_sq = model.task_token_proj.weight.pow(2).mean().item()
         
         # Transformer layers (vectorized - concatenate all weights and compute mean)
@@ -2023,7 +1989,6 @@ def train(config: Config):
                         "dropout": config.dropout,
                         "task_codebook_size": config.task_codebook_size,
                         "task_codebook_dim": config.task_codebook_dim,
-                        "num_task_codebooks": config.num_task_codebooks,
                         "num_task_latent_tokens": config.num_task_latent_tokens,
                     },
                 },
@@ -2055,7 +2020,6 @@ def train(config: Config):
                 "dropout": config.dropout,
                 "task_codebook_size": config.task_codebook_size,
                 "task_codebook_dim": config.task_codebook_dim,
-                "num_task_codebooks": config.num_task_codebooks,
                 "num_task_latent_tokens": config.num_task_latent_tokens,
             },
         },
@@ -2080,8 +2044,7 @@ def main():
         dim_feedforward=1024,
         dropout=0.1,
         task_codebook_size=64,
-        task_codebook_dim=8,
-        num_task_codebooks=16,
+        task_codebook_dim=16,
         num_task_latent_tokens=10,
         # Data parameters
         vocab_size=11,
