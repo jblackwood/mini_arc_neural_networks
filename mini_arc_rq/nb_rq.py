@@ -2050,7 +2050,7 @@ def main():
         dropout=0.1,
         task_codebook_size=1024,
         task_codebook_dim=16,
-        num_task_latent_tokens=25,
+        num_task_latent_tokens=15,
         # Data parameters
         vocab_size=11,
         # Denoising evaluation parameters
