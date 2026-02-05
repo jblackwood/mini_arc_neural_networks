@@ -1208,7 +1208,8 @@ def compute_loss_for_batch(
         
         # Compute distances: (batch_size, num_task_latent_tokens, task_codebook_size)
         task_emb_flat = task_embeddings.reshape(-1, task_codebook_dim)  # (batch_size * num_task_latent_tokens, task_codebook_dim)
-        distances = torch.cdist(task_emb_flat, cast(torch.Tensor, model.task_codebook))  # (batch_size * num_task_latent_tokens, task_codebook_size)
+        task_emb_flat_normalized = torch.nn.functional.normalize(task_emb_flat, p=2, dim=1)  # Normalize to unit L2 norm
+        distances = torch.cdist(task_emb_flat_normalized, cast(torch.Tensor, model.task_codebook))  # (batch_size * num_task_latent_tokens, task_codebook_size)
         task_targets = torch.argmin(distances, dim=-1)  # (batch_size * num_task_latent_tokens,)
         task_targets = task_targets.view(-1, num_task_latent_tokens)  # (batch_size, num_task_latent_tokens)
         
@@ -1779,11 +1780,15 @@ def train(config: Config):
         )
         return
 
-    # Create optimizer
+    # Create optimizer with separate learning rates for task embeddings
+    task_embedding_params = list(model.task_embedding.parameters())
+    other_params = [p for p in model.parameters() if not any(p is te_p for te_p in task_embedding_params)]
+    
     optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.learning_rate,
-        weight_decay=config.weight_decay,
+        [
+            {"params": task_embedding_params, "lr": config.task_embedding_lr, "weight_decay": config.task_embedding_weight_decay},
+            {"params": other_params, "lr": config.learning_rate, "weight_decay": config.weight_decay},
+        ]
     )
 
     # Load existing model if specified
