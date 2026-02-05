@@ -2048,7 +2048,7 @@ def main():
         num_layers=8,
         dim_feedforward=1024,
         dropout=0.1,
-        task_codebook_size=256,
+        task_codebook_size=1024,
         task_codebook_dim=16,
         num_task_latent_tokens=25,
         # Data parameters
