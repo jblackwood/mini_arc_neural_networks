@@ -1208,50 +1208,61 @@ def compute_loss_for_batch(
     total_loss = torch.tensor(0.0, device=device)
     num_masked = 0
     
-    # Task token loss (only on masked positions) - for all codebooks
+    # Task token loss (only on masked positions) - for all codebooks (vectorized)
     if task_mask.any():
-        # Get targets by finding closest codebook entry in each codebook (vectorized)
+        # Get targets by finding closest codebook entry in each codebook (vectorized across all codebooks)
         # task_embeddings: (batch_size, num_task_latent_tokens, task_codebook_dim)
         # task_codebooks: (num_codebooks, task_codebook_size, task_codebook_dim)
         
-        num_codebooks = cast(torch.Tensor, model.task_codebooks).shape[0]
+        task_codebooks = cast(torch.Tensor, model.task_codebooks)
+        num_codebooks = task_codebooks.shape[0]
         
         # Normalize task embeddings
         task_emb_flat = task_embeddings.reshape(-1, task_codebook_dim)  # (batch_size * num_task_latent_tokens, task_codebook_dim)
         task_emb_flat_normalized = torch.nn.functional.normalize(task_emb_flat, p=2, dim=1)  # Normalize to unit L2 norm
         
-        # Compute targets for each codebook
-        task_targets_per_codebook = []  # List of (batch_size, num_task_latent_tokens) tensors
-        for codebook_idx in range(num_codebooks):
-            codebook = cast(torch.Tensor, model.task_codebooks)[codebook_idx]  # (task_codebook_size, task_codebook_dim)
-            distances = torch.cdist(task_emb_flat_normalized, codebook)  # (batch_size * num_task_latent_tokens, task_codebook_size)
-            targets = torch.argmin(distances, dim=-1)  # (batch_size * num_task_latent_tokens,)
-            targets = targets.view(-1, num_task_latent_tokens)  # (batch_size, num_task_latent_tokens)
-            task_targets_per_codebook.append(targets)
+        # Compute distances to all codebooks at once using broadcasting
+        # Reshape: (batch * tokens, 1, dim) @ (num_codebooks, codebook_size, dim)^T
+        # Result: (batch * tokens, num_codebooks, codebook_size)
+        task_emb_expanded = task_emb_flat_normalized.unsqueeze(1)  # (batch * tokens, 1, dim)
+        codebooks_expanded = task_codebooks.unsqueeze(0)  # (1, num_codebooks, codebook_size, dim)
         
-        # Compute loss for each codebook
-        for codebook_idx in range(num_codebooks):
-            task_targets = task_targets_per_codebook[codebook_idx]  # (batch_size, num_task_latent_tokens)
-            codebook_logits = task_logits[:, codebook_idx, :, :]  # (batch_size, num_task_latent_tokens, task_codebook_size)
+        # Compute L2 distances: ||a - b||^2 = ||a||^2 + ||b||^2 - 2*a^T*b
+        # Since both are normalized (||a|| = ||b|| = 1), this simplifies to: 2 - 2*a^T*b
+        similarities = torch.einsum('bnd,kcnd->bnc', task_emb_expanded, codebooks_expanded)  # (batch * tokens, num_codebooks, codebook_size)
+        distances = 2.0 - 2.0 * similarities
+        
+        # Get targets for all codebooks at once
+        task_targets_all = torch.argmin(distances, dim=-1)  # (batch * tokens, num_codebooks)
+        task_targets_all = task_targets_all.view(-1, num_task_latent_tokens, num_codebooks)  # (batch_size, num_task_latent_tokens, num_codebooks)
+        
+        # Flatten logits and targets for vectorized loss computation
+        # task_logits: (batch_size, num_codebooks, num_task_latent_tokens, task_codebook_size)
+        # Reshape to: (batch_size, num_task_latent_tokens, num_codebooks, task_codebook_size)
+        task_logits_reordered = task_logits.permute(0, 2, 1, 3)  # (batch_size, num_task_latent_tokens, num_codebooks, task_codebook_size)
+        
+        # Flatten batch and token dimensions
+        task_logits_flat = task_logits_reordered.reshape(-1, num_codebooks, task_codebook_size)  # (batch * tokens, num_codebooks, task_codebook_size)
+        task_targets_flat = task_targets_all.reshape(-1, num_codebooks)  # (batch * tokens, num_codebooks)
+        task_mask_flat = task_mask.reshape(-1)  # (batch * tokens,)
+        
+        # Select only masked positions
+        masked_task_logits = task_logits_flat[task_mask_flat]  # (num_masked, num_codebooks, task_codebook_size)
+        masked_task_targets = task_targets_flat[task_mask_flat]  # (num_masked, num_codebooks)
+        
+        if masked_task_logits.shape[0] > 0:
+            # Compute loss for all codebooks at once by flattening codebook dimension
+            masked_task_logits_flat = masked_task_logits.reshape(-1, task_codebook_size)  # (num_masked * num_codebooks, task_codebook_size)
+            masked_task_targets_flat = masked_task_targets.reshape(-1)  # (num_masked * num_codebooks,)
             
-            # Flatten and select only masked positions
-            codebook_logits_flat = codebook_logits.reshape(-1, task_codebook_size)  # (batch_size * num_task_latent_tokens, task_codebook_size)
-            task_targets_flat = task_targets.reshape(-1)  # (batch_size * num_task_latent_tokens,)
-            task_mask_flat = task_mask.reshape(-1)  # (batch_size * num_task_latent_tokens,)
-            
-            # Select masked positions
-            masked_task_logits = codebook_logits_flat[task_mask_flat]
-            masked_task_targets = task_targets_flat[task_mask_flat]
-            
-            if masked_task_logits.shape[0] > 0:
-                task_loss = torch.nn.functional.cross_entropy(
-                    masked_task_logits,
-                    masked_task_targets,
-                    label_smoothing=label_smoothing,
-                    reduction='sum'
-                )
-                total_loss = total_loss + task_loss
-                num_masked += masked_task_logits.shape[0]
+            task_loss = torch.nn.functional.cross_entropy(
+                masked_task_logits_flat,
+                masked_task_targets_flat,
+                label_smoothing=label_smoothing,
+                reduction='sum'
+            )
+            total_loss = total_loss + task_loss
+            num_masked += masked_task_logits_flat.shape[0]
     
     # Grid token loss (only on masked positions)
     if grid_mask.any():
