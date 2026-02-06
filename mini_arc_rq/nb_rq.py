@@ -2085,9 +2085,9 @@ def main():
         num_layers=8,
         dim_feedforward=1024,
         dropout=0.1,
-        task_codebook_size=1024,
+        task_codebook_size=64,
         task_codebook_dim=16,
-        num_task_latent_tokens=15,
+        num_task_latent_tokens=10,
         num_codebooks=16,
         # Data parameters
         vocab_size=11,
