@@ -2094,7 +2094,7 @@ def main():
         # Denoising evaluation parameters
         eval_denoise_epoch_interval=10,
         # Training parameters
-        num_epochs=300,
+        num_epochs=150,
         batch_size=32,
         learning_rate=1e-4,
         task_embedding_lr=1e-2,
