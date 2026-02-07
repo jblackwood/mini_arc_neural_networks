@@ -1222,18 +1222,17 @@ def compute_loss_for_batch(
         task_codebooks = cast(torch.Tensor, model.task_codebooks)
         num_codebooks = task_codebooks.shape[0]
         
-        # Normalize task embeddings
+        # Reshape task embeddings (already normalized above)
         task_emb_flat = task_embeddings.reshape(-1, task_codebook_dim)  # (batch_size * num_task_latent_tokens, task_codebook_dim)
-        task_emb_flat_normalized = torch.nn.functional.normalize(task_emb_flat, p=2, dim=1)  # Normalize to unit L2 norm
         
         # Compute distances to all codebooks at once using einsum
-        # task_emb_flat_normalized: (batch * tokens, dim)
+        # task_emb_flat: (batch * tokens, dim) - already normalized
         # task_codebooks: (num_codebooks, codebook_size, dim)
         # Result: (batch * tokens, num_codebooks, codebook_size)
         
         # Compute L2 distances: ||a - b||^2 = ||a||^2 + ||b||^2 - 2*a^T*b
         # Since both are normalized (||a|| = ||b|| = 1), this simplifies to: 2 - 2*a^T*b
-        similarities = torch.einsum('bd,ncd->bnc', task_emb_flat_normalized, task_codebooks)  # (batch * tokens, num_codebooks, codebook_size)
+        similarities = torch.einsum('bd,ncd->bnc', task_emb_flat, task_codebooks)  # (batch * tokens, num_codebooks, codebook_size)
         distances = 2.0 - 2.0 * similarities
         
         # Get targets for all codebooks at once
