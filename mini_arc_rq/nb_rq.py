@@ -2100,7 +2100,7 @@ def main():
         task_embedding_lr=1e-2,
         weight_decay=1e-4,
         task_embedding_weight_decay=1e-4,
-        label_smoothing=0.05,
+        label_smoothing=0.1,
         mode="train",
         checkpoint_save_interval=50,
         # Google Drive location for Colab
