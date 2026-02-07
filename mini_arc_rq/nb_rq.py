@@ -800,6 +800,45 @@ class RoPE2D(nn.Module):
         return x_rotated.reshape(x.shape[0], 25, self.d_model)
 
 
+class NormalizedEmbedding(nn.Module):
+    """Embedding layer that normalizes embeddings to unit L2 norm.
+    
+    This wrapper around nn.Embedding automatically normalizes the output embeddings
+    to have unit L2 norm, projecting them onto a hypersphere. This is useful when
+    embeddings need to be compared via cosine similarity or distance metrics.
+    """
+    
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        super().__init__()
+        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
+        self.embedding_dim = embedding_dim
+    
+    def forward(self, indices: torch.Tensor) -> torch.Tensor:
+        """Get normalized embeddings for the given indices.
+        
+        Args:
+            indices: Tensor of shape (...) containing embedding indices
+            
+        Returns:
+            Normalized embeddings of shape (..., embedding_dim) with unit L2 norm
+        """
+        emb = self.embedding(indices)
+        # Normalize along the last dimension to unit L2 norm
+        return torch.nn.functional.normalize(emb, p=2, dim=-1)
+    
+    def parameters(self, recurse: bool = True):
+        """Return parameters of the underlying embedding."""
+        return self.embedding.parameters(recurse=recurse)
+    
+    def state_dict(self, *args, **kwargs):
+        """Return state dict of the underlying embedding."""
+        return self.embedding.state_dict(*args, **kwargs)
+    
+    def load_state_dict(self, state_dict, strict: bool = True):
+        """Load state dict into the underlying embedding."""
+        return self.embedding.load_state_dict(state_dict, strict=strict)
+
+
 class TransformerModel(nn.Module):
     """Non-causal transformer encoder for ARC tasks."""
 
@@ -841,9 +880,9 @@ class TransformerModel(nn.Module):
         self.task_codebook_dim = task_codebook_dim
         self.num_codebooks = num_codebooks
 
-        # Task embedding layer: maps task index to embedding vector
+        # Task embedding layer: maps task index to embedding vector (normalized)
         task_emb_dim = task_codebook_dim * num_task_latent_tokens
-        self.task_embedding = nn.Embedding(num_tasks, task_emb_dim)
+        self.task_embedding = NormalizedEmbedding(num_tasks, task_emb_dim)
 
         # Task codebooks: (num_codebooks, task_codebook_size, task_codebook_dim) with unit L2 norm
         codebooks = torch.randn(num_codebooks, task_codebook_size, task_codebook_dim)
@@ -1924,7 +1963,7 @@ def train(config: Config):
 
         # Calculate layer-wise mean square using vectorized operations
         # Embedding layers
-        task_emb_mean_sq = model.task_embedding.weight.pow(2).mean().item()
+        task_emb_mean_sq = model.task_embedding.embedding.weight.pow(2).mean().item()
         token_emb_mean_sq = model.token_embedding.weight.pow(2).mean().item()
         
         # Linear layers
@@ -2098,8 +2137,8 @@ def main():
         batch_size=32,
         learning_rate=1e-4,
         task_embedding_lr=1e-2,
-        weight_decay=1e-4,
-        task_embedding_weight_decay=1e-3,
+        weight_decay=0,
+        task_embedding_weight_decay=0,
         label_smoothing=0,
         mode="train",
         checkpoint_save_interval=50,
