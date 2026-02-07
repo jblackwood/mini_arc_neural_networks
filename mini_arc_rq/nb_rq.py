@@ -2092,7 +2092,7 @@ def main():
         task_codebook_size=64,
         task_codebook_dim=16,
         num_task_latent_tokens=10,
-        num_codebooks=16,
+        num_codebooks=1,
         # Data parameters
         vocab_size=11,
         # Denoising evaluation parameters
