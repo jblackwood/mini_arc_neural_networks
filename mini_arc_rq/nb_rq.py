@@ -1097,7 +1097,8 @@ def create_masked_inputs(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Create masked inputs for BERT-style training.
     
-    Randomly masks 1-25 positions across task embeddings, input grid, and output grid.
+    Randomly picks ONE of three token sequences (task tokens, input grid, or output grid) 
+    and masks 1 to all tokens within the picked sequence.
     
     Args:
         task_embeddings: Task embeddings of shape (batch_size, num_task_latent_tokens, task_codebook_dim)
@@ -1121,19 +1122,40 @@ def create_masked_inputs(
     masked_task_embeddings = task_embeddings.clone()
     masked_grid_tokens = grid_tokens.clone()
     
-    # Generate random number of masks for each batch item (1-25)
-    num_masks = torch.randint(1, 26, (batch_size,), device=device)
+    # Randomly choose which sequence to mask for each batch item: 0=task, 1=input grid, 2=output grid
+    sequence_choice = torch.randint(0, 3, (batch_size,), device=device)
     
-    # Create mask_positions tensor - for each batch item, mask random positions
-    # Use a vectorized approach: create random values and threshold
-    rand_vals = torch.rand(batch_size, total_positions, device=device)
-    # For each batch item, sort random values and take top num_masks[i] positions
-    # We'll use argsort and then create a mask
-    sorted_indices = torch.argsort(rand_vals, dim=1, descending=True)
+    # Generate random orderings for each sequence type using argsort trick
+    task_ranks = torch.argsort(torch.argsort(torch.rand(batch_size, num_task_latent_tokens, device=device), dim=1), dim=1)
+    input_ranks = torch.argsort(torch.argsort(torch.rand(batch_size, 25, device=device), dim=1), dim=1)
+    output_ranks = torch.argsort(torch.argsort(torch.rand(batch_size, 25, device=device), dim=1), dim=1)
     
-    # Create mask by checking if position index is < num_masks for that batch item
-    position_ranks = torch.argsort(sorted_indices, dim=1)
-    mask_positions = position_ranks < num_masks.unsqueeze(1)
+    # Generate number of tokens to mask based on sequence choice
+    task_mask_counts = torch.randint(1, num_task_latent_tokens + 1, (batch_size,), device=device)
+    grid_mask_counts = torch.randint(1, 26, (batch_size,), device=device)
+    num_to_mask = torch.where(sequence_choice == 0, task_mask_counts, grid_mask_counts)
+    
+    # Create masks for each sequence type by checking if rank < num_to_mask
+    task_seq_mask = task_ranks < num_to_mask.unsqueeze(1)
+    input_seq_mask = input_ranks < num_to_mask.unsqueeze(1)
+    output_seq_mask = output_ranks < num_to_mask.unsqueeze(1)
+    
+    # Place each sequence mask in the appropriate position range of the full mask
+    task_full_mask = torch.zeros(batch_size, total_positions, dtype=torch.bool, device=device)
+    task_full_mask[:, :num_task_latent_tokens] = task_seq_mask
+    
+    input_full_mask = torch.zeros(batch_size, total_positions, dtype=torch.bool, device=device)
+    input_full_mask[:, num_task_latent_tokens:num_task_latent_tokens+25] = input_seq_mask
+    
+    output_full_mask = torch.zeros(batch_size, total_positions, dtype=torch.bool, device=device)
+    output_full_mask[:, num_task_latent_tokens+25:] = output_seq_mask
+    
+    # Select the appropriate mask for each batch item based on sequence_choice
+    is_task = (sequence_choice == 0).unsqueeze(1)
+    is_input = (sequence_choice == 1).unsqueeze(1)
+    is_output = (sequence_choice == 2).unsqueeze(1)
+    
+    mask_positions = (is_task & task_full_mask) | (is_input & input_full_mask) | (is_output & output_full_mask)
     
     # Split mask into task and grid parts
     task_mask = mask_positions[:, :num_task_latent_tokens]  # (batch_size, num_task_latent_tokens)
