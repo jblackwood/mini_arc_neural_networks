@@ -15,6 +15,7 @@ from typing import Dict, List, Literal, Optional, Set, Tuple, TypedDict, cast
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 
@@ -45,9 +46,6 @@ class Config:
     lambd: float  # Weight for loss_sig_reg in loss calculation
     mode: Literal["train", "learning_rate_test"]
     checkpoint_save_interval: int
-    eval_interval: int  # Number of epochs between eval steps
-    eval_learning_rate: float  # Learning rate for eval optimization
-    max_eval_batches: int  # Maximum number of batches to evaluate (to speed up eval)
 
     # Data parameters
     vocab_size: int
@@ -105,12 +103,12 @@ class ARCTask:
     color_permutation: Optional[Dict[int, int]] = None
 
 
-class ARCTaskExample(TypedDict):
-    """Typed dict for a single ARC example with token sequences."""
-    input_grid: torch.Tensor  # Shape: (25,) - token values
-    output_grid: torch.Tensor  # Shape: (25,) - token values
-    example_type: Literal["train", "test"]
-    task_id: str
+class ARCTaskData(TypedDict):
+    """Typed dict for a task with lists of grids."""
+    train_input_grids: List[torch.Tensor]  # List of (25,) tensors
+    train_output_grids: List[torch.Tensor]  # List of (25,) tensors
+    test_input_grids: List[torch.Tensor]  # List of (25,) tensors
+    test_output_grids: List[torch.Tensor]  # List of (25,) tensors
 
 
 def parse_arc_json(file_path: Path) -> ARCTask:
@@ -526,25 +524,11 @@ def create_dataset(
     json_files = sorted(data_dir.glob("*.json"))
     print(f"Found {len(json_files)} total task files")
 
-    # Filter to only tasks with 3 train and 1 test example
-    filtered_files = []
-    for json_file in json_files:
-        try:
-            task = parse_arc_json(json_file)
-            if len(task.train) == 3 and len(task.test) == 1:
-                filtered_files.append(json_file)
-        except Exception as e:
-            print(f"Error reading {json_file.name}: {e}")
-            continue
-    
-    print(f"Filtered to {len(filtered_files)} tasks with 3 train and 1 test examples")
-    assert len(filtered_files) == 82, f"Expected 82 tasks with 3 train and 1 test, but found {len(filtered_files)}"
-
     # Shuffle and split into train and test
-    random.shuffle(filtered_files)
-    num_test = int(len(filtered_files) * test_ratio)
-    test_files = filtered_files[:num_test]
-    train_files = filtered_files[num_test:]
+    random.shuffle(json_files)
+    num_test = int(len(json_files) * test_ratio)
+    test_files = json_files[:num_test]
+    train_files = json_files[num_test:]
 
     print(f"Train tasks: {len(train_files)}")
     print(f"Test tasks: {len(test_files)}")
@@ -571,107 +555,121 @@ class ARCTaskDataset(Dataset):
     - example_type: 'train' or 'test' indicating which set the example came from
     """
 
-    def __init__(self, folder_path: str, vocab_size: int = 10, grids: Literal["all", "train", "test"] = "all"):
+    def __init__(self, folder_path: str, vocab_size: int = 10):
         """Initialize the dataset.
 
         Args:
             folder_path: Path to folder containing task JSON files
             vocab_size: Size of vocabulary (default 10: 0-9 for colors)
-            grids: Which grids to return - 'all' for both train and test, 'train' for train only, 'test' for test only
         """
         self.folder_path = Path(folder_path)
         self.task_files = sorted(self.folder_path.glob("*.json"))
         self.vocab_size = vocab_size
-        self.grids = grids
 
     def __len__(self) -> int:
         return len(self.task_files)
 
-    def __getitem__(self, idx: int) -> List[ARCTaskExample]:
-        """Get a task as a list of example dicts.
+    def __getitem__(self, idx: int) -> ARCTaskData:
+        """Get a task as a dict with train/test grids.
 
         Args:
             idx: Index of the task
 
         Returns:
-            List of ARCTaskExample dicts, each containing input_grid, output_grid, and example_type.
+            ArcTaskData dict with train_input_grids, train_output_grids, test_input_grids, test_output_grids.
+            Each value is a list of tensors (25,) with token values.
         """
         task_file = self.task_files[idx]
         task_data = parse_arc_json(task_file)
         
-        # Extract task_id from filename (without .json extension)
-        task_id = task_file.stem
+        train_input_grids = []
+        train_output_grids = []
+        test_input_grids = []
+        test_output_grids = []
+        
+        # Process train examples
+        for example in task_data.train:
+                # Check that grids are exactly 5x5
+                input_height = len(example.input)
+                input_width = len(example.input[0]) if input_height > 0 else 0
+                output_height = len(example.output)
+                output_width = len(example.output[0]) if output_height > 0 else 0
+                
+                if input_height != 5 or input_width != 5:
+                    raise ValueError(
+                        f"Input grid must be 5x5, but got {input_height}x{input_width} in task {task_file.name}"
+                    )
+                if output_height != 5 or output_width != 5:
+                    raise ValueError(
+                        f"Output grid must be 5x5, but got {output_height}x{output_width} in task {task_file.name}"
+                    )
 
-        # Collect examples based on grids parameter
-        examples_to_process: List[Tuple[ARCExample, Literal["train", "test"]]] = []
-        if self.grids == "all":
-            # Add train examples
-            for ex in task_data.train:
-                examples_to_process.append((ex, "train"))
-            # Add test examples
-            for ex in task_data.test:
-                examples_to_process.append((ex, "test"))
-        elif self.grids == "train":
-            for ex in task_data.train:
-                examples_to_process.append((ex, "train"))
-        elif self.grids == "test":
-            for ex in task_data.test:
-                examples_to_process.append((ex, "test"))
+                # Flatten input grid into token sequence
+                input_cells = []
+                for row in example.input:
+                    input_cells.extend(row)
+                
+                # Flatten output grid into token sequence
+                output_cells = []
+                for row in example.output:
+                    output_cells.extend(row)
 
-        result: List[ARCTaskExample] = []
-        for example, example_type in examples_to_process:
-            # Check that grids are exactly 5x5
-            input_height = len(example.input)
-            input_width = len(example.input[0]) if input_height > 0 else 0
-            output_height = len(example.output)
-            output_width = len(example.output[0]) if output_height > 0 else 0
-            
-            if input_height != 5 or input_width != 5:
-                raise ValueError(
-                    f"Input grid must be 5x5, but got {input_height}x{input_width} in task {task_file.name}"
-                )
-            if output_height != 5 or output_width != 5:
-                raise ValueError(
-                    f"Output grid must be 5x5, but got {output_height}x{output_width} in task {task_file.name}"
-                )
+                # Convert to tensors of token values
+                train_input_grids.append(torch.tensor(input_cells, dtype=torch.long))
+                train_output_grids.append(torch.tensor(output_cells, dtype=torch.long))
+        
+        # Process test examples
+        for example in task_data.test:
+                # Check that grids are exactly 5x5
+                input_height = len(example.input)
+                input_width = len(example.input[0]) if input_height > 0 else 0
+                output_height = len(example.output)
+                output_width = len(example.output[0]) if output_height > 0 else 0
+                
+                if input_height != 5 or input_width != 5:
+                    raise ValueError(
+                        f"Input grid must be 5x5, but got {input_height}x{input_width} in task {task_file.name}"
+                    )
+                if output_height != 5 or output_width != 5:
+                    raise ValueError(
+                        f"Output grid must be 5x5, but got {output_height}x{output_width} in task {task_file.name}"
+                    )
 
-            # Flatten input grid into token sequence
-            input_cells = []
-            for row in example.input:
-                input_cells.extend(row)
-            
-            # Flatten output grid into token sequence
-            output_cells = []
-            for row in example.output:
-                output_cells.extend(row)
+                # Flatten input grid into token sequence
+                input_cells = []
+                for row in example.input:
+                    input_cells.extend(row)
+                
+                # Flatten output grid into token sequence
+                output_cells = []
+                for row in example.output:
+                    output_cells.extend(row)
 
-            # Convert to tensors of token values (not one-hot)
-            input_tokens = torch.tensor(input_cells, dtype=torch.long)
-            output_tokens = torch.tensor(output_cells, dtype=torch.long)
+                # Convert to tensors of token values
+                test_input_grids.append(torch.tensor(input_cells, dtype=torch.long))
+                test_output_grids.append(torch.tensor(output_cells, dtype=torch.long))
 
-            result.append(ARCTaskExample(
-                input_grid=input_tokens,
-                output_grid=output_tokens,
-                example_type=example_type,
-                task_id=task_id,
-            ))
-
-        return result
+        return {
+            "train_input_grids": train_input_grids,
+            "train_output_grids": train_output_grids,
+            "test_input_grids": test_input_grids,
+            "test_output_grids": test_output_grids,
+        }
 
 
-def arc_collate_fn(batch: List[List[ARCTaskExample]]) -> List[ARCTaskExample]:
-    """Collate function to combine lists of examples from multiple tasks into a single list.
+def arc_task_collate_fn(batch: List[ARCTaskData]) -> List[ARCTaskData]:
+    """Custom collate function for batching ARCTaskData dictionaries.
+    
+    Since each task has variable-length lists, we don't stack them.
+    Just return the batch as a list of dictionaries.
     
     Args:
-        batch: List of lists, where each inner list contains examples from one task
+        batch: List of ARCTaskData dictionaries
     
     Returns:
-        Flattened list of all examples from all tasks in the batch
+        The batch as-is (list of dictionaries)
     """
-    result: List[ARCTaskExample] = []
-    for task_examples in batch:
-        result.extend(task_examples)
-    return result
+    return batch
 
 
 class RoPE2D(nn.Module):
@@ -794,8 +792,8 @@ class RoPE2D(nn.Module):
         return x_rotated.reshape(x.shape[0], 25, self.d_model)
 
 
-class TransformerModel(nn.Module):
-    """Non-causal transformer encoder for ARC tasks."""
+class JepaModel(nn.Module):
+    """Non-causal transformer encoder for ARC tasks (JEPA model)."""
 
     def __init__(
         self,
@@ -825,21 +823,15 @@ class TransformerModel(nn.Module):
         self.embedding_dim = embedding_dim
         self.d_model = d_model
 
-        # Token embedding layer (vocab_size + 1 -> d_model)
-        # Includes padding token at index 10 (tokens 0-9 are valid colors, 10 is padding)
-        self.token_embedding = nn.Embedding(vocab_size + 1, d_model)
-        # Initialize token embeddings with small std to keep activation scale stable
-        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.01)
-        # Initialize padding token (index 10) to zeros
-        nn.init.zeros_(self.token_embedding.weight[vocab_size])
+        # Token embedding layer (vocab_size -> d_model)
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
 
         # Learnable position embeddings for grid types
         self.input_grid_embedding = nn.Parameter(torch.randn(d_model))
         self.output_grid_embedding = nn.Parameter(torch.randn(d_model))
 
-        # Learnable example embeddings (4 examples per task)
-        # Example 0: tokens 0-49, Example 1: tokens 50-99, etc.
-        self.example_embeddings = nn.Parameter(torch.randn(4, d_model) * 0.01)
+        # Learnable example embeddings (3 examples per global view)
+        self.example_embeddings = nn.Parameter(torch.randn(3, d_model))
 
         # 2D Rotary Position Embeddings
         self.rope = RoPE2D(d_model=d_model, max_grid_size=5)
@@ -854,32 +846,29 @@ class TransformerModel(nn.Module):
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
 
-        # Output projection to embedding_dim
-        self.output_proj = nn.Linear(d_model, embedding_dim)
+        # Single linear projection to map from flattened (150 * d_model) to embedding_dim
+        self.output_proj = nn.Linear(150 * d_model, embedding_dim)
 
-    def _forward_from_grid_embeddings(
+    def forward(
         self,
-        grid_embeddings: torch.Tensor,
-        src_key_padding_mask: Optional[torch.Tensor] = None,
+        x: torch.Tensor,
     ) -> torch.Tensor:
-        """Process grid embeddings through the model architecture.
-        
+        """Forward pass.
+
         Args:
-            grid_embeddings: Tensor of shape (batch_size, 200, d_model) containing
-                            embeddings for up to 4 examples (each 50 tokens)
-            src_key_padding_mask: Optional tensor of shape (batch_size, 200) where
-                                  True indicates padding positions to ignore
-        
+            x: Input tensor of shape (batch_size, 150) - tokens for 3 examples (3 * 50 tokens)
+
         Returns:
-            Tensor of shape (batch_size, embedding_dim) with final embeddings
+            Tensor of shape (batch_size, embedding_dim) with embeddings
         """
-        batch_size = grid_embeddings.shape[0]
-        seq_len = grid_embeddings.shape[1]  # Should be 200
-        num_examples = seq_len // 50  # 4 for full sequence
+        # Apply token embedding to grid tokens
+        grid_embeddings = self.token_embedding(x)  # (batch_size, 150, d_model)
         
-        # Process each example's grids
+        batch_size = grid_embeddings.shape[0]
+        
+        # Process each of the 3 examples (150 tokens = 3 examples * 50 tokens/example)
         processed_grids = []
-        for ex_idx in range(num_examples):
+        for ex_idx in range(3):
             start_idx = ex_idx * 50
             # Split into input and output grids for this example
             input_grid = grid_embeddings[:, start_idx:start_idx + 25, :]  # (batch_size, 25, d_model)
@@ -901,48 +890,110 @@ class TransformerModel(nn.Module):
             example_grid = torch.cat([input_grid, output_grid], dim=1)  # (batch_size, 50, d_model)
             processed_grids.append(example_grid)
         
-        # Concatenate all examples
-        x = torch.cat(processed_grids, dim=1)  # (batch_size, 200, d_model)
+        # Concatenate all 3 examples
+        x = torch.cat(processed_grids, dim=1)  # (batch_size, 150, d_model)
 
-        # Apply transformer encoder with optional padding mask
-        x = self.transformer_encoder(x, src_key_padding_mask=src_key_padding_mask)  # (batch_size, 200, d_model)
+        # Apply transformer encoder
+        x = self.transformer_encoder(x)  # (batch_size, 150, d_model)
 
-        # Global average pooling over non-padded positions
-        if src_key_padding_mask is not None:
-            # Mask out padded positions before averaging
-            # src_key_padding_mask: True = padding, so invert for valid positions
-            valid_mask = ~src_key_padding_mask  # (batch_size, 200)
-            valid_mask = valid_mask.unsqueeze(-1).float()  # (batch_size, 200, 1)
-            x = (x * valid_mask).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1)  # (batch_size, d_model)
-        else:
-            x = x.mean(dim=1)  # (batch_size, d_model)
-        
-        # Project to embedding_dim
+        # Flatten and apply linear projection
+        x = x.view(batch_size, -1)  # (batch_size, 150 * d_model)
         x = self.output_proj(x)  # (batch_size, embedding_dim)
         
         return x
 
+
+class PredictionModel(nn.Module):
+    """Transformer model that takes JEPA embedding and input grid to predict output grid."""
+
+    def __init__(
+        self,
+        jepa_embedding_dim: int,
+        d_model: int,
+        nhead: int,
+        num_layers: int,
+        dim_feedforward: int,
+        vocab_size: int,
+        dropout: float,
+    ):
+        """Initialize the prediction model.
+
+        Args:
+            jepa_embedding_dim: Dimension of JEPA embedding input
+            d_model: Model dimension
+            nhead: Number of attention heads
+            num_layers: Number of transformer layers
+            dim_feedforward: Dimension of feedforward network
+            vocab_size: Number of possible cell values (10 for ARC: 0-9 colors)
+            dropout: Dropout rate
+        """
+        super().__init__()
+
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.jepa_embedding_dim = jepa_embedding_dim
+        
+        # Calculate number of JEPA tokens
+        assert jepa_embedding_dim % d_model == 0, f"jepa_embedding_dim ({jepa_embedding_dim}) must be divisible by d_model ({d_model})"
+        self.num_jepa_tokens = jepa_embedding_dim // d_model
+
+        # Token embedding layer for grid tokens
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
+
+        # 2D Rotary Position Embeddings for grid positions
+        self.rope = RoPE2D(d_model=d_model, max_grid_size=5)
+
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
+
+        # Output projection to vocab_size
+        self.output_proj = nn.Linear(d_model, vocab_size)
+
     def forward(
         self,
-        x: torch.Tensor,
-        src_key_padding_mask: Optional[torch.Tensor] = None,
+        jepa_embedding: torch.Tensor,
+        input_grid: torch.Tensor,
     ) -> torch.Tensor:
         """Forward pass.
 
         Args:
-            x: Input tensor of shape (batch_size, 200) - tokens for up to 4 examples
-               Padding positions should have value 10 (vocab_size)
-            src_key_padding_mask: Optional tensor of shape (batch_size, 200) where
-                                  True indicates padding positions to ignore
+            jepa_embedding: Tensor of shape (batch_size, jepa_embedding_dim)
+            input_grid: Tensor of shape (batch_size, 25) with token values
 
         Returns:
-            Tensor of shape (batch_size, embedding_dim) with embeddings
+            Tensor of shape (batch_size, 25, vocab_size) with output grid logits
         """
-        # Apply token embedding to grid tokens (includes padding token at index 11)
-        grid_embeddings = self.token_embedding(x)  # (batch_size, 200, d_model)
+        batch_size = input_grid.shape[0]
         
-        # Process through the rest of the model
-        return self._forward_from_grid_embeddings(grid_embeddings, src_key_padding_mask)
+        # Reshape JEPA embedding to tokens
+        jepa_tokens = jepa_embedding.view(batch_size, self.num_jepa_tokens, self.d_model)  # (batch_size, num_jepa_tokens, d_model)
+        
+        # Embed input grid
+        input_emb = self.token_embedding(input_grid)  # (batch_size, 25, d_model)
+        
+        # Apply RoPE to input grid
+        input_emb = self.rope(input_emb)  # (batch_size, 25, d_model)
+        
+        # Concatenate JEPA tokens and input tokens
+        x = torch.cat([jepa_tokens, input_emb], dim=1)  # (batch_size, num_jepa_tokens + 25, d_model)
+        
+        # Apply transformer encoder
+        x = self.transformer_encoder(x)  # (batch_size, num_jepa_tokens + 25, d_model)
+        
+        # Extract output positions (last 25 tokens corresponding to the grid)
+        x = x[:, self.num_jepa_tokens:, :]  # (batch_size, 25, d_model)
+        
+        # Project to logits
+        logits = self.output_proj(x)  # (batch_size, 25, vocab_size)
+        
+        return logits
 
 
 def sig_reg(x: torch.Tensor, num_slices: int = 256) -> torch.Tensor:
@@ -986,438 +1037,310 @@ def sig_reg(x: torch.Tensor, num_slices: int = 256) -> torch.Tensor:
     return t_stat
 
 
-def compute_loss_for_batch(
-    model: TransformerModel,
-    examples: List[ARCTaskExample],
+def compute_jepa_loss_for_batch(
+    jepa_model: JepaModel,
+    batch: List[ARCTaskData],
     device: torch.device,
     lambd: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute LeJEPA loss for a single batch with global and local views.
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute LeJEPA loss for a single batch.
 
-    Creates 2 global views (all 4 examples with different orderings) and
-    8 local views (4 single-example, 2 two-example, 2 three-example views).
+    Creates 8 global views, each with 3 examples (150 tokens) sampled with replacement.
 
     Args:
-        model: The transformer model
-        examples: List of ARCTaskExample dicts with task_id, input_grid, output_grid
+        jepa_model: The JEPA transformer model
+        batch: List of task dicts, each with train_input_grids, train_output_grids, etc.
         device: Device to compute on
-        lambd: Weight for sig_reg loss
+        lambd: Weight for sig_reg loss in JEPA loss
 
     Returns:
-        Tuple of (total_loss, sim_loss, sig_reg_loss) tensors (all scalars)
+        Tuple of (jepa_loss, jepa_sim_loss, jepa_sig_reg_loss, centers) where centers has shape (batch_size, embedding_dim)
     """
-    # Group examples by task_id
-    task_groups: Dict[str, List[torch.Tensor]] = defaultdict(list)
-    for example in examples:
-        task_id = example["task_id"]
-        # Concatenate input and output grids
-        concatenated = torch.cat([example["input_grid"], example["output_grid"]], dim=0)  # (50,)
-        task_groups[task_id].append(concatenated)
+    # Prepare task examples (concatenate input and output grids for each example)
+    task_examples_list = []
+    for task_dict in batch:
+        task_examples = []
+        # Only use train examples
+        for input_grid, output_grid in zip(task_dict["train_input_grids"], task_dict["train_output_grids"]):
+            concatenated = torch.cat([input_grid, output_grid], dim=0)  # (50,)
+            task_examples.append(concatenated)
+        task_examples_list.append(task_examples)
     
-    # Ensure all tasks have exactly 4 examples (duplicate last example if needed)
-    num_examples = 4
-    for task_id in task_groups:
-        task_examples = task_groups[task_id]
-        while len(task_examples) < num_examples:
-            task_examples.append(task_examples[-1])
-        task_groups[task_id] = task_examples[:num_examples]
+    bs = len(batch)  # number of tasks
     
-    bs = len(task_groups)  # number of tasks
-    sorted_task_ids = sorted(task_groups.keys())  # Sort for determinism
+    # Create 8 global views by randomly sampling 3 examples with replacement (150 tokens)
+    global_views: List[torch.Tensor] = []  # Each: (bs, 150)
     
-    # Create global views (2 views, each with all 4 examples in different order)
-    global_views: List[torch.Tensor] = []  # Each: (bs, 200)
-    global_masks: List[torch.Tensor] = []  # Each: (bs, 200) - all False (no padding)
-    
-    for _ in range(2):
+    for view_idx in range(8):
         global_batch = []
-        for task_id in sorted_task_ids:
-            task_examples = task_groups[task_id][:]
-            # Randomly shuffle the order of examples for each global view
-            random.shuffle(task_examples)
-            # Concatenate all 4 examples: (200,)
-            global_seq = torch.cat(task_examples, dim=0)
+        for task_examples in task_examples_list:
+            # Randomly sample 3 examples with replacement
+            sampled_examples = [random.choice(task_examples) for _ in range(3)]
+            # Concatenate 3 examples: (150,)
+            global_seq = torch.cat(sampled_examples, dim=0)
             global_batch.append(global_seq)
-        global_views.append(torch.stack(global_batch, dim=0))  # (bs, 200)
-        global_masks.append(torch.zeros(bs, 200, dtype=torch.bool))  # No padding
+        global_views.append(torch.stack(global_batch, dim=0))  # (bs, 150)
     
-    # Create local views with padding to 200 tokens
-    local_views: List[torch.Tensor] = []  # Each: (bs, 200)
-    local_masks: List[torch.Tensor] = []  # Each: (bs, 200) - True for padding positions
-    
-    # 4 views with 1 example each (50 tokens, padded to 200)
-    for ex_idx in range(4):
-        local_batch = []
-        for task_id in sorted_task_ids:
-            example = task_groups[task_id][ex_idx]  # (50,)
-            # Pad to 200 tokens with 10 (padding token, will be masked)
-            padded = torch.full((200,), 10, dtype=example.dtype)
-            padded[:50] = example
-            local_batch.append(padded)
-        local_views.append(torch.stack(local_batch, dim=0))  # (bs, 200)
-        # Mask: True for padding positions (50-199)
-        mask = torch.zeros(bs, 200, dtype=torch.bool)
-        mask[:, 50:] = True
-        local_masks.append(mask)
-    
-    # 2 views with 2 examples each (100 tokens, padded to 200)
-    for view_idx in range(2):
-        local_batch = []
-        for task_id in sorted_task_ids:
-            task_examples = task_groups[task_id][:]
-            random.shuffle(task_examples)
-            # Take first 2 examples
-            seq = torch.cat(task_examples[:2], dim=0)  # (100,)
-            # Pad to 200 tokens with 10 (padding token, will be masked)
-            padded = torch.full((200,), 10, dtype=seq.dtype)
-            padded[:100] = seq
-            local_batch.append(padded)
-        local_views.append(torch.stack(local_batch, dim=0))  # (bs, 200)
-        # Mask: True for padding positions (100-199)
-        mask = torch.zeros(bs, 200, dtype=torch.bool)
-        mask[:, 100:] = True
-        local_masks.append(mask)
-    
-    # 2 views with 3 examples each (150 tokens, padded to 200)
-    for view_idx in range(2):
-        local_batch = []
-        for task_id in sorted_task_ids:
-            task_examples = task_groups[task_id][:]
-            random.shuffle(task_examples)
-            # Take first 3 examples
-            seq = torch.cat(task_examples[:3], dim=0)  # (150,)
-            # Pad to 200 tokens with 10 (padding token, will be masked)
-            padded = torch.full((200,), 10, dtype=seq.dtype)
-            padded[:150] = seq
-            local_batch.append(padded)
-        local_views.append(torch.stack(local_batch, dim=0))  # (bs, 200)
-        # Mask: True for padding positions (150-199)
-        mask = torch.zeros(bs, 200, dtype=torch.bool)
-        mask[:, 150:] = True
-        local_masks.append(mask)
-    
-    # Combine all views
-    all_views = global_views + local_views  # 10 views total
-    all_masks = global_masks + local_masks
-    
-    num_global_views = 2
-    num_all_views = len(all_views)  # 10
+    num_views = 8
     
     # Stack all views into single batch for forward pass
-    all_batch = torch.cat(all_views, dim=0).to(device)  # (num_all_views * bs, 200)
-    all_mask_batch = torch.cat(all_masks, dim=0).to(device)  # (num_all_views * bs, 200)
+    all_batch = torch.cat(global_views, dim=0).to(device)  # (num_views * bs, 150)
     
     # Forward pass for all views
-    all_embeddings = model(all_batch, src_key_padding_mask=all_mask_batch)  # (num_all_views * bs, embedding_dim)
+    all_embeddings = jepa_model(all_batch)  # (num_views * bs, embedding_dim)
     
     K = all_embeddings.size(1)  # embedding_dim
     
-    # Reshape to (num_all_views, bs, K)
-    all_emb_reshaped = all_embeddings.view(num_all_views, bs, K)
+    # Reshape to (num_views, bs, K)
+    all_emb_reshaped = all_embeddings.view(num_views, bs, K)
     
-    # Extract global view embeddings for computing centers
-    global_emb = all_emb_reshaped[:num_global_views]  # (2, bs, K)
+    # Centers: Mean representation of all views per task
+    centers = all_emb_reshaped.mean(0)  # (bs, K)
     
-    # Centers: Mean representation of global views per task
-    centers = global_emb.mean(0)  # (bs, K)
-    
-    # Similarity term: MSE between centers and ALL view embeddings (global + local)
+    # Similarity term: MSE between centers and ALL view embeddings
     sim = (centers.unsqueeze(0) - all_emb_reshaped).square().mean()
     
     # Regularization term: SIG-Reg applied to each view independently
     sig_reg_vals = []
-    for view_idx in range(num_all_views):
+    for view_idx in range(num_views):
         view_emb = all_emb_reshaped[view_idx]  # (bs, K)
         sig_reg_val = sig_reg(view_emb)  # (num_slices,)
         sig_reg_vals.append(sig_reg_val.mean())
     
     sig_reg_loss = torch.stack(sig_reg_vals).mean()
     
-    # Final weighted loss
-    loss = (1 - lambd) * sim + lambd * sig_reg_loss
+    # Final weighted JEPA loss
+    jepa_loss = (1 - lambd) * sim + lambd * sig_reg_loss
     
-    return loss, sim, sig_reg_loss
+    return jepa_loss, sim, sig_reg_loss, centers
 
 
-def eval_step(
-    model: TransformerModel,
-    test_loader: DataLoader,
+def compute_pred_loss_for_batch(
+    pred_model: PredictionModel,
+    batch: List[ARCTaskData],
+    centers: torch.Tensor,
     device: torch.device,
-    eval_learning_rate: float,
-    epoch: int,
-    writer: SummaryWriter,
-    max_eval_batches: int,
-) -> Tuple[float, float]:
-    """Evaluate model by optimizing output grids to match task centers.
-    
-    Uses early stopping: stops optimization when loss hasn't improved for 25 consecutive steps.
-    
+) -> Tuple[torch.Tensor, int, int, int]:
+    """Compute prediction loss for a single batch.
+
+    For each task, samples a random example and uses the task center to predict its output.
+
     Args:
-        model: The transformer model
-        test_loader: Test data loader
-        device: Device to evaluate on
-        eval_learning_rate: Learning rate for optimization
-        epoch: Current epoch number
-        writer: Tensorboard writer
-        max_eval_batches: Maximum number of batches to process
-    
+        pred_model: The prediction model
+        batch: List of task dicts, each with train_input_grids, train_output_grids, etc.
+        centers: Task center embeddings of shape (batch_size, embedding_dim)
+        device: Device to compute on
+
     Returns:
-        Tuple of (average_accuracy, perfect_task_rate)
+        Tuple of (pred_loss, num_correct_tokens, num_total_tokens, num_perfect_tasks)
     """
-    model.eval()
+    # Prepare task examples (concatenate input and output grids for each example)
+    task_examples_list = []
+    for task_dict in batch:
+        task_examples = []
+        # Only use test examples
+        for input_grid, output_grid in zip(task_dict["test_input_grids"], task_dict["test_output_grids"]):
+            concatenated = torch.cat([input_grid, output_grid], dim=0)  # (50,)
+            task_examples.append(concatenated)
+        task_examples_list.append(task_examples)
     
-    total_correct_tokens = 0
-    total_tokens = 0
-    perfect_tasks = 0
-    total_tasks = 0
-    batch_count = 0
+    # For each task, sample a random example and predict its output
+    pred_input_grids = []
+    pred_output_grids = []
     
-    # Process one batch at a time
-    for batch_examples in test_loader:
-        if batch_count >= max_eval_batches:
-            break
-        batch_count += 1
-        # Group examples in this batch by task_id
-        task_groups = defaultdict(list)
-        for example in batch_examples:
-            task_id = example["task_id"]
-            task_groups[task_id].append(example)
+    for task_idx, task_examples in enumerate(task_examples_list):
+        # Randomly sample one example
+        sampled_idx = random.randint(0, len(task_examples) - 1)
+        sampled_example = task_examples[sampled_idx]  # (50,)
         
-        # Collect all tasks and assert they have exactly 3 train and 1 test example
-        valid_tasks = []
-        for task_id, task_examples in task_groups.items():
-            train_examples = [ex for ex in task_examples if ex["example_type"] == "train"]
-            test_examples = [ex for ex in task_examples if ex["example_type"] == "test"]
-            
-            assert len(train_examples) == 3, f"Task {task_id} has {len(train_examples)} train examples, expected 3"
-            assert len(test_examples) == 1, f"Task {task_id} has {len(test_examples)} test examples, expected 1"
-            
-            valid_tasks.append({
-                "task_id": task_id,
-                "train": train_examples,
-                "test": test_examples[0]
-            })
+        # Split into input and output
+        input_grid = sampled_example[:25]  # (25,)
+        output_grid = sampled_example[25:]  # (25,)
         
-        if len(valid_tasks) == 0:
-            continue
-        
-        num_tasks = len(valid_tasks)
-        
-        # Build global view with all 3 train examples + test input (with placeholder output)
-        # We'll use this to compute the center embedding from train examples
-        # Shape: (num_tasks, 200) - 3 train examples (150 tokens) + 1 test example (50 tokens)
-        train_batch = []
-        for task in valid_tasks:
-            train_grids = []
-            for ex in task["train"]:
-                concatenated = torch.cat([ex["input_grid"], ex["output_grid"]], dim=0)  # (50,)
-                train_grids.append(concatenated)
-            # Concatenate all 3 train examples: (150,)
-            train_seq = torch.cat(train_grids, dim=0)
-            # Pad with 10 to 200 tokens (padding token, will be masked)
-            padded = torch.full((200,), 10, dtype=train_seq.dtype)
-            padded[:150] = train_seq
-            train_batch.append(padded)
-        
-        train_batch_tensor = torch.stack(train_batch, dim=0).to(device)  # (num_tasks, 200)
-        # Mask: True for padding positions (150-199)
-        train_mask = torch.zeros(num_tasks, 200, dtype=torch.bool, device=device)
-        train_mask[:, 150:] = True
-        
-        # Compute center embeddings from train examples only
-        with torch.no_grad():
-            centers = model(train_batch_tensor, src_key_padding_mask=train_mask)  # (num_tasks, embedding_dim)
-        
-        # Stack all test input grids and true output grids
-        test_input_grids = torch.stack([task["test"]["input_grid"] for task in valid_tasks], dim=0).to(device)  # (num_tasks, 25)
-        true_output_grids = torch.stack([task["test"]["output_grid"] for task in valid_tasks], dim=0).to(device)  # (num_tasks, 25)
-        
-        # Build the full sequence with train examples + test input + optimizable test output
-        # Get train example embeddings (frozen)
-        train_example_embeddings = []
-        for task in valid_tasks:
-            task_train_emb = []
-            for ex in task["train"]:
-                concatenated = torch.cat([ex["input_grid"], ex["output_grid"]], dim=0)  # (50,)
-                task_train_emb.append(concatenated)
-            train_example_embeddings.append(torch.cat(task_train_emb, dim=0))  # (150,)
-        
-        train_tokens = torch.stack(train_example_embeddings, dim=0).to(device)  # (num_tasks, 150)
-        
-        # Initialize optimizable output grid parameters for all tasks
-        # Shape: (num_tasks, 25, d_model)
-        output_grid_params = nn.Parameter(
-            torch.randn(num_tasks, 25, model.d_model, device=device) * 0.01
-        )
-        
-        # Create optimizer for all output grid parameters
-        optimizer = torch.optim.Adam([output_grid_params], lr=eval_learning_rate)
-        
-        # Early stopping: track best loss and steps without improvement
-        best_loss = float('inf')
-        steps_without_improvement = 0
-        patience = 25
-        step = 0
-        
-        # Vectorized optimization loop with early stopping
-        while steps_without_improvement < patience:
-            optimizer.zero_grad()
-            
-            # Build full 200-token embedding sequences for all tasks
-            # Train examples: use token embeddings (frozen)
-            train_emb = model.token_embedding(train_tokens)  # (num_tasks, 150, d_model)
-            
-            # Test input: use token embeddings (frozen)
-            test_input_emb = model.token_embedding(test_input_grids)  # (num_tasks, 25, d_model)
-            
-            # Concatenate: train examples + test input + optimizable test output
-            grid_embeddings = torch.cat([train_emb, test_input_emb, output_grid_params], dim=1)  # (num_tasks, 200, d_model)
-            
-            # Process through the model (frozen) - no padding mask needed
-            embeddings = model._forward_from_grid_embeddings(grid_embeddings)  # (num_tasks, embedding_dim)
-            
-            # Compute loss for all tasks
-            loss = (embeddings - centers).square().mean()
-            current_loss = loss.item()
-            
-            # Check for improvement
-            if current_loss < best_loss:
-                best_loss = current_loss
-                steps_without_improvement = 0
-            else:
-                steps_without_improvement += 1
-            
-            # Backprop
-            loss.backward()
-            optimizer.step()
-            
-            step += 1
-        
-        # Print number of steps taken
-        print(f"    Optimization converged after {step} steps (best loss: {best_loss:.6f})")
-        
-        # After optimization, convert output_grid_params to tokens for all tasks
-        with torch.no_grad():
-            # For each position, find nearest token embedding using cosine similarity
-            token_embeddings = model.token_embedding.weight  # (vocab_size, d_model)
-
-            # Normalize vectors to compute cosine similarity safely
-            eps = 1e-8
-            out = output_grid_params  # (num_tasks, 25, d_model)
-            out_norm = out / out.norm(dim=2, keepdim=True).clamp(min=eps)
-            token_norm = token_embeddings / token_embeddings.norm(dim=1, keepdim=True).clamp(min=eps)  # (vocab_size, d_model)
-
-            # Compute cosine similarity: (num_tasks, 25, vocab_size)
-            similarity = torch.einsum('tpd,vd->tpv', out_norm, token_norm)
-
-            # Select token with highest cosine similarity for each position
-            optimized_output_grids = similarity.argmax(dim=2)  # (num_tasks, 25)
-            
-            # Calculate accuracy for all tasks
-            correct_per_task = (optimized_output_grids == true_output_grids).sum(dim=1)  # (num_tasks,)
-            
-            total_correct_tokens += correct_per_task.sum().item()
-            total_tokens += num_tasks * 25
-            
-            # Count perfect tasks
-            perfect_tasks += (correct_per_task == 25).sum().item()
-            total_tasks += num_tasks
+        pred_input_grids.append(input_grid)
+        pred_output_grids.append(output_grid)
     
-    # Calculate metrics
-    avg_accuracy = total_correct_tokens / total_tokens if total_tokens > 0 else 0.0
-    perfect_task_rate = perfect_tasks / total_tasks if total_tasks > 0 else 0.0
+    # Stack into batches
+    pred_input_batch = torch.stack(pred_input_grids, dim=0).to(device)  # (bs, 25)
+    pred_output_batch = torch.stack(pred_output_grids, dim=0).to(device)  # (bs, 25)
     
-    # Log to console
-    print(f"  Eval: Avg Accuracy: {avg_accuracy*100:.2f}% ({total_correct_tokens}/{total_tokens}), Perfect Tasks: {perfect_task_rate*100:.2f}% ({perfect_tasks}/{total_tasks})")
+    # Forward pass through prediction model
+    pred_logits = pred_model(centers, pred_input_batch)  # (bs, 25, vocab_size)
     
-    # Log to tensorboard
-    writer.add_scalar("Eval/avg_accuracy", avg_accuracy, epoch)
-    writer.add_scalar("Eval/perfect_task_rate", perfect_task_rate, epoch)
+    # Compute cross entropy loss
+    pred_loss = F.cross_entropy(
+        pred_logits.view(-1, pred_model.vocab_size),  # (bs * 25, vocab_size)
+        pred_output_batch.view(-1),  # (bs * 25,)
+    )
     
-    return avg_accuracy, perfect_task_rate
+    # Compute accuracy metrics
+    predicted_output_grids = pred_logits.argmax(dim=2)  # (bs, 25)
+    correct_per_task = (predicted_output_grids == pred_output_batch).sum(dim=1)  # (bs,)
+    num_correct_tokens = correct_per_task.sum().item()
+    num_total_tokens = len(batch) * 25
+    num_perfect_tasks = (correct_per_task == 25).sum().item()
+    
+    return pred_loss, num_correct_tokens, num_total_tokens, num_perfect_tasks
 
 
 def train_epoch(
-    model: TransformerModel,
+    jepa_model: JepaModel,
+    pred_model: PredictionModel,
     train_loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
+    jepa_optimizer: torch.optim.Optimizer,
+    pred_optimizer: torch.optim.Optimizer,
     device: torch.device,
     lambd: float,
-) -> Tuple[float, float, float]:
+) -> Tuple[float, float, float, float, float, float]:
     """Train for one epoch.
 
     Args:
-        model: The transformer model
+        jepa_model: The JEPA transformer model
+        pred_model: The prediction model
         train_loader: Training data loader
-        optimizer: Optimizer
+        jepa_optimizer: Optimizer for JEPA model
+        pred_optimizer: Optimizer for prediction model
         device: Device to train on
-        lambd: Weight for sig_reg loss
+        lambd: Weight for sig_reg loss in JEPA loss
 
     Returns:
-        Tuple of (average_total_loss, average_sim_loss, average_sig_reg_loss)
+        Tuple of (avg_jepa_loss, avg_jepa_sim_loss, avg_jepa_sig_reg_loss, avg_pred_loss, avg_accuracy, perfect_task_rate)
     """
-    model.train()
-    total_loss = 0.0
-    total_sim = 0.0
-    total_sig_reg = 0.0
+    jepa_model.train()
+    pred_model.train()
+    total_jepa_loss = 0.0
+    total_jepa_sim = 0.0
+    total_jepa_sig_reg = 0.0
+    total_pred_loss = 0.0
+    total_correct_tokens = 0
+    total_tokens = 0
+    total_perfect_tasks = 0
+    total_tasks = 0
     num_batches = 0
 
     for batch_idx, examples in enumerate(train_loader):
-        # Compute loss with raw examples
-        loss, sim, sig_reg_val = compute_loss_for_batch(model, examples, device, lambd)
+        # Compute JEPA loss and get centers
+        jepa_loss, jepa_sim, jepa_sig_reg, centers = compute_jepa_loss_for_batch(
+            jepa_model, examples, device, lambd
+        )
 
-        # Backward pass
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        # Optimize JEPA model
+        jepa_optimizer.zero_grad()
+        jepa_loss.backward()
+        torch.nn.utils.clip_grad_norm_(jepa_model.parameters(), max_norm=1.0)
+        jepa_optimizer.step()
 
-        total_loss += loss.item()
-        total_sim += sim.item()
-        total_sig_reg += sig_reg_val.item()
+        # Compute prediction loss using the centers (detach to prevent gradients flowing back to JEPA model)
+        pred_loss, num_correct, num_total, num_perfect = compute_pred_loss_for_batch(
+            pred_model, examples, centers.detach(), device
+        )
+
+        # Optimize prediction model
+        pred_optimizer.zero_grad()
+        pred_loss.backward()
+        torch.nn.utils.clip_grad_norm_(pred_model.parameters(), max_norm=1.0)
+        pred_optimizer.step()
+
+        total_jepa_loss += jepa_loss.item()
+        total_jepa_sim += jepa_sim.item()
+        total_jepa_sig_reg += jepa_sig_reg.item()
+        total_pred_loss += pred_loss.item()
+        total_correct_tokens += num_correct
+        total_tokens += num_total
+        total_perfect_tasks += num_perfect
+        total_tasks += len(examples)
         num_batches += 1
 
-    return total_loss / num_batches, total_sim / num_batches, total_sig_reg / num_batches
+    avg_accuracy = total_correct_tokens / total_tokens if total_tokens > 0 else 0.0
+    perfect_task_rate = total_perfect_tasks / total_tasks if total_tasks > 0 else 0.0
+
+    return (
+        total_jepa_loss / num_batches,
+        total_jepa_sim / num_batches,
+        total_jepa_sig_reg / num_batches,
+        total_pred_loss / num_batches,
+        avg_accuracy,
+        perfect_task_rate,
+    )
 
 
 def test_epoch(
-    model: TransformerModel,
+    jepa_model: JepaModel,
+    pred_model: PredictionModel,
     test_loader: DataLoader,
+    jepa_optimizer: torch.optim.Optimizer,
     device: torch.device,
     lambd: float,
-) -> Tuple[float, float, float]:
+) -> Tuple[float, float, float, float, float, float]:
     """Evaluate on test set.
 
     Args:
-        model: The transformer model
+        jepa_model: The JEPA transformer model
+        pred_model: The prediction model
         test_loader: Test data loader
+        jepa_optimizer: Optimizer for JEPA model
         device: Device to evaluate on
-        lambd: Weight for sig_reg loss
+        lambd: Weight for sig_reg loss in JEPA loss
 
     Returns:
-        Tuple of (average_total_loss, average_sim_loss, average_sig_reg_loss)
+        Tuple of (avg_jepa_loss, avg_jepa_sim_loss, avg_jepa_sig_reg_loss, avg_pred_loss, avg_accuracy, perfect_task_rate)
     """
-    model.eval()
-    total_loss = 0.0
-    total_sim = 0.0
-    total_sig_reg = 0.0
+    jepa_model.train()
+    pred_model.eval()
+    total_jepa_loss = 0.0
+    total_jepa_sim = 0.0
+    total_jepa_sig_reg = 0.0
+    total_pred_loss = 0.0
+    total_correct_tokens = 0
+    total_tokens = 0
+    total_perfect_tasks = 0
+    total_tasks = 0
     num_batches = 0
 
-    with torch.no_grad():
-        for batch_idx, examples in enumerate(test_loader):
-            # Compute loss with raw examples
-            loss, sim, sig_reg_val = compute_loss_for_batch(model, examples, device, lambd)
+    for batch_idx, examples in enumerate(test_loader):
+        # Compute JEPA loss and get centers (with gradients)
+        jepa_loss, jepa_sim, jepa_sig_reg, centers = compute_jepa_loss_for_batch(
+            jepa_model, examples, device, lambd
+        )
+        
+        # Optimize JEPA model
+        jepa_optimizer.zero_grad()
+        jepa_loss.backward()
+        torch.nn.utils.clip_grad_norm_(jepa_model.parameters(), max_norm=1.0)
+        jepa_optimizer.step()
+        
+        # Compute prediction loss without gradients
+        with torch.no_grad():
+            pred_loss, num_correct, num_total, num_perfect = compute_pred_loss_for_batch(
+                pred_model, examples, centers.detach(), device
+            )
 
-            total_loss += loss.item()
-            total_sim += sim.item()
-            total_sig_reg += sig_reg_val.item()
-            num_batches += 1
+        total_jepa_loss += jepa_loss.item()
+        total_jepa_sim += jepa_sim.item()
+        total_jepa_sig_reg += jepa_sig_reg.item()
+        total_pred_loss += pred_loss.item()
+        total_correct_tokens += num_correct
+        total_tokens += num_total
+        total_perfect_tasks += num_perfect
+        total_tasks += len(examples)
+        num_batches += 1
 
-    return total_loss / num_batches, total_sim / num_batches, total_sig_reg / num_batches
+    avg_accuracy = total_correct_tokens / total_tokens if total_tokens > 0 else 0.0
+    perfect_task_rate = total_perfect_tasks / total_tasks if total_tasks > 0 else 0.0
+
+    return (
+        total_jepa_loss / num_batches,
+        total_jepa_sim / num_batches,
+        total_jepa_sig_reg / num_batches,
+        total_pred_loss / num_batches,
+        avg_accuracy,
+        perfect_task_rate,
+    )
 
 
 def learning_rate_test(
-    model: TransformerModel,
+    jepa_model: JepaModel,
+    pred_model: PredictionModel,
     train_loader: DataLoader,
     device: torch.device,
     lambd: float,
@@ -1425,37 +1348,53 @@ def learning_rate_test(
     """Test learning rate by starting at 1e-7 and doubling every batch.
 
     Args:
-        model: The transformer model
+        jepa_model: The JEPA transformer model
+        pred_model: The prediction model
         train_loader: Training data loader
         device: Device to train on
-        lambd: Weight for sig_reg loss
+        lambd: Weight for sig_reg loss in JEPA loss
     """
     # Start learning rate test
     print("\nStarting learning rate test...")
     lr = 1e-7
-    model.train()
+    jepa_model.train()
+    pred_model.train()
 
     batch_count = 0
     for batch_idx, examples in enumerate(train_loader):
         if batch_count >= 20:
             break
 
-        # Create optimizer with current learning rate
-        opt = torch.optim.Adam(
-            model.parameters(), lr=lr
+        # Create optimizers with current learning rate
+        jepa_opt = torch.optim.Adam(jepa_model.parameters(), lr=lr)
+        pred_opt = torch.optim.Adam(pred_model.parameters(), lr=lr)
+
+        # Compute JEPA loss and get centers
+        jepa_loss, jepa_sim, jepa_sig_reg, centers = compute_jepa_loss_for_batch(
+            jepa_model, examples, device, lambd
         )
 
-        # Compute loss with raw examples
-        loss, sim, sig_reg_val = compute_loss_for_batch(model, examples, device, lambd)
+        # Backward pass for JEPA model
+        jepa_opt.zero_grad()
+        jepa_loss.backward()
+        torch.nn.utils.clip_grad_norm_(jepa_model.parameters(), max_norm=1.0)
+        jepa_opt.step()
 
-        # Backward pass
-        opt.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        opt.step()
+        # Compute prediction loss using the centers
+        pred_loss, num_correct, num_total, num_perfect = compute_pred_loss_for_batch(
+            pred_model, examples, centers.detach(), device
+        )
 
-        # Print learning rate and loss
-        print(f"Batch {batch_count + 1}: LR = {lr:.2e}, Loss = {loss.item():.6f}, Sim = {sim.item():.6f}, SigReg = {sig_reg_val.item():.6f}")
+        # Backward pass for prediction model
+        pred_opt.zero_grad()
+        pred_loss.backward()
+        torch.nn.utils.clip_grad_norm_(pred_model.parameters(), max_norm=1.0)
+        pred_opt.step()
+
+        # Print learning rate and losses
+        print(f"Batch {batch_count + 1}: LR = {lr:.2e}, JEPA Loss = {jepa_loss.item():.6f}, "
+              f"JEPA Sim = {jepa_sim.item():.6f}, JEPA SigReg = {jepa_sig_reg.item():.6f}, "
+              f"Pred Loss = {pred_loss.item():.6f}")
 
         # Double learning rate for next batch
         lr *= 2
@@ -1483,16 +1422,8 @@ def train(config: Config):
     print(f"Using device: {device}")
 
     # Create datasets
-    # Train dataset uses all grids (train + test from each task)
-    train_dataset_all = ARCTaskDataset(config.train_data_dir, vocab_size=config.vocab_size, grids="all")
-    # Test dataset train portion for training
-    test_dataset_train = ARCTaskDataset(config.test_data_dir, vocab_size=config.vocab_size, grids="train")
-    
-    # Concatenate train_dataset_all with test_dataset_train for training
-    train_dataset = ConcatDataset([train_dataset_all, test_dataset_train])
-    
-    # Use all examples from test set for evaluation
-    test_dataset = ARCTaskDataset(config.test_data_dir, vocab_size=config.vocab_size, grids="all")
+    train_dataset = ARCTaskDataset(config.train_data_dir, vocab_size=config.vocab_size)
+    test_dataset = ARCTaskDataset(config.test_data_dir, vocab_size=config.vocab_size)
 
     print(f"Train dataset size: {len(train_dataset)}")
     print(f"Test dataset size: {len(test_dataset)}")
@@ -1502,17 +1433,17 @@ def train(config: Config):
         train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
-        collate_fn=arc_collate_fn,
+        collate_fn=arc_task_collate_fn,
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=config.batch_size,
         shuffle=True,
-        collate_fn=arc_collate_fn,
+        collate_fn=arc_task_collate_fn,
     )
 
-    # Create model
-    model = TransformerModel(
+    # Create JEPA model
+    jepa_model = JepaModel(
         d_model=config.d_model,
         nhead=config.nhead,
         num_layers=config.num_layers,
@@ -1522,35 +1453,56 @@ def train(config: Config):
         embedding_dim=config.embedding_dim,
     ).to(device)
 
-    # Compile model for better performance (PyTorch 2.0+)
-    # print("Compiling model with torch.compile...")
-    # model = cast(TransformerModel, torch.compile(model))
+    # Create prediction model
+    pred_model = PredictionModel(
+        jepa_embedding_dim=config.embedding_dim,
+        d_model=config.d_model,
+        nhead=config.nhead,
+        num_layers=config.num_layers,
+        dim_feedforward=config.dim_feedforward,
+        vocab_size=config.vocab_size,
+        dropout=config.dropout,
+    ).to(device)
+
+    # Compile models for better performance (PyTorch 2.0+)
+    # print("Compiling models with torch.compile...")
+    # jepa_model = cast(JepaModel, torch.compile(jepa_model))
+    # pred_model = cast(PredictionModel, torch.compile(pred_model))
 
     # Count parameters
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    jepa_params = sum(p.numel() for p in jepa_model.parameters() if p.requires_grad)
+    pred_params = sum(p.numel() for p in pred_model.parameters() if p.requires_grad)
+    total_params = jepa_params + pred_params
     
-    print(f"Model has {total_params:,} trainable parameters")
+    print(f"JEPA model has {jepa_params:,} trainable parameters")
+    print(f"Prediction model has {pred_params:,} trainable parameters")
+    print(f"Total parameters: {total_params:,}")
 
     # Check if running learning rate test
     if config.mode == "learning_rate_test":
-        learning_rate_test(model, train_loader, device, config.lambd)
+        learning_rate_test(jepa_model, pred_model, train_loader, device, config.lambd)
         return
 
-    # Create optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+    # Create optimizers
+    jepa_optimizer = torch.optim.Adam(jepa_model.parameters(), lr=config.learning_rate)
+    pred_optimizer = torch.optim.Adam(pred_model.parameters(), lr=config.learning_rate)
 
-    # Load existing model if specified
+    # Load existing models if specified
     start_epoch = 0
     if config.load_model_path:
         if Path(config.load_model_path).exists():
-            print(f"\nLoading existing model from {config.load_model_path}")
+            print(f"\nLoading existing models from {config.load_model_path}")
             checkpoint = torch.load(config.load_model_path, map_location=device)
-            model.load_state_dict(checkpoint["model_state_dict"])
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            jepa_model.load_state_dict(checkpoint["jepa_model_state_dict"])
+            pred_model.load_state_dict(checkpoint["pred_model_state_dict"])
+            jepa_optimizer.load_state_dict(checkpoint["jepa_optimizer_state_dict"])
+            pred_optimizer.load_state_dict(checkpoint["pred_optimizer_state_dict"])
             start_epoch = checkpoint.get("epoch", 0)
             print(f"Resumed from epoch {start_epoch}")
-            print(f"Previous train loss: {checkpoint.get('train_loss', 'N/A')}")
-            print(f"Previous test loss: {checkpoint.get('test_loss', 'N/A')}")
+            print(f"Previous train JEPA loss: {checkpoint.get('train_jepa_loss', 'N/A')}")
+            print(f"Previous train pred loss: {checkpoint.get('train_pred_loss', 'N/A')}")
+            print(f"Previous test JEPA loss: {checkpoint.get('test_jepa_loss', 'N/A')}")
+            print(f"Previous test pred loss: {checkpoint.get('test_pred_loss', 'N/A')}")
         else:
             print(
                 f"\nWarning: Model path {config.load_model_path} does not exist. Starting from scratch."
@@ -1569,95 +1521,114 @@ def train(config: Config):
         epoch_start_time = time.time()
 
         # Train
-        train_loss, train_sim, train_sig_reg = train_epoch(model, train_loader, optimizer, device, config.lambd)
+        train_jepa_loss, train_jepa_sim, train_jepa_sig_reg, train_pred_loss, train_accuracy, train_perfect_rate = train_epoch(
+            jepa_model, pred_model, train_loader, jepa_optimizer, pred_optimizer, device, config.lambd
+        )
 
         # Test
-        test_loss, test_sim, test_sig_reg = test_epoch(model, test_loader, device, config.lambd)
+        test_jepa_loss, test_jepa_sim, test_jepa_sig_reg, test_pred_loss, test_accuracy, test_perfect_rate = test_epoch(
+            jepa_model, pred_model, test_loader, jepa_optimizer, device, config.lambd
+        )
 
         # Calculate epoch time
         epoch_time = time.time() - epoch_start_time
 
-        # Calculate model weight norm (L2 norm of all parameters)
-        total_norm_sq = torch.tensor(0.0, device=device)
-        for p in model.parameters():
-            total_norm_sq += p.pow(2).sum()
-        model_weight_norm = torch.sqrt(total_norm_sq).item()
+        # Calculate model weight norms (L2 norm of all parameters)
+        jepa_norm_sq = torch.tensor(0.0, device=device)
+        for p in jepa_model.parameters():
+            jepa_norm_sq += p.pow(2).sum()
+        jepa_weight_norm = torch.sqrt(jepa_norm_sq).item()
 
-        # Calculate output projection scale (norm of output projection layer weights)
-        output_proj_scale = torch.sqrt(
-            model.output_proj.weight.pow(2).sum()
-        ).item()
+        pred_norm_sq = torch.tensor(0.0, device=device)
+        for p in pred_model.parameters():
+            pred_norm_sq += p.pow(2).sum()
+        pred_weight_norm = torch.sqrt(pred_norm_sq).item()
 
-        # Calculate layer-wise mean square using vectorized operations
-        # Embedding layers
-        token_emb_mean_sq = model.token_embedding.weight.pow(2).mean().item()
+        # Calculate output projection scales
+        jepa_output_proj_scale = torch.sqrt(jepa_model.output_proj.weight.pow(2).sum()).item()
+        pred_output_proj_scale = torch.sqrt(pred_model.output_proj.weight.pow(2).sum()).item()
+
+        # Calculate layer-wise mean squares for JEPA model
+        jepa_token_emb_mean_sq = jepa_model.token_embedding.weight.pow(2).mean().item()
+        jepa_output_proj_mean_sq = jepa_model.output_proj.weight.pow(2).mean().item()
         
-        # Output projection
-        output_proj_mean_sq = model.output_proj.weight.pow(2).mean().item()
-        
-        # Transformer layers (vectorized - concatenate all weights and compute mean)
-        transformer_weights: List[torch.Tensor] = []
-        for layer_module in model.transformer_encoder.layers:
+        # Transformer layers for JEPA model
+        jepa_transformer_weights: List[torch.Tensor] = []
+        for layer_module in jepa_model.transformer_encoder.layers:
             encoder_layer = cast(nn.TransformerEncoderLayer, layer_module)
-            # Self-attention weights
             if encoder_layer.self_attn.in_proj_weight is not None:
-                transformer_weights.append(encoder_layer.self_attn.in_proj_weight.flatten())
-            transformer_weights.append(encoder_layer.self_attn.out_proj.weight.flatten())
-            # Feedforward weights
-            transformer_weights.append(encoder_layer.linear1.weight.flatten())
-            transformer_weights.append(encoder_layer.linear2.weight.flatten())
-        transformer_mean_sq = torch.cat(transformer_weights).pow(2).mean().item()
+                jepa_transformer_weights.append(encoder_layer.self_attn.in_proj_weight.flatten())
+            jepa_transformer_weights.append(encoder_layer.self_attn.out_proj.weight.flatten())
+            jepa_transformer_weights.append(encoder_layer.linear1.weight.flatten())
+            jepa_transformer_weights.append(encoder_layer.linear2.weight.flatten())
+        jepa_transformer_mean_sq = torch.cat(jepa_transformer_weights).pow(2).mean().item()
+
+        # Calculate layer-wise mean squares for prediction model
+        pred_token_emb_mean_sq = pred_model.token_embedding.weight.pow(2).mean().item()
+        pred_output_proj_mean_sq = pred_model.output_proj.weight.pow(2).mean().item()
+        
+        # Transformer layers for prediction model
+        pred_transformer_weights: List[torch.Tensor] = []
+        for layer_module in pred_model.transformer_encoder.layers:
+            encoder_layer = cast(nn.TransformerEncoderLayer, layer_module)
+            if encoder_layer.self_attn.in_proj_weight is not None:
+                pred_transformer_weights.append(encoder_layer.self_attn.in_proj_weight.flatten())
+            pred_transformer_weights.append(encoder_layer.self_attn.out_proj.weight.flatten())
+            pred_transformer_weights.append(encoder_layer.linear1.weight.flatten())
+            pred_transformer_weights.append(encoder_layer.linear2.weight.flatten())
+        pred_transformer_mean_sq = torch.cat(pred_transformer_weights).pow(2).mean().item()
 
         # Log to console
         print(
             f"Epoch {epoch + 1}/{start_epoch + config.num_epochs} - "
-            f"Train Loss: {train_loss:.6f}, Test Loss: {test_loss:.6f}, "
-            f"Time: {epoch_time:.2f}s, "
-            f"Weight Norm: {model_weight_norm:.4f}, "
-            f"Output Scale: {output_proj_scale:.4f}"
+            f"Train JEPA Loss: {train_jepa_loss:.6f}, Train Pred Loss: {train_pred_loss:.6f}, "
+            f"Test JEPA Loss: {test_jepa_loss:.6f}, Test Pred Loss: {test_pred_loss:.6f}, "
+            f"Time: {epoch_time:.2f}s"
         )
         print(
-            f"  Loss Components - "
-            f"Train Sim: {train_sim:.6f}, Train SigReg: {train_sig_reg:.6f}, "
-            f"Test Sim: {test_sim:.6f}, Test SigReg: {test_sig_reg:.6f}"
+            f"  JEPA Loss Components - "
+            f"Train Sim: {train_jepa_sim:.6f}, Train SigReg: {train_jepa_sig_reg:.6f}, "
+            f"Test Sim: {test_jepa_sim:.6f}, Test SigReg: {test_jepa_sig_reg:.6f}"
         )
         print(
-            f"  Layer Mean Squares - "
-            f"Token Emb: {token_emb_mean_sq:.6f}, "
-            f"Out Proj: {output_proj_mean_sq:.6f}, "
-            f"Transformer: {transformer_mean_sq:.6f}"
+            f"  Accuracy - "
+            f"Train: {train_accuracy*100:.2f}%, Train Perfect: {train_perfect_rate*100:.2f}%, "
+            f"Test: {test_accuracy*100:.2f}%, Test Perfect: {test_perfect_rate*100:.2f}%"
+        )
+        print(
+            f"  Model Norms - "
+            f"JEPA: {jepa_weight_norm:.4f}, Pred: {pred_weight_norm:.4f}, "
+            f"JEPA Out Scale: {jepa_output_proj_scale:.4f}, Pred Out Scale: {pred_output_proj_scale:.4f}"
         )
 
         # Log to tensorboard
-        writer.add_scalar("Loss/train", train_loss, epoch)
-        writer.add_scalar("Loss/test", test_loss, epoch)
-        writer.add_scalar("Loss/train_sim", train_sim, epoch)
-        writer.add_scalar("Loss/train_sig_reg", train_sig_reg, epoch)
-        writer.add_scalar("Loss/test_sim", test_sim, epoch)
-        writer.add_scalar("Loss/test_sig_reg", test_sig_reg, epoch)
+        writer.add_scalar("Loss/train_jepa", train_jepa_loss, epoch)
+        writer.add_scalar("Loss/train_pred", train_pred_loss, epoch)
+        writer.add_scalar("Loss/test_jepa", test_jepa_loss, epoch)
+        writer.add_scalar("Loss/test_pred", test_pred_loss, epoch)
+        writer.add_scalar("Loss/train_jepa_sim", train_jepa_sim, epoch)
+        writer.add_scalar("Loss/train_jepa_sig_reg", train_jepa_sig_reg, epoch)
+        writer.add_scalar("Loss/test_jepa_sim", test_jepa_sim, epoch)
+        writer.add_scalar("Loss/test_jepa_sig_reg", test_jepa_sig_reg, epoch)
+        writer.add_scalar("Accuracy/train_accuracy", train_accuracy, epoch)
+        writer.add_scalar("Accuracy/train_perfect_rate", train_perfect_rate, epoch)
+        writer.add_scalar("Accuracy/test_accuracy", test_accuracy, epoch)
+        writer.add_scalar("Accuracy/test_perfect_rate", test_perfect_rate, epoch)
         writer.add_scalar("Time/epoch", epoch_time, epoch)
-        writer.add_scalar("Model/weight_norm", model_weight_norm, epoch)
-        writer.add_scalar("Model/output_proj_scale", output_proj_scale, epoch)
+        writer.add_scalar("Model/jepa_weight_norm", jepa_weight_norm, epoch)
+        writer.add_scalar("Model/pred_weight_norm", pred_weight_norm, epoch)
+        writer.add_scalar("Model/jepa_output_proj_scale", jepa_output_proj_scale, epoch)
+        writer.add_scalar("Model/pred_output_proj_scale", pred_output_proj_scale, epoch)
         
-        # Log layer-wise mean squares
-        writer.add_scalar("LayerMeanSquare/token_embedding", token_emb_mean_sq, epoch)
-        writer.add_scalar("LayerMeanSquare/output_proj", output_proj_mean_sq, epoch)
-        writer.add_scalar("LayerMeanSquare/transformer_avg", transformer_mean_sq, epoch)
-
-        # Run eval step every eval_interval epochs
-        if (epoch + 1) % config.eval_interval == 0:
-            eval_start_time = time.time()
-            eval_step(
-                model,
-                test_loader,
-                device,
-                config.eval_learning_rate,
-                epoch,
-                writer,
-                config.max_eval_batches,
-            )
-            eval_time = time.time() - eval_start_time
-            print(f"  Eval Time: {eval_time:.2f}s")
+        # Log layer-wise mean squares for JEPA model
+        writer.add_scalar("LayerMeanSquare/jepa_token_embedding", jepa_token_emb_mean_sq, epoch)
+        writer.add_scalar("LayerMeanSquare/jepa_output_proj", jepa_output_proj_mean_sq, epoch)
+        writer.add_scalar("LayerMeanSquare/jepa_transformer_avg", jepa_transformer_mean_sq, epoch)
+        
+        # Log layer-wise mean squares for prediction model
+        writer.add_scalar("LayerMeanSquare/pred_token_embedding", pred_token_emb_mean_sq, epoch)
+        writer.add_scalar("LayerMeanSquare/pred_output_proj", pred_output_proj_mean_sq, epoch)
+        writer.add_scalar("LayerMeanSquare/pred_transformer_avg", pred_transformer_mean_sq, epoch)
 
         # Save checkpoint every N epochs (configurable)
         if (epoch + 1) % config.checkpoint_save_interval == 0:
@@ -1665,10 +1636,14 @@ def train(config: Config):
             torch.save(
                 {
                     "epoch": epoch + 1,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "train_loss": train_loss,
-                    "test_loss": test_loss,
+                    "jepa_model_state_dict": jepa_model.state_dict(),
+                    "pred_model_state_dict": pred_model.state_dict(),
+                    "jepa_optimizer_state_dict": jepa_optimizer.state_dict(),
+                    "pred_optimizer_state_dict": pred_optimizer.state_dict(),
+                    "train_jepa_loss": train_jepa_loss,
+                    "train_pred_loss": train_pred_loss,
+                    "test_jepa_loss": test_jepa_loss,
+                    "test_pred_loss": test_pred_loss,
                     "config": {
                         "d_model": config.d_model,
                         "nhead": config.nhead,
@@ -1676,6 +1651,7 @@ def train(config: Config):
                         "dim_feedforward": config.dim_feedforward,
                         "vocab_size": config.vocab_size,
                         "dropout": config.dropout,
+                        "embedding_dim": config.embedding_dim,
                     },
                 },
                 checkpoint_path,
@@ -1691,12 +1667,14 @@ def train(config: Config):
     writer.close()
     print("\nTraining complete!")
 
-    # Save model
+    # Save final models
     Path(config.model_save_dir).mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
+            "jepa_model_state_dict": jepa_model.state_dict(),
+            "pred_model_state_dict": pred_model.state_dict(),
+            "jepa_optimizer_state_dict": jepa_optimizer.state_dict(),
+            "pred_optimizer_state_dict": pred_optimizer.state_dict(),
             "config": {
                 "d_model": config.d_model,
                 "nhead": config.nhead,
@@ -1704,11 +1682,12 @@ def train(config: Config):
                 "dim_feedforward": config.dim_feedforward,
                 "vocab_size": config.vocab_size,
                 "dropout": config.dropout,
+                "embedding_dim": config.embedding_dim,
             },
         },
         config.model_save_path,
     )
-    print(f"Model saved to {config.model_save_path}")
+    print(f"Models saved to {config.model_save_path}")
 
 
 def main():
@@ -1736,9 +1715,6 @@ def main():
         lambd=0.05,
         mode="train",
         checkpoint_save_interval=25,
-        eval_interval=1,
-        eval_learning_rate=1e-2,
-        max_eval_batches=2,
         # Google Drive location for Colab
         google_drive_dir="/content/drive/MyDrive/sparse_arc",
         # Optional: Load existing model to continue training
