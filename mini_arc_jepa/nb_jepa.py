@@ -1467,9 +1467,9 @@ def train(config: Config):
     ).to(device)
 
     # Compile models for better performance (PyTorch 2.0+)
-    # print("Compiling models with torch.compile...")
-    # jepa_model = cast(JepaModel, torch.compile(jepa_model))
-    # pred_model = cast(PredictionModel, torch.compile(pred_model))
+    print("Compiling models with torch.compile...")
+    jepa_model = cast(JepaModel, torch.compile(jepa_model))
+    pred_model = cast(PredictionModel, torch.compile(pred_model))
 
     # Count parameters
     jepa_params = sum(p.numel() for p in jepa_model.parameters() if p.requires_grad)
