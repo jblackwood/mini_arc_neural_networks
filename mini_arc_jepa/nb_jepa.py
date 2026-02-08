@@ -846,8 +846,8 @@ class JepaModel(nn.Module):
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
 
-        # Single linear projection to map from flattened (150 * d_model) to embedding_dim
-        self.output_proj = nn.Linear(150 * d_model, embedding_dim)
+        # Linear projection from d_model to embedding_dim (applied per token)
+        self.output_proj = nn.Linear(d_model, embedding_dim)
 
     def forward(
         self,
@@ -896,9 +896,11 @@ class JepaModel(nn.Module):
         # Apply transformer encoder
         x = self.transformer_encoder(x)  # (batch_size, 150, d_model)
 
-        # Flatten and apply linear projection
-        x = x.view(batch_size, -1)  # (batch_size, 150 * d_model)
-        x = self.output_proj(x)  # (batch_size, embedding_dim)
+        # Project each token to embedding_dim
+        x = self.output_proj(x)  # (batch_size, 150, embedding_dim)
+        
+        # Mean pooling over sequence dimension
+        x = x.mean(dim=1)  # (batch_size, embedding_dim)
         
         return x
 
@@ -1710,7 +1712,7 @@ def main():
         vocab_size=10,
         # Training parameters
         num_epochs=150,
-        batch_size=64,
+        batch_size=128,
         learning_rate=1e-4,
         lambd=0.05,
         mode="train",
