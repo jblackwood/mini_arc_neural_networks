@@ -1782,7 +1782,7 @@ def train(config: Config):
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    codebook_params = cast(torch.Tensor, model.task_codebooks).numel()
+    codebook_params = cast(torch.Tensor, model.task_codebook).numel()
     
     task_emb_params = sum(p.numel() for p in model.task_embedding.parameters())
     rope_params = 0  # RoPE buffers are not trainable
