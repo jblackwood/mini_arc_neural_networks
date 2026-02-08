@@ -107,8 +107,8 @@ class ARCTaskData(TypedDict):
     """Typed dict for a task with lists of grids."""
     train_input_grids: List[torch.Tensor]  # List of (25,) tensors
     train_output_grids: List[torch.Tensor]  # List of (25,) tensors
-    test_input_grids: List[torch.Tensor]  # List of (25,) tensors
-    test_output_grids: List[torch.Tensor]  # List of (25,) tensors
+    test_input_grid: torch.Tensor  # Single (25,) tensor
+    test_output_grid: torch.Tensor  # Single (25,) tensor
 
 
 def parse_arc_json(file_path: Path) -> ARCTask:
@@ -584,8 +584,9 @@ class ARCTaskDataset(Dataset):
         
         train_input_grids = []
         train_output_grids = []
-        test_input_grids = []
-        test_output_grids = []
+        
+        # Assert there is exactly one test example
+        assert len(task_data.test) == 1, f"Expected 1 test example, got {len(task_data.test)} in task {task_file.name}"
         
         # Process train examples
         for example in task_data.train:
@@ -618,42 +619,39 @@ class ARCTaskDataset(Dataset):
                 train_input_grids.append(torch.tensor(input_cells, dtype=torch.long))
                 train_output_grids.append(torch.tensor(output_cells, dtype=torch.long))
         
-        # Process test examples
-        for example in task_data.test:
-                # Check that grids are exactly 5x5
-                input_height = len(example.input)
-                input_width = len(example.input[0]) if input_height > 0 else 0
-                output_height = len(example.output)
-                output_width = len(example.output[0]) if output_height > 0 else 0
-                
-                if input_height != 5 or input_width != 5:
-                    raise ValueError(
-                        f"Input grid must be 5x5, but got {input_height}x{input_width} in task {task_file.name}"
-                    )
-                if output_height != 5 or output_width != 5:
-                    raise ValueError(
-                        f"Output grid must be 5x5, but got {output_height}x{output_width} in task {task_file.name}"
-                    )
+        # Process the single test example
+        test_example = task_data.test[0]
+        
+        # Check that grids are exactly 5x5
+        input_height = len(test_example.input)
+        input_width = len(test_example.input[0]) if input_height > 0 else 0
+        output_height = len(test_example.output)
+        output_width = len(test_example.output[0]) if output_height > 0 else 0
+        
+        if input_height != 5 or input_width != 5:
+            raise ValueError(
+                f"Input grid must be 5x5, but got {input_height}x{input_width} in task {task_file.name}"
+            )
+        if output_height != 5 or output_width != 5:
+            raise ValueError(
+                f"Output grid must be 5x5, but got {output_height}x{output_width} in task {task_file.name}"
+            )
 
-                # Flatten input grid into token sequence
-                input_cells = []
-                for row in example.input:
-                    input_cells.extend(row)
-                
-                # Flatten output grid into token sequence
-                output_cells = []
-                for row in example.output:
-                    output_cells.extend(row)
-
-                # Convert to tensors of token values
-                test_input_grids.append(torch.tensor(input_cells, dtype=torch.long))
-                test_output_grids.append(torch.tensor(output_cells, dtype=torch.long))
+        # Flatten input grid into token sequence
+        test_input_cells = []
+        for row in test_example.input:
+            test_input_cells.extend(row)
+        
+        # Flatten output grid into token sequence
+        test_output_cells = []
+        for row in test_example.output:
+            test_output_cells.extend(row)
 
         return {
             "train_input_grids": train_input_grids,
             "train_output_grids": train_output_grids,
-            "test_input_grids": test_input_grids,
-            "test_output_grids": test_output_grids,
+            "test_input_grid": torch.tensor(test_input_cells, dtype=torch.long),
+            "test_output_grid": torch.tensor(test_output_cells, dtype=torch.long),
         }
 
 
@@ -1058,32 +1056,32 @@ def compute_jepa_loss_for_batch(
     Returns:
         Tuple of (jepa_loss, jepa_sim_loss, jepa_sig_reg_loss, centers) where centers has shape (batch_size, embedding_dim)
     """
-    # Prepare task examples (concatenate input and output grids for each example)
+    bs = len(batch)  # number of tasks
+    num_views = 8
+    
+    # Stack all train examples per task: List[Tensor(num_examples, 50)]
     task_examples_list = []
     for task_dict in batch:
-        task_examples = []
-        # Only use train examples
-        for input_grid, output_grid in zip(task_dict["train_input_grids"], task_dict["train_output_grids"]):
-            concatenated = torch.cat([input_grid, output_grid], dim=0)  # (50,)
-            task_examples.append(concatenated)
+        # Stack input and output grids: (num_examples, 25) each
+        input_grids = torch.stack(task_dict["train_input_grids"], dim=0)
+        output_grids = torch.stack(task_dict["train_output_grids"], dim=0)
+        # Concatenate to get (num_examples, 50)
+        task_examples = torch.cat([input_grids, output_grids], dim=1)
         task_examples_list.append(task_examples)
     
-    bs = len(batch)  # number of tasks
-    
-    # Create 8 global views by randomly sampling 3 examples with replacement (150 tokens)
-    global_views: List[torch.Tensor] = []  # Each: (bs, 150)
-    
-    for view_idx in range(8):
-        global_batch = []
+    # Create 8 global views by randomly sampling 3 examples with replacement
+    # Generate random indices for all views and tasks at once
+    global_views = []
+    for view_idx in range(num_views):
+        view_batch = []
         for task_examples in task_examples_list:
-            # Randomly sample 3 examples with replacement
-            sampled_examples = [random.choice(task_examples) for _ in range(3)]
-            # Concatenate 3 examples: (150,)
-            global_seq = torch.cat(sampled_examples, dim=0)
-            global_batch.append(global_seq)
-        global_views.append(torch.stack(global_batch, dim=0))  # (bs, 150)
-    
-    num_views = 8
+            num_examples = task_examples.shape[0]
+            # Sample 3 example indices with replacement
+            indices = torch.randint(0, num_examples, (3,))
+            # Gather and flatten to (150,)
+            sampled = task_examples[indices].reshape(-1)
+            view_batch.append(sampled)
+        global_views.append(torch.stack(view_batch, dim=0))  # (bs, 150)
     
     # Stack all views into single batch for forward pass
     all_batch = torch.cat(global_views, dim=0).to(device)  # (num_views * bs, 150)
@@ -1136,31 +1134,9 @@ def compute_pred_loss_for_batch(
     Returns:
         Tuple of (pred_loss, num_correct_tokens, num_total_tokens, num_perfect_tasks)
     """
-    # Prepare task examples (concatenate input and output grids for each example)
-    task_examples_list = []
-    for task_dict in batch:
-        task_examples = []
-        # Only use test examples
-        for input_grid, output_grid in zip(task_dict["test_input_grids"], task_dict["test_output_grids"]):
-            concatenated = torch.cat([input_grid, output_grid], dim=0)  # (50,)
-            task_examples.append(concatenated)
-        task_examples_list.append(task_examples)
-    
-    # For each task, sample a random example and predict its output
-    pred_input_grids = []
-    pred_output_grids = []
-    
-    for task_idx, task_examples in enumerate(task_examples_list):
-        # Randomly sample one example
-        sampled_idx = random.randint(0, len(task_examples) - 1)
-        sampled_example = task_examples[sampled_idx]  # (50,)
-        
-        # Split into input and output
-        input_grid = sampled_example[:25]  # (25,)
-        output_grid = sampled_example[25:]  # (25,)
-        
-        pred_input_grids.append(input_grid)
-        pred_output_grids.append(output_grid)
+    # Stack test grids directly from each task
+    pred_input_grids = [task_dict["test_input_grid"] for task_dict in batch]
+    pred_output_grids = [task_dict["test_output_grid"] for task_dict in batch]
     
     # Stack into batches
     pred_input_batch = torch.stack(pred_input_grids, dim=0).to(device)  # (bs, 25)
