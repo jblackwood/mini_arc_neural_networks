@@ -40,8 +40,7 @@ class Config:
     embedding_dim: int  # Output embedding dimension (e.g., 512)
 
     # Training parameters
-    jepa_batch_size: int
-    pred_batch_size: int
+    batch_size: int
     num_epochs: int
     learning_rate: float
     lambd: float  # Weight for loss_sig_reg in loss calculation
@@ -110,6 +109,7 @@ class ARCTaskData(TypedDict):
     train_output_grids: List[torch.Tensor]  # List of (25,) tensors
     test_input_grid: torch.Tensor  # Single (25,) tensor
     test_output_grid: torch.Tensor  # Single (25,) tensor
+    task_type: Literal["train", "test"]  # Whether this task is from train or test dataset
 
 
 def parse_arc_json(file_path: Path) -> ARCTask:
@@ -556,16 +556,18 @@ class ARCTaskDataset(Dataset):
     - example_type: 'train' or 'test' indicating which set the example came from
     """
 
-    def __init__(self, folder_path: str, vocab_size: int = 10):
+    def __init__(self, folder_path: str, vocab_size: int, task_type: Literal["train", "test"]):
         """Initialize the dataset.
 
         Args:
             folder_path: Path to folder containing task JSON files
             vocab_size: Size of vocabulary (default 10: 0-9 for colors)
+            task_type: Whether this dataset is for train or test tasks
         """
         self.folder_path = Path(folder_path)
         self.task_files = sorted(self.folder_path.glob("*.json"))
         self.vocab_size = vocab_size
+        self.task_type: Literal["train", "test"] = task_type
 
     def __len__(self) -> int:
         return len(self.task_files)
@@ -653,6 +655,7 @@ class ARCTaskDataset(Dataset):
             "train_output_grids": train_output_grids,
             "test_input_grid": torch.tensor(test_input_cells, dtype=torch.long),
             "test_output_grid": torch.tensor(test_output_cells, dtype=torch.long),
+            "task_type": self.task_type,
         }
 
 
@@ -1105,7 +1108,7 @@ def compute_jepa_loss_for_batch(
     batch: List[ARCTaskData],
     device: torch.device,
     lambd: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute LeJEPA loss for a single batch.
 
     Creates 8 global views, each with 3 examples (150 tokens) sampled with replacement.
@@ -1117,7 +1120,7 @@ def compute_jepa_loss_for_batch(
         lambd: Weight for sig_reg loss in JEPA loss
 
     Returns:
-        Tuple of (jepa_loss, jepa_sim_loss, jepa_sig_reg_loss)
+        Tuple of (jepa_loss, jepa_sim_loss, jepa_sig_reg_loss, centers)
     """
     bs = len(batch)  # number of tasks
     num_views = 8
@@ -1175,21 +1178,22 @@ def compute_jepa_loss_for_batch(
     # Final weighted JEPA loss
     jepa_loss = (1 - lambd) * sim + lambd * sig_reg_loss
     
-    return jepa_loss, sim, sig_reg_loss
+    return jepa_loss, sim, sig_reg_loss, centers
 
 
 def compute_pred_loss_for_batch(
-    jepa_model: JepaModel,
+    centers: torch.Tensor,
     pred_model: PredictionModel,
     batch: List[ARCTaskData],
     device: torch.device,
 ) -> Tuple[torch.Tensor, int, int, int]:
     """Compute prediction loss for a single batch.
 
-    For each task, uses the JEPA model to compute task centers, then predicts the test output.
+    Uses precomputed task centers to predict outputs. When pred_model.training is True,
+    uses all train examples. When False, uses test examples.
 
     Args:
-        jepa_model: The JEPA transformer model (used without gradients)
+        centers: Precomputed task centers from JEPA model (batch_size, embedding_dim)
         pred_model: The prediction model
         batch: List of task dicts, each with train_input_grids, train_output_grids, etc.
         device: Device to compute on
@@ -1197,190 +1201,159 @@ def compute_pred_loss_for_batch(
     Returns:
         Tuple of (pred_loss, num_correct_tokens, num_total_tokens, num_perfect_tasks)
     """
-    # Compute centers using JEPA model without gradients
-    with torch.no_grad():
-        centers = compute_global_views_and_centers(jepa_model, batch, device)
-    
-    # Stack test grids directly from each task
-    pred_input_grids = [task_dict["test_input_grid"] for task_dict in batch]
-    pred_output_grids = [task_dict["test_output_grid"] for task_dict in batch]
-    
-    # Stack into batches
-    pred_input_batch = torch.stack(pred_input_grids, dim=0).to(device)  # (bs, 25)
-    pred_output_batch = torch.stack(pred_output_grids, dim=0).to(device)  # (bs, 25)
+    if pred_model.training:
+        # Training mode: use all train examples
+        pred_input_grids = []
+        pred_output_grids = []
+        for task_dict in batch:
+            pred_input_grids.extend(task_dict["train_input_grids"])
+            pred_output_grids.extend(task_dict["train_output_grids"])
+        
+        # Stack into batches
+        pred_input_batch = torch.stack(pred_input_grids, dim=0).to(device)  # (total_examples, 25)
+        pred_output_batch = torch.stack(pred_output_grids, dim=0).to(device)  # (total_examples, 25)
+        
+        # Repeat centers for each train example
+        num_examples_per_task = [len(task_dict["train_input_grids"]) for task_dict in batch]
+        centers_repeated = torch.cat([centers[i:i+1].repeat(n, 1) for i, n in enumerate(num_examples_per_task)], dim=0)  # (total_examples, embedding_dim)
+    else:
+        # Evaluation mode: use test examples
+        pred_input_grids = [task_dict["test_input_grid"] for task_dict in batch]
+        pred_output_grids = [task_dict["test_output_grid"] for task_dict in batch]
+        
+        # Stack into batches
+        pred_input_batch = torch.stack(pred_input_grids, dim=0).to(device)  # (bs, 25)
+        pred_output_batch = torch.stack(pred_output_grids, dim=0).to(device)  # (bs, 25)
+        centers_repeated = centers
     
     # Forward pass through prediction model
-    pred_logits = pred_model(centers, pred_input_batch)  # (bs, 25, vocab_size)
+    pred_logits = pred_model(centers_repeated, pred_input_batch)  # (num_examples, 25, vocab_size)
     
     # Compute cross entropy loss
     pred_loss = F.cross_entropy(
-        pred_logits.view(-1, pred_model.vocab_size),  # (bs * 25, vocab_size)
-        pred_output_batch.view(-1),  # (bs * 25,)
+        pred_logits.view(-1, pred_model.vocab_size),  # (num_examples * 25, vocab_size)
+        pred_output_batch.view(-1),  # (num_examples * 25,)
     )
     
     # Compute accuracy metrics
-    predicted_output_grids = pred_logits.argmax(dim=2)  # (bs, 25)
-    correct_per_task = (predicted_output_grids == pred_output_batch).sum(dim=1)  # (bs,)
-    num_correct_tokens = correct_per_task.sum().item()
-    num_total_tokens = len(batch) * 25
-    num_perfect_tasks = (correct_per_task == 25).sum().item()
+    predicted_output_grids = pred_logits.argmax(dim=2)  # (num_examples, 25)
+    correct_per_example = (predicted_output_grids == pred_output_batch).sum(dim=1)  # (num_examples,)
+    num_correct_tokens = correct_per_example.sum().item()
+    num_total_tokens = predicted_output_grids.shape[0] * 25
+    num_perfect_tasks = (correct_per_example == 25).sum().item()
     
     return pred_loss, num_correct_tokens, num_total_tokens, num_perfect_tasks
 
 
-def jepa_train_epoch(
+def train_and_test_epoch(
     jepa_model: JepaModel,
-    jepa_train_loader: DataLoader,
+    pred_model: PredictionModel,
+    data_loader: DataLoader,
     jepa_optimizer: torch.optim.Optimizer,
+    pred_optimizer: torch.optim.Optimizer,
     device: torch.device,
     lambd: float,
-) -> Tuple[float, float, float]:
-    """Train JEPA model for one epoch.
+) -> Tuple[float, float, float, float, float, float, float, float, float]:
+    """Train both JEPA and prediction models for one epoch, and evaluate prediction model.
 
     Args:
         jepa_model: The JEPA transformer model
-        jepa_train_loader: Data loader for JEPA training (concatenation of train and test)
+        pred_model: The prediction model
+        data_loader: Data loader for all tasks (train and test datasets combined)
         jepa_optimizer: Optimizer for JEPA model
+        pred_optimizer: Optimizer for prediction model
         device: Device to train on
         lambd: Weight for sig_reg loss in JEPA loss
 
     Returns:
-        Tuple of (avg_jepa_loss, avg_jepa_sim_loss, avg_jepa_sig_reg_loss)
+        Tuple of (avg_jepa_loss, avg_jepa_sim_loss, avg_jepa_sig_reg_loss,
+                  avg_train_pred_loss, train_accuracy, train_perfect_rate,
+                  avg_test_pred_loss, test_accuracy, test_perfect_rate)
     """
     jepa_model.train()
+    pred_model.train()
+    
     total_jepa_loss = 0.0
     total_jepa_sim = 0.0
     total_jepa_sig_reg = 0.0
+    total_train_pred_loss = 0.0
+    total_test_pred_loss = 0.0
+    
+    total_train_correct_tokens = 0
+    total_train_tokens = 0
+    total_train_perfect = 0
+    total_train_examples = 0
+    
+    total_test_correct_tokens = 0
+    total_test_tokens = 0
+    total_test_perfect = 0
+    total_test_tasks = 0
+    
     num_batches = 0
 
-    for batch_idx, examples in enumerate(jepa_train_loader):
-        # Compute JEPA loss
-        jepa_loss, jepa_sim, jepa_sig_reg = compute_jepa_loss_for_batch(
+    for batch_idx, examples in enumerate(data_loader):
+        # Compute JEPA loss and get centers
+        jepa_loss, jepa_sim, jepa_sig_reg, centers = compute_jepa_loss_for_batch(
             jepa_model, examples, device, lambd
         )
 
         # Optimize JEPA model
         jepa_optimizer.zero_grad()
         jepa_loss.backward()
-        torch.nn.utils.clip_grad_norm_(jepa_model.parameters(), max_norm=1.0)
         jepa_optimizer.step()
 
+        # Train prediction model with train examples
+        pred_model.train()
+        train_pred_loss, train_correct, train_total, train_perfect = compute_pred_loss_for_batch(
+            centers.detach(), pred_model, examples, device
+        )
+        
+        pred_optimizer.zero_grad()
+        train_pred_loss.backward()
+        pred_optimizer.step()
+        
+        # Evaluate prediction model with test examples
+        pred_model.eval()
+        with torch.no_grad():
+            # No need to detach centers here - torch.no_grad() already prevents gradient computation
+            test_pred_loss, test_correct, test_total, test_perfect = compute_pred_loss_for_batch(
+                centers, pred_model, examples, device
+            )
+        
+        # Accumulate metrics
         total_jepa_loss += jepa_loss.item()
         total_jepa_sim += jepa_sim.item()
         total_jepa_sig_reg += jepa_sig_reg.item()
+        total_train_pred_loss += train_pred_loss.item()
+        total_test_pred_loss += test_pred_loss.item()
+        
+        total_train_correct_tokens += train_correct
+        total_train_tokens += train_total
+        total_train_perfect += train_perfect
+        total_train_examples += train_total // 25
+        
+        total_test_correct_tokens += test_correct
+        total_test_tokens += test_total
+        total_test_perfect += test_perfect
+        total_test_tasks += len(examples)
+        
         num_batches += 1
+
+    train_accuracy = total_train_correct_tokens / total_train_tokens if total_train_tokens > 0 else 0.0
+    train_perfect_rate = total_train_perfect / total_train_examples if total_train_examples > 0 else 0.0
+    test_accuracy = total_test_correct_tokens / total_test_tokens if total_test_tokens > 0 else 0.0
+    test_perfect_rate = total_test_perfect / total_test_tasks if total_test_tasks > 0 else 0.0
 
     return (
         total_jepa_loss / num_batches,
         total_jepa_sim / num_batches,
         total_jepa_sig_reg / num_batches,
-    )
-
-
-def pred_train_epoch(
-    jepa_model: JepaModel,
-    pred_model: PredictionModel,
-    pred_train_loader: DataLoader,
-    pred_optimizer: torch.optim.Optimizer,
-    device: torch.device,
-) -> Tuple[float, float, float]:
-    """Train prediction model for one epoch.
-
-    Args:
-        jepa_model: The JEPA transformer model (used without gradients)
-        pred_model: The prediction model
-        pred_train_loader: Data loader for prediction training
-        pred_optimizer: Optimizer for prediction model
-        device: Device to train on
-
-    Returns:
-        Tuple of (avg_pred_loss, avg_accuracy, perfect_task_rate)
-    """
-    jepa_model.eval()
-    pred_model.train()
-    total_pred_loss = 0.0
-    total_correct_tokens = 0
-    total_tokens = 0
-    total_perfect_tasks = 0
-    total_tasks = 0
-    num_batches = 0
-
-    for batch_idx, examples in enumerate(pred_train_loader):
-        # Compute prediction loss
-        pred_loss, num_correct, num_total, num_perfect = compute_pred_loss_for_batch(
-            jepa_model, pred_model, examples, device
-        )
-
-        # Optimize prediction model
-        pred_optimizer.zero_grad()
-        pred_loss.backward()
-        torch.nn.utils.clip_grad_norm_(pred_model.parameters(), max_norm=1.0)
-        pred_optimizer.step()
-
-        total_pred_loss += pred_loss.item()
-        total_correct_tokens += num_correct
-        total_tokens += num_total
-        total_perfect_tasks += num_perfect
-        total_tasks += len(examples)
-        num_batches += 1
-
-    avg_accuracy = total_correct_tokens / total_tokens if total_tokens > 0 else 0.0
-    perfect_task_rate = total_perfect_tasks / total_tasks if total_tasks > 0 else 0.0
-
-    return (
-        total_pred_loss / num_batches,
-        avg_accuracy,
-        perfect_task_rate,
-    )
-
-
-def pred_test_epoch(
-    jepa_model: JepaModel,
-    pred_model: PredictionModel,
-    pred_test_loader: DataLoader,
-    device: torch.device,
-) -> Tuple[float, float, float]:
-    """Evaluate prediction model on test set.
-
-    Args:
-        jepa_model: The JEPA transformer model (used without gradients)
-        pred_model: The prediction model
-        pred_test_loader: Data loader for prediction testing
-        device: Device to evaluate on
-
-    Returns:
-        Tuple of (avg_pred_loss, avg_accuracy, perfect_task_rate)
-    """
-    jepa_model.eval()
-    pred_model.eval()
-    total_pred_loss = 0.0
-    total_correct_tokens = 0
-    total_tokens = 0
-    total_perfect_tasks = 0
-    total_tasks = 0
-    num_batches = 0
-
-    with torch.no_grad():
-        for batch_idx, examples in enumerate(pred_test_loader):
-            # Compute prediction loss
-            pred_loss, num_correct, num_total, num_perfect = compute_pred_loss_for_batch(
-                jepa_model, pred_model, examples, device
-            )
-
-            total_pred_loss += pred_loss.item()
-            total_correct_tokens += num_correct
-            total_tokens += num_total
-            total_perfect_tasks += num_perfect
-            total_tasks += len(examples)
-            num_batches += 1
-
-    avg_accuracy = total_correct_tokens / total_tokens if total_tokens > 0 else 0.0
-    perfect_task_rate = total_perfect_tasks / total_tasks if total_tasks > 0 else 0.0
-
-    return (
-        total_pred_loss / num_batches,
-        avg_accuracy,
-        perfect_task_rate,
+        total_train_pred_loss / num_batches,
+        train_accuracy,
+        train_perfect_rate,
+        total_test_pred_loss / num_batches,
+        test_accuracy,
+        test_perfect_rate,
     )
 
 
@@ -1411,14 +1384,13 @@ def jepa_learning_rate_test(
         jepa_opt = torch.optim.Adam(jepa_model.parameters(), lr=lr)
 
         # Compute JEPA loss
-        jepa_loss, jepa_sim, jepa_sig_reg = compute_jepa_loss_for_batch(
+        jepa_loss, jepa_sim, jepa_sig_reg, centers = compute_jepa_loss_for_batch(
             jepa_model, examples, device, lambd
         )
 
         # Backward pass for JEPA model
         jepa_opt.zero_grad()
         jepa_loss.backward()
-        torch.nn.utils.clip_grad_norm_(jepa_model.parameters(), max_norm=1.0)
         jepa_opt.step()
 
         # Print learning rate and losses
@@ -1459,15 +1431,18 @@ def pred_learning_rate_test(
         # Create optimizer with current learning rate
         pred_opt = torch.optim.Adam(pred_model.parameters(), lr=lr)
 
+        # Compute centers from JEPA model
+        with torch.no_grad():
+            centers = compute_global_views_and_centers(jepa_model, examples, device)
+
         # Compute prediction loss
         pred_loss, num_correct, num_total, num_perfect = compute_pred_loss_for_batch(
-            jepa_model, pred_model, examples, device
+            centers, pred_model, examples, device
         )
 
         # Backward pass for prediction model
         pred_opt.zero_grad()
         pred_loss.backward()
-        torch.nn.utils.clip_grad_norm_(pred_model.parameters(), max_norm=1.0)
         pred_opt.step()
 
         # Print learning rate and losses
@@ -1500,37 +1475,20 @@ def train(config: Config):
     print(f"Using device: {device}")
 
     # Create datasets
-    train_dataset = ARCTaskDataset(config.train_data_dir, vocab_size=config.vocab_size)
-    test_dataset = ARCTaskDataset(config.test_data_dir, vocab_size=config.vocab_size)
+    train_dataset = ARCTaskDataset(config.train_data_dir, vocab_size=config.vocab_size, task_type="train")
+    test_dataset = ARCTaskDataset(config.test_data_dir, vocab_size=config.vocab_size, task_type="test")
 
     print(f"Train dataset size: {len(train_dataset)}")
     print(f"Test dataset size: {len(test_dataset)}")
 
-    # Create datasets for different training purposes
-    jepa_train_dataset = ConcatDataset([train_dataset, test_dataset])
-    pred_train_dataset = train_dataset
-    pred_test_dataset = test_dataset
+    # Combine all tasks for training
+    combined_dataset = ConcatDataset([train_dataset, test_dataset])
+    print(f"Combined dataset size: {len(combined_dataset)}")
 
-    print(f"JEPA train dataset size: {len(jepa_train_dataset)}")
-    print(f"Pred train dataset size: {len(pred_train_dataset)}")
-    print(f"Pred test dataset size: {len(pred_test_dataset)}")
-
-    # Create dataloaders
-    jepa_train_loader = DataLoader(
-        jepa_train_dataset,
-        batch_size=config.jepa_batch_size,
-        shuffle=True,
-        collate_fn=arc_task_collate_fn,
-    )
-    pred_train_loader = DataLoader(
-        pred_train_dataset,
-        batch_size=config.pred_batch_size,
-        shuffle=True,
-        collate_fn=arc_task_collate_fn,
-    )
-    pred_test_loader = DataLoader(
-        pred_test_dataset,
-        batch_size=config.pred_batch_size,
+    # Create single dataloader
+    data_loader = DataLoader(
+        combined_dataset,
+        batch_size=config.batch_size,
         shuffle=True,
         collate_fn=arc_task_collate_fn,
     )
@@ -1573,8 +1531,8 @@ def train(config: Config):
 
     # Check if running learning rate test
     if config.mode == "learning_rate_test":
-        jepa_learning_rate_test(jepa_model, jepa_train_loader, device, config.lambd)
-        pred_learning_rate_test(jepa_model, pred_model, pred_train_loader, device)
+        jepa_learning_rate_test(jepa_model, data_loader, device, config.lambd)
+        pred_learning_rate_test(jepa_model, pred_model, data_loader, device)
         return
 
     # Create optimizers
@@ -1614,19 +1572,25 @@ def train(config: Config):
     for epoch in range(start_epoch, start_epoch + config.num_epochs):
         epoch_start_time = time.time()
 
-        # Train JEPA model
-        train_jepa_loss, train_jepa_sim, train_jepa_sig_reg = jepa_train_epoch(
-            jepa_model, jepa_train_loader, jepa_optimizer, device, config.lambd
-        )
-
-        # Train prediction model
-        train_pred_loss, train_accuracy, train_perfect_rate = pred_train_epoch(
-            jepa_model, pred_model, pred_train_loader, pred_optimizer, device
-        )
-
-        # Test prediction model
-        test_pred_loss, test_accuracy, test_perfect_rate = pred_test_epoch(
-            jepa_model, pred_model, pred_test_loader, device
+        # Train and test both models
+        (
+            train_jepa_loss,
+            train_jepa_sim,
+            train_jepa_sig_reg,
+            train_pred_loss,
+            train_accuracy,
+            train_perfect_rate,
+            test_pred_loss,
+            test_accuracy,
+            test_perfect_rate,
+        ) = train_and_test_epoch(
+            jepa_model,
+            pred_model,
+            data_loader,
+            jepa_optimizer,
+            pred_optimizer,
+            device,
+            config.lambd,
         )
 
         # Calculate epoch time
@@ -1727,6 +1691,30 @@ def train(config: Config):
 
         # Save checkpoint every N epochs (configurable)
         if (epoch + 1) % config.checkpoint_save_interval == 0:
+            checkpoint_path = Path(config.checkpoint_dir) / f"{config.timestamp}_epoch_{epoch + 1}_checkpoint.pt"
+            torch.save(
+                {
+                    "epoch": epoch + 1,
+                    "jepa_model_state_dict": jepa_model.state_dict(),
+                    "pred_model_state_dict": pred_model.state_dict(),
+                    "jepa_optimizer_state_dict": jepa_optimizer.state_dict(),
+                    "pred_optimizer_state_dict": pred_optimizer.state_dict(),
+                    "train_jepa_loss": train_jepa_loss,
+                    "train_pred_loss": train_pred_loss,
+                    "test_pred_loss": test_pred_loss,
+                    "config": {
+                        "d_model": config.d_model,
+                        "nhead": config.nhead,
+                        "num_layers": config.num_layers,
+                        "dim_feedforward": config.dim_feedforward,
+                        "vocab_size": config.vocab_size,
+                        "dropout": config.dropout,
+                        "embedding_dim": config.embedding_dim,
+                    },
+                },
+                checkpoint_path,
+            )
+            print(f"Saved checkpoint to {checkpoint_path}")
             checkpoint_path = f"{config.checkpoint_dir}/{config.timestamp}_epoch_{epoch + 1}_checkpoint.pt"
             torch.save(
                 {
@@ -1804,9 +1792,8 @@ def main():
         vocab_size=10,
         # Training parameters
         num_epochs=150,
-        jepa_batch_size=128,
-        pred_batch_size=32,
-        learning_rate=1e-4,
+        batch_size=128,
+        learning_rate=2e-4,
         lambd=0.05,
         mode="train",
         checkpoint_save_interval=25,
