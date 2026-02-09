@@ -935,6 +935,9 @@ class PredictionModel(nn.Module):
         # Token embedding layer for grid tokens
         self.token_embedding = nn.Embedding(vocab_size, d_model)
 
+        # Learnable position embeddings for JEPA tokens
+        self.jepa_position_embeddings = nn.Parameter(torch.randn(self.num_jepa_tokens, d_model))
+
         # 2D Rotary Position Embeddings for grid positions
         self.rope = RoPE2D(d_model=d_model, max_grid_size=5)
 
@@ -969,6 +972,9 @@ class PredictionModel(nn.Module):
         
         # Reshape JEPA embedding to tokens
         jepa_tokens = jepa_embedding.view(batch_size, self.num_jepa_tokens, self.d_model)  # (batch_size, num_jepa_tokens, d_model)
+        
+        # Add position embeddings to JEPA tokens
+        jepa_tokens = jepa_tokens + self.jepa_position_embeddings
         
         # Embed input grid
         input_emb = self.token_embedding(input_grid)  # (batch_size, 25, d_model)
