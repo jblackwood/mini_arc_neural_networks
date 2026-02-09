@@ -1748,12 +1748,12 @@ def main():
         # Data parameters
         vocab_size=10,
         # Training parameters
-        num_epochs=150,
+        num_epochs=100,
         batch_size=128,
         learning_rate=2e-4,
         lambd=0.05,
         mode="train",
-        checkpoint_save_interval=25,
+        checkpoint_save_interval=10,
         # Google Drive location for Colab
         google_drive_dir="/content/drive/MyDrive/sparse_arc",
         # Optional: Load existing models to continue training
