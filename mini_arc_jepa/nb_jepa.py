@@ -1045,7 +1045,7 @@ def compute_global_views_and_centers(
     jepa_model: JepaModel,
     batch: List[ARCTaskData],
     device: torch.device,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute global views and task centers for a batch.
 
     Creates 8 global views, each with 3 examples (150 tokens) sampled with replacement,
@@ -1057,7 +1057,9 @@ def compute_global_views_and_centers(
         device: Device to compute on
 
     Returns:
-        Tensor of shape (batch_size, embedding_dim) with task centers
+        Tuple of (centers, all_emb_reshaped) where:
+            centers: Tensor of shape (batch_size, embedding_dim) with task centers
+            all_emb_reshaped: Tensor of shape (num_views, batch_size, embedding_dim) with all view embeddings
     """
     bs = len(batch)  # number of tasks
     num_views = 8
@@ -1073,18 +1075,17 @@ def compute_global_views_and_centers(
         task_examples_list.append(task_examples)
     
     # Create 8 global views by randomly sampling 3 examples with replacement
-    # Generate random indices for all views and tasks at once
-    global_views = []
-    for view_idx in range(num_views):
-        view_batch = []
-        for task_examples in task_examples_list:
-            num_examples = task_examples.shape[0]
-            # Sample 3 example indices with replacement
-            indices = torch.randint(0, num_examples, (3,))
-            # Gather and flatten to (150,)
-            sampled = task_examples[indices].reshape(-1)
-            view_batch.append(sampled)
-        global_views.append(torch.stack(view_batch, dim=0))  # (bs, 150)
+    # Pre-compute number of examples per task for efficiency
+    num_examples_per_task = [task_examples.shape[0] for task_examples in task_examples_list]
+    
+    # Generate all views using list comprehension for efficiency
+    global_views = [
+        torch.stack([
+            task_examples[torch.randint(0, num_examples, (3,))].reshape(-1)
+            for task_examples, num_examples in zip(task_examples_list, num_examples_per_task)
+        ], dim=0)
+        for _ in range(num_views)
+    ]
     
     # Stack all views into single batch for forward pass
     all_batch = torch.cat(global_views, dim=0).to(device)  # (num_views * bs, 150)
@@ -1100,7 +1101,7 @@ def compute_global_views_and_centers(
     # Centers: Mean representation of all views per task
     centers = all_emb_reshaped.mean(0)  # (bs, K)
     
-    return centers
+    return centers, all_emb_reshaped
 
 
 def compute_jepa_loss_for_batch(
@@ -1125,43 +1126,8 @@ def compute_jepa_loss_for_batch(
     bs = len(batch)  # number of tasks
     num_views = 8
     
-    # Stack all train examples per task: List[Tensor(num_examples, 50)]
-    task_examples_list = []
-    for task_dict in batch:
-        # Stack input and output grids: (num_examples, 25) each
-        input_grids = torch.stack(task_dict["train_input_grids"], dim=0)
-        output_grids = torch.stack(task_dict["train_output_grids"], dim=0)
-        # Concatenate to get (num_examples, 50)
-        task_examples = torch.cat([input_grids, output_grids], dim=1)
-        task_examples_list.append(task_examples)
-    
-    # Create 8 global views by randomly sampling 3 examples with replacement
-    # Generate random indices for all views and tasks at once
-    global_views = []
-    for view_idx in range(num_views):
-        view_batch = []
-        for task_examples in task_examples_list:
-            num_examples = task_examples.shape[0]
-            # Sample 3 example indices with replacement
-            indices = torch.randint(0, num_examples, (3,))
-            # Gather and flatten to (150,)
-            sampled = task_examples[indices].reshape(-1)
-            view_batch.append(sampled)
-        global_views.append(torch.stack(view_batch, dim=0))  # (bs, 150)
-    
-    # Stack all views into single batch for forward pass
-    all_batch = torch.cat(global_views, dim=0).to(device)  # (num_views * bs, 150)
-    
-    # Forward pass for all views
-    all_embeddings = jepa_model(all_batch)  # (num_views * bs, embedding_dim)
-    
-    K = all_embeddings.size(1)  # embedding_dim
-    
-    # Reshape to (num_views, bs, K)
-    all_emb_reshaped = all_embeddings.view(num_views, bs, K)
-    
-    # Centers: Mean representation of all views per task
-    centers = all_emb_reshaped.mean(0)  # (bs, K)
+    # Compute global views and centers
+    centers, all_emb_reshaped = compute_global_views_and_centers(jepa_model, batch, device)
     
     # Similarity term: MSE between centers and ALL view embeddings
     sim = (centers.unsqueeze(0) - all_emb_reshaped).square().mean()
@@ -1433,7 +1399,7 @@ def pred_learning_rate_test(
 
         # Compute centers from JEPA model
         with torch.no_grad():
-            centers = compute_global_views_and_centers(jepa_model, examples, device)
+            centers, _ = compute_global_views_and_centers(jepa_model, examples, device)
 
         # Compute prediction loss
         pred_loss, num_correct, num_total, num_perfect = compute_pred_loss_for_batch(
