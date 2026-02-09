@@ -22,59 +22,50 @@ from torch.utils.tensorboard import SummaryWriter
 
 @dataclass
 class Config:
-    """Configuration for ARC dataset creation and model training."""
-
     # Dataset creation parameters
     data_dir: Path
     output_dir: Path
     test_ratio: float
     random_seed: int
     max_augmentations: int
-
     # Model parameters
     d_model: int
     nhead: int
     num_layers: int
     dim_feedforward: int
     dropout: float
-    embedding_dim: int  # Output embedding dimension (e.g., 512)
-
-    # Training parameters
-    batch_size: int
-    num_epochs: int
-    learning_rate: float
-    lambd: float  # Weight for loss_sig_reg in loss calculation
-    mode: Literal["train", "learning_rate_test"]
-    checkpoint_save_interval: int
-
+    embedding_dim: int
     # Data parameters
     vocab_size: int
-
+    # Training parameters
+    num_epochs: int
+    batch_size: int
+    learning_rate: float
+    lambd: float
+    mode: Literal["train", "learning_rate_test"]
+    checkpoint_save_interval: int
     # Google Drive location for Colab
     google_drive_dir: str
-
-    # Optional model loading
-    load_model_path: Optional[str] = None
-
-    # Paths (computed)
+    # Optional: Load existing models to continue training
+    jepa_load_model_path: Optional[str]
+    pred_load_model_path: Optional[str]
+    # Computed fields
     timestamp: str = ""
-    tensorboard_log_dir: str = ""
-    model_save_dir: str = ""
-    model_save_path: str = ""
-    checkpoint_dir: str = ""
     train_data_dir: str = ""
     test_data_dir: str = ""
+    tensorboard_log_dir: str = ""
+    checkpoint_dir: str = ""
+    model_save_dir: str = ""
+    model_save_path: str = ""
 
     def __post_init__(self):
-        """Initialize computed paths."""
-        if not self.timestamp:
-            self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        if not self.tensorboard_log_dir:
-            self.tensorboard_log_dir = f"{self.output_dir}/runs/{self.timestamp}_model"
-        if not self.model_save_dir:
-            self.model_save_dir = f"{self.output_dir}/models"
-        if not self.model_save_path:
-            self.model_save_path = f"{self.model_save_dir}/{self.timestamp}_model.pt"
+        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.train_data_dir = str(self.output_dir / "train")
+        self.test_data_dir = str(self.output_dir / "test")
+        self.tensorboard_log_dir = str(self.output_dir / "tensorboard" / self.timestamp)
+        self.checkpoint_dir = str(self.output_dir / "checkpoints")
+        self.model_save_dir = str(self.output_dir / "models")
+        self.model_save_path = str(Path(self.model_save_dir) / f"{self.timestamp}_model.pt")
         if not self.checkpoint_dir:
             self.checkpoint_dir = f"{self.output_dir}/checkpoints"
         if not self.train_data_dir:
@@ -1507,23 +1498,38 @@ def train(config: Config):
 
     # Load existing models if specified
     start_epoch = 0
-    if config.load_model_path:
-        if Path(config.load_model_path).exists():
-            print(f"\nLoading existing models from {config.load_model_path}")
-            checkpoint = torch.load(config.load_model_path, map_location=device)
-            jepa_model.load_state_dict(checkpoint["jepa_model_state_dict"])
-            pred_model.load_state_dict(checkpoint["pred_model_state_dict"])
-            jepa_optimizer.load_state_dict(checkpoint["jepa_optimizer_state_dict"])
-            pred_optimizer.load_state_dict(checkpoint["pred_optimizer_state_dict"])
-            start_epoch = checkpoint.get("epoch", 0)
-            print(f"Resumed from epoch {start_epoch}")
-            print(f"Previous train JEPA loss: {checkpoint.get('train_jepa_loss', 'N/A')}")
-            print(f"Previous train pred loss: {checkpoint.get('train_pred_loss', 'N/A')}")
-            print(f"Previous test JEPA loss: {checkpoint.get('test_jepa_loss', 'N/A')}")
-            print(f"Previous test pred loss: {checkpoint.get('test_pred_loss', 'N/A')}")
+    
+    # Load JEPA model if path is specified
+    if config.jepa_load_model_path:
+        if Path(config.jepa_load_model_path).exists():
+            print(f"\nLoading JEPA model from {config.jepa_load_model_path}")
+            jepa_checkpoint = torch.load(config.jepa_load_model_path, map_location=device)
+            jepa_model.load_state_dict(jepa_checkpoint["model_state_dict"])
+            jepa_optimizer.load_state_dict(jepa_checkpoint["optimizer_state_dict"])
+            jepa_epoch = jepa_checkpoint.get("epoch", 0)
+            start_epoch = max(start_epoch, jepa_epoch)
+            print(f"Loaded JEPA model from epoch {jepa_epoch}")
+            print(f"Previous train JEPA loss: {jepa_checkpoint.get('train_jepa_loss', 'N/A')}")
         else:
             print(
-                f"\nWarning: Model path {config.load_model_path} does not exist. Starting from scratch."
+                f"\nWarning: JEPA model path {config.jepa_load_model_path} does not exist. Starting JEPA from scratch."
+            )
+    
+    # Load prediction model if path is specified
+    if config.pred_load_model_path:
+        if Path(config.pred_load_model_path).exists():
+            print(f"\nLoading prediction model from {config.pred_load_model_path}")
+            pred_checkpoint = torch.load(config.pred_load_model_path, map_location=device)
+            pred_model.load_state_dict(pred_checkpoint["model_state_dict"])
+            pred_optimizer.load_state_dict(pred_checkpoint["optimizer_state_dict"])
+            pred_epoch = pred_checkpoint.get("epoch", 0)
+            start_epoch = max(start_epoch, pred_epoch)
+            print(f"Loaded prediction model from epoch {pred_epoch}")
+            print(f"Previous train pred loss: {pred_checkpoint.get('train_pred_loss', 'N/A')}")
+            print(f"Previous test pred loss: {pred_checkpoint.get('test_pred_loss', 'N/A')}")
+        else:
+            print(
+                f"\nWarning: Prediction model path {config.pred_load_model_path} does not exist. Starting prediction model from scratch."
             )
 
     # Create tensorboard writer
@@ -1657,17 +1663,16 @@ def train(config: Config):
 
         # Save checkpoint every N epochs (configurable)
         if (epoch + 1) % config.checkpoint_save_interval == 0:
-            checkpoint_path = Path(config.checkpoint_dir) / f"{config.timestamp}_epoch_{epoch + 1}_checkpoint.pt"
+            # Save JEPA model checkpoint
+            jepa_checkpoint_path = Path(config.checkpoint_dir) / f"jepa_{config.timestamp}_epoch_{epoch + 1}_checkpoint.pt"
             torch.save(
                 {
                     "epoch": epoch + 1,
-                    "jepa_model_state_dict": jepa_model.state_dict(),
-                    "pred_model_state_dict": pred_model.state_dict(),
-                    "jepa_optimizer_state_dict": jepa_optimizer.state_dict(),
-                    "pred_optimizer_state_dict": pred_optimizer.state_dict(),
+                    "model_state_dict": jepa_model.state_dict(),
+                    "optimizer_state_dict": jepa_optimizer.state_dict(),
                     "train_jepa_loss": train_jepa_loss,
-                    "train_pred_loss": train_pred_loss,
-                    "test_pred_loss": test_pred_loss,
+                    "train_jepa_sim": train_jepa_sim,
+                    "train_jepa_sig_reg": train_jepa_sig_reg,
                     "config": {
                         "d_model": config.d_model,
                         "nhead": config.nhead,
@@ -1678,64 +1683,44 @@ def train(config: Config):
                         "embedding_dim": config.embedding_dim,
                     },
                 },
-                checkpoint_path,
+                jepa_checkpoint_path,
             )
-            print(f"Saved checkpoint to {checkpoint_path}")
-            checkpoint_path = f"{config.checkpoint_dir}/{config.timestamp}_epoch_{epoch + 1}_checkpoint.pt"
-            torch.save(
-                {
-                    "epoch": epoch + 1,
-                    "jepa_model_state_dict": jepa_model.state_dict(),
-                    "pred_model_state_dict": pred_model.state_dict(),
-                    "jepa_optimizer_state_dict": jepa_optimizer.state_dict(),
-                    "pred_optimizer_state_dict": pred_optimizer.state_dict(),
-                    "train_jepa_loss": train_jepa_loss,
-                    "train_pred_loss": train_pred_loss,
-                    "test_pred_loss": test_pred_loss,
-                    "config": {
-                        "d_model": config.d_model,
-                        "nhead": config.nhead,
-                        "num_layers": config.num_layers,
-                        "dim_feedforward": config.dim_feedforward,
-                        "vocab_size": config.vocab_size,
-                        "dropout": config.dropout,
-                        "embedding_dim": config.embedding_dim,
-                    },
-                },
-                checkpoint_path,
-            )
-            print(f"Saved checkpoint to {checkpoint_path}")
+            print(f"Saved JEPA checkpoint to {jepa_checkpoint_path}")
             
-            # Copy checkpoint to Google Drive if the directory exists
+            # Save prediction model checkpoint
+            pred_checkpoint_path = Path(config.checkpoint_dir) / f"pred_{config.timestamp}_epoch_{epoch + 1}_checkpoint.pt"
+            torch.save(
+                {
+                    "epoch": epoch + 1,
+                    "model_state_dict": pred_model.state_dict(),
+                    "optimizer_state_dict": pred_optimizer.state_dict(),
+                    "train_pred_loss": train_pred_loss,
+                    "test_pred_loss": test_pred_loss,
+                    "config": {
+                        "jepa_embedding_dim": config.embedding_dim,
+                        "d_model": config.d_model,
+                        "nhead": config.nhead,
+                        "num_layers": config.num_layers,
+                        "dim_feedforward": config.dim_feedforward,
+                        "vocab_size": config.vocab_size,
+                        "dropout": config.dropout,
+                    },
+                },
+                pred_checkpoint_path,
+            )
+            print(f"Saved prediction checkpoint to {pred_checkpoint_path}")
+            
+            # Copy checkpoints to Google Drive if the directory exists
             if os.path.exists(config.google_drive_dir):
-                gdrive_checkpoint_path = f"{config.google_drive_dir}/{config.timestamp}_epoch_{epoch + 1}_checkpoint.pt"
-                shutil.copy2(checkpoint_path, gdrive_checkpoint_path)
-                print(f"Copied checkpoint to Google Drive: {gdrive_checkpoint_path}")
+                gdrive_jepa_checkpoint_path = Path(config.google_drive_dir) / f"jepa_{config.timestamp}_epoch_{epoch + 1}_checkpoint.pt"
+                gdrive_pred_checkpoint_path = Path(config.google_drive_dir) / f"pred_{config.timestamp}_epoch_{epoch + 1}_checkpoint.pt"
+                shutil.copy2(jepa_checkpoint_path, gdrive_jepa_checkpoint_path)
+                shutil.copy2(pred_checkpoint_path, gdrive_pred_checkpoint_path)
+                print(f"Copied JEPA checkpoint to Google Drive: {gdrive_jepa_checkpoint_path}")
+                print(f"Copied prediction checkpoint to Google Drive: {gdrive_pred_checkpoint_path}")
 
     writer.close()
     print("\nTraining complete!")
-
-    # Save final models
-    Path(config.model_save_dir).mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "jepa_model_state_dict": jepa_model.state_dict(),
-            "pred_model_state_dict": pred_model.state_dict(),
-            "jepa_optimizer_state_dict": jepa_optimizer.state_dict(),
-            "pred_optimizer_state_dict": pred_optimizer.state_dict(),
-            "config": {
-                "d_model": config.d_model,
-                "nhead": config.nhead,
-                "num_layers": config.num_layers,
-                "dim_feedforward": config.dim_feedforward,
-                "vocab_size": config.vocab_size,
-                "dropout": config.dropout,
-                "embedding_dim": config.embedding_dim,
-            },
-        },
-        config.model_save_path,
-    )
-    print(f"Models saved to {config.model_save_path}")
 
 
 def main():
@@ -1765,8 +1750,15 @@ def main():
         checkpoint_save_interval=25,
         # Google Drive location for Colab
         google_drive_dir="/content/drive/MyDrive/sparse_arc",
-        # Optional: Load existing model to continue training
-        load_model_path=None,
+        # Optional: Load existing models to continue training
+        jepa_load_model_path=None,
+        pred_load_model_path=None,
+    )
+    
+    # Ensure a checkpoint is saved on the last epoch
+    assert config.num_epochs % config.checkpoint_save_interval == 0, (
+        f"num_epochs ({config.num_epochs}) must be a multiple of "
+        f"checkpoint_save_interval ({config.checkpoint_save_interval})"
     )
 
     # Print configuration
