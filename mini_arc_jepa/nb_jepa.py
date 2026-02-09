@@ -1511,8 +1511,8 @@ def train(config: Config):
             print(f"Loaded JEPA model from epoch {jepa_epoch}")
             print(f"Previous train JEPA loss: {jepa_checkpoint.get('train_jepa_loss', 'N/A')}")
         else:
-            print(
-                f"\nWarning: JEPA model path {config.jepa_load_model_path} does not exist. Starting JEPA from scratch."
+            raise FileNotFoundError(
+                f"JEPA model path {config.jepa_load_model_path} does not exist."
             )
     
     # Load prediction model if path is specified
@@ -1528,8 +1528,8 @@ def train(config: Config):
             print(f"Previous train pred loss: {pred_checkpoint.get('train_pred_loss', 'N/A')}")
             print(f"Previous test pred loss: {pred_checkpoint.get('test_pred_loss', 'N/A')}")
         else:
-            print(
-                f"\nWarning: Prediction model path {config.pred_load_model_path} does not exist. Starting prediction model from scratch."
+            raise FileNotFoundError(
+                f"Prediction model path {config.pred_load_model_path} does not exist."
             )
 
     # Create tensorboard writer
