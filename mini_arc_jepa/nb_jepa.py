@@ -1001,7 +1001,7 @@ class PredictionModel(nn.Module):
 
 
 def sig_reg(x: torch.Tensor, num_slices: int = 256) -> torch.Tensor:
-    """Sliced Independence Generator Regularization (SIG-Reg).
+    """Sketched Isotropic Gaussian Regularization (SIG-Reg).
     
     Computes the Epps-Pulley test statistic to measure deviation from standard normal.
     
