@@ -94,6 +94,49 @@ class ARCTask:
     color_permutation: Optional[Dict[int, int]] = None
 
 
+@dataclass
+class TimingMetrics:
+    """Timing breakdown for epoch operations."""
+    data_load_time: float
+    jepa_compute_time: float
+    jepa_backward_time: float
+    pred_train_time: float
+    pred_eval_time: float
+
+
+@dataclass
+class JepaLossResult:
+    """Result from JEPA loss computation."""
+    total_loss: torch.Tensor
+    sim_loss: torch.Tensor
+    sig_reg_loss: torch.Tensor
+    centers: torch.Tensor
+
+
+@dataclass
+class PredLossResult:
+    """Result from prediction loss computation."""
+    loss: torch.Tensor
+    num_correct_tokens: int
+    num_total_tokens: int
+    num_perfect_tasks: int
+
+
+@dataclass
+class EpochMetrics:
+    """Metrics from training/testing for one epoch."""
+    train_jepa_loss: float
+    train_jepa_sim: float
+    train_jepa_sig_reg: float
+    train_pred_loss: float
+    train_accuracy: float
+    train_perfect_rate: float
+    test_pred_loss: float
+    test_accuracy: float
+    test_perfect_rate: float
+    timing: TimingMetrics
+
+
 class ARCTaskData(TypedDict):
     """Typed dict for a task with lists of grids."""
     train_input_grids: List[torch.Tensor]  # List of (25,) tensors
@@ -1106,7 +1149,7 @@ def compute_jepa_loss_for_batch(
     batch: List[ARCTaskData],
     device: torch.device,
     lambd: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> JepaLossResult:
     """Compute LeJEPA loss for a single batch.
 
     Creates 8 global views, each with 3 examples (150 tokens) sampled with replacement.
@@ -1118,7 +1161,7 @@ def compute_jepa_loss_for_batch(
         lambd: Weight for sig_reg loss in JEPA loss
 
     Returns:
-        Tuple of (jepa_loss, jepa_sim_loss, jepa_sig_reg_loss, centers)
+        JepaLossResult containing total_loss, sim_loss, sig_reg_loss, and centers
     """
     bs = len(batch)  # number of tasks
     num_views = 8
@@ -1141,7 +1184,12 @@ def compute_jepa_loss_for_batch(
     # Final weighted JEPA loss
     jepa_loss = (1 - lambd) * sim + lambd * sig_reg_loss
     
-    return jepa_loss, sim, sig_reg_loss, centers
+    return JepaLossResult(
+        total_loss=jepa_loss,
+        sim_loss=sim,
+        sig_reg_loss=sig_reg_loss,
+        centers=centers,
+    )
 
 
 def compute_pred_loss_for_batch(
@@ -1149,7 +1197,7 @@ def compute_pred_loss_for_batch(
     pred_model: PredictionModel,
     batch: List[ARCTaskData],
     device: torch.device,
-) -> Tuple[torch.Tensor, int, int, int]:
+) -> PredLossResult:
     """Compute prediction loss for a single batch.
 
     Uses precomputed task centers to predict outputs. When pred_model.training is True,
@@ -1162,7 +1210,7 @@ def compute_pred_loss_for_batch(
         device: Device to compute on
 
     Returns:
-        Tuple of (pred_loss, num_correct_tokens, num_total_tokens, num_perfect_tasks)
+        PredLossResult containing loss, num_correct_tokens, num_total_tokens, and num_perfect_tasks
     """
     if pred_model.training:
         # Training mode: use all train examples
@@ -1205,7 +1253,12 @@ def compute_pred_loss_for_batch(
     num_total_tokens = predicted_output_grids.shape[0] * 25
     num_perfect_tasks = (correct_per_example == 25).sum().item()
     
-    return pred_loss, num_correct_tokens, num_total_tokens, num_perfect_tasks
+    return PredLossResult(
+        loss=pred_loss,
+        num_correct_tokens=num_correct_tokens,
+        num_total_tokens=num_total_tokens,
+        num_perfect_tasks=num_perfect_tasks,
+    )
 
 
 def train_and_test_epoch(
@@ -1216,7 +1269,7 @@ def train_and_test_epoch(
     pred_optimizer: torch.optim.Optimizer,
     device: torch.device,
     lambd: float,
-) -> Tuple[float, float, float, float, float, float, float, float, float]:
+) -> EpochMetrics:
     """Train both JEPA and prediction models for one epoch, and evaluate prediction model.
 
     Args:
@@ -1229,9 +1282,7 @@ def train_and_test_epoch(
         lambd: Weight for sig_reg loss in JEPA loss
 
     Returns:
-        Tuple of (avg_jepa_loss, avg_jepa_sim_loss, avg_jepa_sig_reg_loss,
-                  avg_train_pred_loss, train_accuracy, train_perfect_rate,
-                  avg_test_pred_loss, test_accuracy, test_perfect_rate)
+        EpochMetrics containing losses, accuracies, and timing information
     """
     jepa_model.train()
     pred_model.train()
@@ -1253,52 +1304,77 @@ def train_and_test_epoch(
     total_test_tasks = 0
     
     num_batches = 0
+    
+    # Timing variables
+    total_data_load_time = 0.0
+    total_jepa_compute_time = 0.0
+    total_jepa_backward_time = 0.0
+    total_pred_train_time = 0.0
+    total_pred_eval_time = 0.0
 
     for batch_idx, examples in enumerate(data_loader):
+        batch_start_time = time.time()
+        
         # Compute JEPA loss and get centers
-        jepa_loss, jepa_sim, jepa_sig_reg, centers = compute_jepa_loss_for_batch(
+        jepa_compute_start = time.time()
+        jepa_result = compute_jepa_loss_for_batch(
             jepa_model, examples, device, lambd
         )
+        total_jepa_compute_time += time.time() - jepa_compute_start
 
         # Optimize JEPA model
+        jepa_backward_start = time.time()
         jepa_optimizer.zero_grad()
-        jepa_loss.backward()
+        jepa_result.total_loss.backward()
         jepa_optimizer.step()
+        total_jepa_backward_time += time.time() - jepa_backward_start
 
         # Train prediction model with train examples
+        pred_train_start = time.time()
         pred_model.train()
-        train_pred_loss, train_correct, train_total, train_perfect = compute_pred_loss_for_batch(
-            centers.detach(), pred_model, examples, device
+        train_pred_result = compute_pred_loss_for_batch(
+            jepa_result.centers.detach(), pred_model, examples, device
         )
         
         pred_optimizer.zero_grad()
-        train_pred_loss.backward()
+        train_pred_result.loss.backward()
         pred_optimizer.step()
+        total_pred_train_time += time.time() - pred_train_start
         
         # Evaluate prediction model with test examples
+        pred_eval_start = time.time()
         pred_model.eval()
         with torch.no_grad():
             # No need to detach centers here - torch.no_grad() already prevents gradient computation
-            test_pred_loss, test_correct, test_total, test_perfect = compute_pred_loss_for_batch(
-                centers, pred_model, examples, device
+            test_pred_result = compute_pred_loss_for_batch(
+                jepa_result.centers, pred_model, examples, device
             )
+        total_pred_eval_time += time.time() - pred_eval_start
         
         # Accumulate metrics
-        total_jepa_loss += jepa_loss.item()
-        total_jepa_sim += jepa_sim.item()
-        total_jepa_sig_reg += jepa_sig_reg.item()
-        total_train_pred_loss += train_pred_loss.item()
-        total_test_pred_loss += test_pred_loss.item()
+        total_jepa_loss += jepa_result.total_loss.item()
+        total_jepa_sim += jepa_result.sim_loss.item()
+        total_jepa_sig_reg += jepa_result.sig_reg_loss.item()
+        total_train_pred_loss += train_pred_result.loss.item()
+        total_test_pred_loss += test_pred_result.loss.item()
         
-        total_train_correct_tokens += train_correct
-        total_train_tokens += train_total
-        total_train_perfect += train_perfect
-        total_train_examples += train_total // 25
+        total_train_correct_tokens += train_pred_result.num_correct_tokens
+        total_train_tokens += train_pred_result.num_total_tokens
+        total_train_perfect += train_pred_result.num_perfect_tasks
+        total_train_examples += train_pred_result.num_total_tokens // 25
         
-        total_test_correct_tokens += test_correct
-        total_test_tokens += test_total
-        total_test_perfect += test_perfect
+        total_test_correct_tokens += test_pred_result.num_correct_tokens
+        total_test_tokens += test_pred_result.num_total_tokens
+        total_test_perfect += test_pred_result.num_perfect_tasks
         total_test_tasks += len(examples)
+        
+        # Track data loading time (time not spent in other operations)
+        batch_time = time.time() - batch_start_time
+        other_time = batch_time - (total_jepa_compute_time + total_jepa_backward_time + 
+                                    total_pred_train_time + total_pred_eval_time - 
+                                    (num_batches * (total_jepa_compute_time + total_jepa_backward_time + 
+                                                     total_pred_train_time + total_pred_eval_time) / (num_batches + 1)))
+        total_data_load_time += other_time
         
         num_batches += 1
 
@@ -1307,16 +1383,23 @@ def train_and_test_epoch(
     test_accuracy = total_test_correct_tokens / total_test_tokens if total_test_tokens > 0 else 0.0
     test_perfect_rate = total_test_perfect / total_test_tasks if total_test_tasks > 0 else 0.0
 
-    return (
-        total_jepa_loss / num_batches,
-        total_jepa_sim / num_batches,
-        total_jepa_sig_reg / num_batches,
-        total_train_pred_loss / num_batches,
-        train_accuracy,
-        train_perfect_rate,
-        total_test_pred_loss / num_batches,
-        test_accuracy,
-        test_perfect_rate,
+    return EpochMetrics(
+        train_jepa_loss=total_jepa_loss / num_batches,
+        train_jepa_sim=total_jepa_sim / num_batches,
+        train_jepa_sig_reg=total_jepa_sig_reg / num_batches,
+        train_pred_loss=total_train_pred_loss / num_batches,
+        train_accuracy=train_accuracy,
+        train_perfect_rate=train_perfect_rate,
+        test_pred_loss=total_test_pred_loss / num_batches,
+        test_accuracy=test_accuracy,
+        test_perfect_rate=test_perfect_rate,
+        timing=TimingMetrics(
+            data_load_time=total_data_load_time,
+            jepa_compute_time=total_jepa_compute_time,
+            jepa_backward_time=total_jepa_backward_time,
+            pred_train_time=total_pred_train_time,
+            pred_eval_time=total_pred_eval_time,
+        ),
     )
 
 
@@ -1347,18 +1430,18 @@ def jepa_learning_rate_test(
         jepa_opt = torch.optim.Adam(jepa_model.parameters(), lr=lr)
 
         # Compute JEPA loss
-        jepa_loss, jepa_sim, jepa_sig_reg, centers = compute_jepa_loss_for_batch(
+        jepa_result = compute_jepa_loss_for_batch(
             jepa_model, examples, device, lambd
         )
 
         # Backward pass for JEPA model
         jepa_opt.zero_grad()
-        jepa_loss.backward()
+        jepa_result.total_loss.backward()
         jepa_opt.step()
 
         # Print learning rate and losses
-        print(f"Batch {batch_count + 1}: LR = {lr:.2e}, JEPA Loss = {jepa_loss.item():.6f}, "
-              f"JEPA Sim = {jepa_sim.item():.6f}, JEPA SigReg = {jepa_sig_reg.item():.6f}")
+        print(f"Batch {batch_count + 1}: LR = {lr:.2e}, JEPA Loss = {jepa_result.total_loss.item():.6f}, "
+              f"JEPA Sim = {jepa_result.sim_loss.item():.6f}, JEPA SigReg = {jepa_result.sig_reg_loss.item():.6f}")
 
         # Double learning rate for next batch
         lr *= 2
@@ -1399,18 +1482,18 @@ def pred_learning_rate_test(
             centers, _ = compute_global_views_and_centers(jepa_model, examples, device)
 
         # Compute prediction loss
-        pred_loss, num_correct, num_total, num_perfect = compute_pred_loss_for_batch(
+        pred_result = compute_pred_loss_for_batch(
             centers, pred_model, examples, device
         )
 
         # Backward pass for prediction model
         pred_opt.zero_grad()
-        pred_loss.backward()
+        pred_result.loss.backward()
         pred_opt.step()
 
         # Print learning rate and losses
-        print(f"Batch {batch_count + 1}: LR = {lr:.2e}, Pred Loss = {pred_loss.item():.6f}, "
-              f"Accuracy: {num_correct}/{num_total} ({num_correct/num_total*100:.2f}%)")
+        print(f"Batch {batch_count + 1}: LR = {lr:.2e}, Pred Loss = {pred_result.loss.item():.6f}, "
+              f"Accuracy: {pred_result.num_correct_tokens}/{pred_result.num_total_tokens} ({pred_result.num_correct_tokens/pred_result.num_total_tokens*100:.2f}%)")
 
         # Double learning rate for next batch
         lr *= 2
@@ -1551,17 +1634,7 @@ def train(config: Config):
         epoch_start_time = time.time()
 
         # Train and test both models
-        (
-            train_jepa_loss,
-            train_jepa_sim,
-            train_jepa_sig_reg,
-            train_pred_loss,
-            train_accuracy,
-            train_perfect_rate,
-            test_pred_loss,
-            test_accuracy,
-            test_perfect_rate,
-        ) = train_and_test_epoch(
+        metrics = train_and_test_epoch(
             jepa_model,
             pred_model,
             data_loader,
@@ -1622,18 +1695,26 @@ def train(config: Config):
         # Log to console
         print(
             f"Epoch {epoch + 1}/{start_epoch + config.num_epochs} - "
-            f"Train JEPA Loss: {train_jepa_loss:.6f}, Train Pred Loss: {train_pred_loss:.6f}, "
-            f"Test Pred Loss: {test_pred_loss:.6f}, "
+            f"Train JEPA Loss: {metrics.train_jepa_loss:.6f}, Train Pred Loss: {metrics.train_pred_loss:.6f}, "
+            f"Test Pred Loss: {metrics.test_pred_loss:.6f}, "
             f"Time: {epoch_time:.2f}s"
         )
         print(
             f"  JEPA Loss Components - "
-            f"Train Sim: {train_jepa_sim:.6f}, Train SigReg: {train_jepa_sig_reg:.6f}"
+            f"Train Sim: {metrics.train_jepa_sim:.6f}, Train SigReg: {metrics.train_jepa_sig_reg:.6f}"
         )
         print(
             f"  Accuracy - "
-            f"Train: {train_accuracy*100:.2f}%, Train Perfect: {train_perfect_rate*100:.2f}%, "
-            f"Test: {test_accuracy*100:.2f}%, Test Perfect: {test_perfect_rate*100:.2f}%"
+            f"Train: {metrics.train_accuracy*100:.2f}%, Train Perfect: {metrics.train_perfect_rate*100:.2f}%, "
+            f"Test: {metrics.test_accuracy*100:.2f}%, Test Perfect: {metrics.test_perfect_rate*100:.2f}%"
+        )
+        print(
+            f"  Timing Breakdown - "
+            f"Data: {metrics.timing.data_load_time:.2f}s ({metrics.timing.data_load_time/epoch_time*100:.1f}%), "
+            f"JEPA Compute: {metrics.timing.jepa_compute_time:.2f}s ({metrics.timing.jepa_compute_time/epoch_time*100:.1f}%), "
+            f"JEPA Backward: {metrics.timing.jepa_backward_time:.2f}s ({metrics.timing.jepa_backward_time/epoch_time*100:.1f}%), "
+            f"Pred Train: {metrics.timing.pred_train_time:.2f}s ({metrics.timing.pred_train_time/epoch_time*100:.1f}%), "
+            f"Pred Eval: {metrics.timing.pred_eval_time:.2f}s ({metrics.timing.pred_eval_time/epoch_time*100:.1f}%)"
         )
         print(
             f"  Model Norms - "
@@ -1642,16 +1723,21 @@ def train(config: Config):
         )
 
         # Log to tensorboard
-        writer.add_scalar("Loss/train_jepa", train_jepa_loss, epoch)
-        writer.add_scalar("Loss/train_pred", train_pred_loss, epoch)
-        writer.add_scalar("Loss/test_pred", test_pred_loss, epoch)
-        writer.add_scalar("Loss/train_jepa_sim", train_jepa_sim, epoch)
-        writer.add_scalar("Loss/train_jepa_sig_reg", train_jepa_sig_reg, epoch)
-        writer.add_scalar("Accuracy/train_accuracy", train_accuracy, epoch)
-        writer.add_scalar("Accuracy/train_perfect_rate", train_perfect_rate, epoch)
-        writer.add_scalar("Accuracy/test_accuracy", test_accuracy, epoch)
-        writer.add_scalar("Accuracy/test_perfect_rate", test_perfect_rate, epoch)
+        writer.add_scalar("Loss/train_jepa", metrics.train_jepa_loss, epoch)
+        writer.add_scalar("Loss/train_pred", metrics.train_pred_loss, epoch)
+        writer.add_scalar("Loss/test_pred", metrics.test_pred_loss, epoch)
+        writer.add_scalar("Loss/train_jepa_sim", metrics.train_jepa_sim, epoch)
+        writer.add_scalar("Loss/train_jepa_sig_reg", metrics.train_jepa_sig_reg, epoch)
+        writer.add_scalar("Accuracy/train_accuracy", metrics.train_accuracy, epoch)
+        writer.add_scalar("Accuracy/train_perfect_rate", metrics.train_perfect_rate, epoch)
+        writer.add_scalar("Accuracy/test_accuracy", metrics.test_accuracy, epoch)
+        writer.add_scalar("Accuracy/test_perfect_rate", metrics.test_perfect_rate, epoch)
         writer.add_scalar("Time/epoch", epoch_time, epoch)
+        writer.add_scalar("Time/data_load", metrics.timing.data_load_time, epoch)
+        writer.add_scalar("Time/jepa_compute", metrics.timing.jepa_compute_time, epoch)
+        writer.add_scalar("Time/jepa_backward", metrics.timing.jepa_backward_time, epoch)
+        writer.add_scalar("Time/pred_train", metrics.timing.pred_train_time, epoch)
+        writer.add_scalar("Time/pred_eval", metrics.timing.pred_eval_time, epoch)
         writer.add_scalar("Model/jepa_weight_norm", jepa_weight_norm, epoch)
         writer.add_scalar("Model/pred_weight_norm", pred_weight_norm, epoch)
         writer.add_scalar("Model/jepa_output_proj_scale", jepa_output_proj_scale, epoch)
@@ -1676,9 +1762,9 @@ def train(config: Config):
                     "epoch": epoch + 1,
                     "model_state_dict": jepa_model.state_dict(),
                     "optimizer_state_dict": jepa_optimizer.state_dict(),
-                    "train_jepa_loss": train_jepa_loss,
-                    "train_jepa_sim": train_jepa_sim,
-                    "train_jepa_sig_reg": train_jepa_sig_reg,
+                    "train_jepa_loss": metrics.train_jepa_loss,
+                    "train_jepa_sim": metrics.train_jepa_sim,
+                    "train_jepa_sig_reg": metrics.train_jepa_sig_reg,
                     "config": {
                         "d_model": config.d_model,
                         "nhead": config.nhead,
@@ -1700,8 +1786,8 @@ def train(config: Config):
                     "epoch": epoch + 1,
                     "model_state_dict": pred_model.state_dict(),
                     "optimizer_state_dict": pred_optimizer.state_dict(),
-                    "train_pred_loss": train_pred_loss,
-                    "test_pred_loss": test_pred_loss,
+                    "train_pred_loss": metrics.train_pred_loss,
+                    "test_pred_loss": metrics.test_pred_loss,
                     "config": {
                         "jepa_embedding_dim": config.embedding_dim,
                         "d_model": config.d_model,
