@@ -25,10 +25,24 @@ def parse_epoch_line(line: str):
     
     Example format:
     "Epoch 1/150 - Train JEPA Loss: 0.515991, Train Pred Loss: 1.175712, Test Pred Loss: 1.174907, Time: 306.76s"
+    "Epoch 1/100 - Train JEPA Loss: 0.552229, Train Pred Loss: 0.106552, Eval Pred Loss: 0.095103, Time: 458.53s"
     
     Returns:
         dict with keys: epoch, train_jepa_loss, train_pred_loss, test_pred_loss, time
     """
+    # Try the new format with "Eval Pred Loss"
+    pattern = r"Epoch (\d+)/\d+ - Train JEPA Loss: ([\d.]+), Train Pred Loss: ([\d.]+), Eval Pred Loss: ([\d.]+), Time: ([\d.]+)s"
+    match = re.match(pattern, line)
+    if match:
+        return {
+            'epoch': int(match.group(1)),
+            'train_jepa_loss': float(match.group(2)),
+            'train_pred_loss': float(match.group(3)),
+            'test_pred_loss': float(match.group(4)),
+            'time': float(match.group(5))
+        }
+    
+    # Try the old format with "Test Pred Loss"
     pattern = r"Epoch (\d+)/\d+ - Train JEPA Loss: ([\d.]+), Train Pred Loss: ([\d.]+), Test Pred Loss: ([\d.]+), Time: ([\d.]+)s"
     match = re.match(pattern, line)
     if match:
@@ -64,10 +78,12 @@ def parse_accuracy_line(line: str):
     """Parse accuracy line.
     
     Example: "  Accuracy - Train: 62.27%, Train Perfect: 0.87%, Test: 62.88%, Test Perfect: 0.50%"
+    Example: "  Eval Accuracy (Test Examples) - Accuracy: 7.92%, Perfect: 0.09%"
     
     Returns:
         dict with keys: train_acc, train_perfect, test_acc, test_perfect (or None if no match)
     """
+    # Try the old format with combined accuracy line
     pattern = r"\s+Accuracy - Train: ([\d.]+)%, Train Perfect: ([\d.]+)%, Test: ([\d.]+)%, Test Perfect: ([\d.]+)%"
     match = re.match(pattern, line)
     if match:
@@ -77,6 +93,25 @@ def parse_accuracy_line(line: str):
             'test_acc': float(match.group(3)),
             'test_perfect': float(match.group(4))
         }
+    
+    # Try the new format with train examples
+    pattern = r"\s+Eval Accuracy \(Train Examples\) - Accuracy: ([\d.]+)%, Perfect: ([\d.]+)%"
+    match = re.match(pattern, line)
+    if match:
+        return {
+            'train_acc': float(match.group(1)),
+            'train_perfect': float(match.group(2))
+        }
+    
+    # Try the new format with test examples
+    pattern = r"\s+Eval Accuracy \(Test Examples\) - Accuracy: ([\d.]+)%, Perfect: ([\d.]+)%"
+    match = re.match(pattern, line)
+    if match:
+        return {
+            'test_acc': float(match.group(1)),
+            'test_perfect': float(match.group(2))
+        }
+    
     return None
 
 
@@ -218,7 +253,7 @@ def write_to_tensorboard(metrics, log_dir: Path, model_name: str):
 
 def main():
     # ============ Configure these variables ============
-    md_file = "mini_arc_jepa/results/20260209_172346_epoch_90_checkpoint.md"
+    md_file = "mini_arc_jepa/results/20260210_043657_epoch_40_checkpoint.md"
     log_dir = "output/mini_arc_jepa/runs"
     # ===================================================
     
