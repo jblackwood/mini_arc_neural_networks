@@ -118,9 +118,12 @@ class JepaLossResult:
 class PredLossResult:
     """Result from prediction loss computation."""
     loss: torch.Tensor
-    num_correct_tokens: int
-    num_total_tokens: int
-    num_perfect_tasks: int
+    train_num_correct_tokens: int
+    train_num_total_tokens: int
+    train_num_perfect_tasks: int
+    test_num_correct_tokens: int
+    test_num_total_tokens: int
+    test_num_perfect_tasks: int
 
 
 @dataclass
@@ -130,11 +133,11 @@ class EpochMetrics:
     train_jepa_sim: float
     train_jepa_sig_reg: float
     train_pred_loss: float
-    train_accuracy: float
-    train_perfect_rate: float
-    test_pred_loss: float
-    test_accuracy: float
-    test_perfect_rate: float
+    eval_pred_loss: float
+    eval_train_accuracy: float
+    eval_train_perfect_rate: float
+    eval_test_accuracy: float
+    eval_test_perfect_rate: float
     timing: TimingMetrics
 
 
@@ -1289,10 +1292,10 @@ def compute_pred_loss_for_batch(
         device: Device to compute on
 
     Returns:
-        PredLossResult containing loss, num_correct_tokens, num_total_tokens, and num_perfect_tasks
+        PredLossResult containing loss and separate train/test metrics
     """
     if pred_model.training:
-        # Training mode: use all train examples with teacher forcing
+        # Training mode: use all train examples with teacher forcing, no accuracy computation
         pred_input_grids = []
         pred_output_grids = []
         for task_dict in batch:
@@ -1316,52 +1319,67 @@ def compute_pred_loss_for_batch(
             pred_output_batch.view(-1),  # (total_examples * 25,)
         )
         
-        # Compute accuracy metrics
-        predicted_output_grids = pred_logits.argmax(dim=2)  # (total_examples, 25)
-        correct_per_example = (predicted_output_grids == pred_output_batch).sum(dim=1)  # (total_examples,)
-        num_correct_tokens = correct_per_example.sum().item()
-        num_total_tokens = predicted_output_grids.shape[0] * 25
-        num_perfect_tasks = (correct_per_example == 25).sum().item()
-        
+        # No accuracy computation during training
         return PredLossResult(
             loss=pred_loss,
-            num_correct_tokens=num_correct_tokens,
-            num_total_tokens=num_total_tokens,
-            num_perfect_tasks=num_perfect_tasks,
+            train_num_correct_tokens=0,
+            train_num_total_tokens=0,
+            train_num_perfect_tasks=0,
+            test_num_correct_tokens=0,
+            test_num_total_tokens=0,
+            test_num_perfect_tasks=0,
         )
     else:
         # Evaluation mode: use autoregressive generation
         # For each task: pick one random train example + test example
-        eval_input_grids = []
-        eval_output_grids = []
-        eval_centers = []
+        train_input_grids = []
+        train_output_grids = []
+        test_input_grids = []
+        test_output_grids = []
+        train_centers = []
+        test_centers = []
         
         for i, task_dict in enumerate(batch):
             # Pick one random train example
             num_train_examples = len(task_dict["train_input_grids"])
             random_idx = int(torch.randint(0, num_train_examples, (1,)).item())
-            eval_input_grids.append(task_dict["train_input_grids"][random_idx])
-            eval_output_grids.append(task_dict["train_output_grids"][random_idx])
-            eval_centers.append(centers[i])
+            train_input_grids.append(task_dict["train_input_grids"][random_idx])
+            train_output_grids.append(task_dict["train_output_grids"][random_idx])
+            train_centers.append(centers[i])
             
             # Add test example
-            eval_input_grids.append(task_dict["test_input_grid"])
-            eval_output_grids.append(task_dict["test_output_grid"])
-            eval_centers.append(centers[i])
+            test_input_grids.append(task_dict["test_input_grid"])
+            test_output_grids.append(task_dict["test_output_grid"])
+            test_centers.append(centers[i])
         
-        # Stack into batches
-        eval_input_batch = torch.stack(eval_input_grids, dim=0).to(device)  # (2 * bs, 25)
-        eval_output_batch = torch.stack(eval_output_grids, dim=0).to(device)  # (2 * bs, 25)
-        eval_centers_batch = torch.stack(eval_centers, dim=0).to(device)  # (2 * bs, embedding_dim)
+        # Stack train examples
+        train_input_batch = torch.stack(train_input_grids, dim=0).to(device)  # (bs, 25)
+        train_output_batch = torch.stack(train_output_grids, dim=0).to(device)  # (bs, 25)
+        train_centers_batch = torch.stack(train_centers, dim=0).to(device)  # (bs, embedding_dim)
         
-        # Generate outputs autoregressively
-        predicted_output_grids = pred_model.generate(eval_centers_batch, eval_input_batch)  # (2 * bs, 25)
+        # Stack test examples
+        test_input_batch = torch.stack(test_input_grids, dim=0).to(device)  # (bs, 25)
+        test_output_batch = torch.stack(test_output_grids, dim=0).to(device)  # (bs, 25)
+        test_centers_batch = torch.stack(test_centers, dim=0).to(device)  # (bs, embedding_dim)
         
-        # Compute accuracy metrics (no loss in eval mode)
-        correct_per_example = (predicted_output_grids == eval_output_batch).sum(dim=1)  # (2 * bs,)
-        num_correct_tokens = int(correct_per_example.sum().item())
-        num_total_tokens = predicted_output_grids.shape[0] * 25
-        num_perfect_tasks = int((correct_per_example == 25).sum().item())
+        # Generate outputs autoregressively for train examples
+        train_predicted = pred_model.generate(train_centers_batch, train_input_batch)  # (bs, 25)
+        train_correct_per_example = (train_predicted == train_output_batch).sum(dim=1)  # (bs,)
+        train_num_correct_tokens = int(train_correct_per_example.sum().item())
+        train_num_total_tokens = train_predicted.shape[0] * 25
+        train_num_perfect_tasks = int((train_correct_per_example == 25).sum().item())
+        
+        # Generate outputs autoregressively for test examples
+        test_predicted = pred_model.generate(test_centers_batch, test_input_batch)  # (bs, 25)
+        test_correct_per_example = (test_predicted == test_output_batch).sum(dim=1)  # (bs,)
+        test_num_correct_tokens = int(test_correct_per_example.sum().item())
+        test_num_total_tokens = test_predicted.shape[0] * 25
+        test_num_perfect_tasks = int((test_correct_per_example == 25).sum().item())
+        
+        # Concatenate for loss computation
+        eval_input_batch = torch.cat([train_input_batch, test_input_batch], dim=0)
+        eval_output_batch = torch.cat([train_output_batch, test_output_batch], dim=0)
+        eval_centers_batch = torch.cat([train_centers_batch, test_centers_batch], dim=0)
         
         # For loss, we'll compute it using teacher forcing for logging purposes
         with torch.no_grad():
@@ -1373,9 +1391,12 @@ def compute_pred_loss_for_batch(
         
         return PredLossResult(
             loss=pred_loss,
-            num_correct_tokens=num_correct_tokens,
-            num_total_tokens=num_total_tokens,
-            num_perfect_tasks=num_perfect_tasks,
+            train_num_correct_tokens=train_num_correct_tokens,
+            train_num_total_tokens=train_num_total_tokens,
+            train_num_perfect_tasks=train_num_perfect_tasks,
+            test_num_correct_tokens=test_num_correct_tokens,
+            test_num_total_tokens=test_num_total_tokens,
+            test_num_perfect_tasks=test_num_perfect_tasks,
         )
 
 
@@ -1413,15 +1434,13 @@ def train_and_test_epoch(
     total_train_pred_loss = 0.0
     total_test_pred_loss = 0.0
     
-    total_train_correct_tokens = 0
-    total_train_tokens = 0
-    total_train_perfect = 0
-    total_train_examples = 0
+    total_eval_train_correct_tokens = 0
+    total_eval_train_tokens = 0
+    total_eval_train_perfect = 0
     
-    total_test_correct_tokens = 0
-    total_test_tokens = 0
-    total_test_perfect = 0
-    total_test_tasks = 0
+    total_eval_test_correct_tokens = 0
+    total_eval_test_tokens = 0
+    total_eval_test_perfect = 0
     
     num_batches = 0
     
@@ -1482,16 +1501,13 @@ def train_and_test_epoch(
         total_train_pred_loss += train_pred_result.loss.item()
         total_test_pred_loss += test_pred_result.loss.item()
         
-        total_train_correct_tokens += train_pred_result.num_correct_tokens
-        total_train_tokens += train_pred_result.num_total_tokens
-        total_train_perfect += train_pred_result.num_perfect_tasks
-        total_train_examples += train_pred_result.num_total_tokens // 25
+        total_eval_train_correct_tokens += test_pred_result.train_num_correct_tokens
+        total_eval_train_tokens += test_pred_result.train_num_total_tokens
+        total_eval_train_perfect += test_pred_result.train_num_perfect_tasks
         
-        total_test_correct_tokens += test_pred_result.num_correct_tokens
-        total_test_tokens += test_pred_result.num_total_tokens
-        total_test_perfect += test_pred_result.num_perfect_tasks
-        # In eval mode, we generate 2 examples per task (1 train + 1 test)
-        total_test_tasks += test_pred_result.num_total_tokens // 25
+        total_eval_test_correct_tokens += test_pred_result.test_num_correct_tokens
+        total_eval_test_tokens += test_pred_result.test_num_total_tokens
+        total_eval_test_perfect += test_pred_result.test_num_perfect_tasks
         
         # Track data loading time (time not spent in other operations)
         batch_time = time.time() - batch_start_time
@@ -1503,21 +1519,21 @@ def train_and_test_epoch(
         
         num_batches += 1
 
-    train_accuracy = total_train_correct_tokens / total_train_tokens if total_train_tokens > 0 else 0.0
-    train_perfect_rate = total_train_perfect / total_train_examples if total_train_examples > 0 else 0.0
-    test_accuracy = total_test_correct_tokens / total_test_tokens if total_test_tokens > 0 else 0.0
-    test_perfect_rate = total_test_perfect / total_test_tasks if total_test_tasks > 0 else 0.0
+    eval_train_accuracy = total_eval_train_correct_tokens / total_eval_train_tokens if total_eval_train_tokens > 0 else 0.0
+    eval_train_perfect_rate = total_eval_train_perfect / (total_eval_train_tokens // 25) if total_eval_train_tokens > 0 else 0.0
+    eval_test_accuracy = total_eval_test_correct_tokens / total_eval_test_tokens if total_eval_test_tokens > 0 else 0.0
+    eval_test_perfect_rate = total_eval_test_perfect / (total_eval_test_tokens // 25) if total_eval_test_tokens > 0 else 0.0
 
     return EpochMetrics(
         train_jepa_loss=total_jepa_loss / num_batches,
         train_jepa_sim=total_jepa_sim / num_batches,
         train_jepa_sig_reg=total_jepa_sig_reg / num_batches,
         train_pred_loss=total_train_pred_loss / num_batches,
-        train_accuracy=train_accuracy,
-        train_perfect_rate=train_perfect_rate,
-        test_pred_loss=total_test_pred_loss / num_batches,
-        test_accuracy=test_accuracy,
-        test_perfect_rate=test_perfect_rate,
+        eval_pred_loss=total_test_pred_loss / num_batches,
+        eval_train_accuracy=eval_train_accuracy,
+        eval_train_perfect_rate=eval_train_perfect_rate,
+        eval_test_accuracy=eval_test_accuracy,
+        eval_test_perfect_rate=eval_test_perfect_rate,
         timing=TimingMetrics(
             data_load_time=total_data_load_time,
             jepa_compute_time=total_jepa_compute_time,
@@ -1618,9 +1634,8 @@ def pred_learning_rate_test(
         pred_result.loss.backward()
         pred_opt.step()
 
-        # Print learning rate and losses
-        print(f"Batch {batch_count + 1}: LR = {lr:.2e}, Pred Loss = {pred_result.loss.item():.6f}, "
-              f"Accuracy: {pred_result.num_correct_tokens}/{pred_result.num_total_tokens} ({pred_result.num_correct_tokens/pred_result.num_total_tokens*100:.2f}%)")
+        # Print learning rate and losses (no accuracy in training mode)
+        print(f"Batch {batch_count + 1}: LR = {lr:.2e}, Pred Loss = {pred_result.loss.item():.6f}")
 
         # Double learning rate for next batch
         lr *= 2
@@ -1742,7 +1757,7 @@ def train(config: Config):
             start_epoch = max(start_epoch, pred_epoch)
             print(f"Loaded prediction model from epoch {pred_epoch}")
             print(f"Previous train pred loss: {pred_checkpoint.get('train_pred_loss', 'N/A')}")
-            print(f"Previous test pred loss: {pred_checkpoint.get('test_pred_loss', 'N/A')}")
+            print(f"Previous eval pred loss: {pred_checkpoint.get('eval_pred_loss', 'N/A')}")
         else:
             raise FileNotFoundError(
                 f"Prediction model path {config.pred_load_model_path} does not exist."
@@ -1827,7 +1842,7 @@ def train(config: Config):
         print(
             f"Epoch {epoch + 1}/{start_epoch + config.num_epochs} - "
             f"Train JEPA Loss: {metrics.train_jepa_loss:.6f}, Train Pred Loss: {metrics.train_pred_loss:.6f}, "
-            f"Test Pred Loss: {metrics.test_pred_loss:.6f}, "
+            f"Eval Pred Loss: {metrics.eval_pred_loss:.6f}, "
             f"Time: {epoch_time:.2f}s"
         )
         print(
@@ -1835,9 +1850,12 @@ def train(config: Config):
             f"Train Sim: {metrics.train_jepa_sim:.6f}, Train SigReg: {metrics.train_jepa_sig_reg:.6f}"
         )
         print(
-            f"  Accuracy - "
-            f"Train: {metrics.train_accuracy*100:.2f}%, Train Perfect: {metrics.train_perfect_rate*100:.2f}%, "
-            f"Test: {metrics.test_accuracy*100:.2f}%, Test Perfect: {metrics.test_perfect_rate*100:.2f}%"
+            f"  Eval Accuracy (Train Examples) - "
+            f"Accuracy: {metrics.eval_train_accuracy*100:.2f}%, Perfect: {metrics.eval_train_perfect_rate*100:.2f}%"
+        )
+        print(
+            f"  Eval Accuracy (Test Examples) - "
+            f"Accuracy: {metrics.eval_test_accuracy*100:.2f}%, Perfect: {metrics.eval_test_perfect_rate*100:.2f}%"
         )
         print(
             f"  Timing Breakdown - "
@@ -1856,13 +1874,13 @@ def train(config: Config):
         # Log to tensorboard
         writer.add_scalar("Loss/train_jepa", metrics.train_jepa_loss, epoch)
         writer.add_scalar("Loss/train_pred", metrics.train_pred_loss, epoch)
-        writer.add_scalar("Loss/test_pred", metrics.test_pred_loss, epoch)
+        writer.add_scalar("Loss/eval_pred", metrics.eval_pred_loss, epoch)
         writer.add_scalar("Loss/train_jepa_sim", metrics.train_jepa_sim, epoch)
         writer.add_scalar("Loss/train_jepa_sig_reg", metrics.train_jepa_sig_reg, epoch)
-        writer.add_scalar("Accuracy/train_accuracy", metrics.train_accuracy, epoch)
-        writer.add_scalar("Accuracy/train_perfect_rate", metrics.train_perfect_rate, epoch)
-        writer.add_scalar("Accuracy/test_accuracy", metrics.test_accuracy, epoch)
-        writer.add_scalar("Accuracy/test_perfect_rate", metrics.test_perfect_rate, epoch)
+        writer.add_scalar("Accuracy/eval_train_accuracy", metrics.eval_train_accuracy, epoch)
+        writer.add_scalar("Accuracy/eval_train_perfect_rate", metrics.eval_train_perfect_rate, epoch)
+        writer.add_scalar("Accuracy/eval_test_accuracy", metrics.eval_test_accuracy, epoch)
+        writer.add_scalar("Accuracy/eval_test_perfect_rate", metrics.eval_test_perfect_rate, epoch)
         writer.add_scalar("Time/epoch", epoch_time, epoch)
         writer.add_scalar("Time/data_load", metrics.timing.data_load_time, epoch)
         writer.add_scalar("Time/jepa_compute", metrics.timing.jepa_compute_time, epoch)
@@ -1918,7 +1936,7 @@ def train(config: Config):
                     "model_state_dict": pred_model.state_dict(),
                     "optimizer_state_dict": pred_optimizer.state_dict(),
                     "train_pred_loss": metrics.train_pred_loss,
-                    "test_pred_loss": metrics.test_pred_loss,
+                    "eval_pred_loss": metrics.eval_pred_loss,
                     "config": {
                         "jepa_embedding_dim": config.embedding_dim,
                         "d_model": config.d_model,
