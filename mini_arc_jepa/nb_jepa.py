@@ -20,6 +20,9 @@ from torch.utils.data import ConcatDataset, DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 
 
+START_TOKEN = 10
+
+
 @dataclass
 class Config:
     # Dataset creation parameters
@@ -599,7 +602,7 @@ class ARCTaskDataset(Dataset):
 
         Args:
             folder_path: Path to folder containing task JSON files
-            vocab_size: Size of vocabulary (default 10: 0-9 for colors)
+            vocab_size: Size of vocabulary (11: 0-9 colors + start token)
             task_type: Whether this dataset is for train or test tasks
         """
         self.folder_path = Path(folder_path)
@@ -852,7 +855,7 @@ class JepaModel(nn.Module):
             nhead: Number of attention heads
             num_layers: Number of transformer layers
             dim_feedforward: Dimension of feedforward network
-            vocab_size: Number of possible cell values (10 for ARC: 0-9 colors)
+            vocab_size: Number of possible cell values (11: 0-9 colors + start token)
             dropout: Dropout rate
             embedding_dim: Output embedding dimension (e.g., 512)
         """
@@ -966,7 +969,7 @@ class PredictionModel(nn.Module):
             nhead: Number of attention heads
             num_layers: Number of transformer layers
             dim_feedforward: Dimension of feedforward network
-            vocab_size: Number of possible cell values (10 for ARC: 0-9 colors)
+            vocab_size: Number of possible cell values (11: 0-9 colors + start token)
             dropout: Dropout rate
         """
         super().__init__()
@@ -1037,8 +1040,17 @@ class PredictionModel(nn.Module):
         # Concatenate JEPA tokens and input tokens as memory
         memory = torch.cat([jepa_tokens, input_emb], dim=1)  # (batch_size, num_jepa_tokens + 25, d_model)
         
-        # Embed output grid tokens
-        output_emb = self.token_embedding(output_grid)  # (batch_size, 25, d_model)
+        # Shift output tokens right and prepend START_TOKEN
+        start_tokens = torch.full(
+            (batch_size, 1),
+            START_TOKEN,
+            dtype=output_grid.dtype,
+            device=output_grid.device,
+        )
+        decoder_input_tokens = torch.cat([start_tokens, output_grid[:, :-1]], dim=1)
+
+        # Embed decoder input tokens
+        output_emb = self.token_embedding(decoder_input_tokens)  # (batch_size, 25, d_model)
         
         # Add position embeddings to output grid
         output_emb = output_emb + self.output_grid_position_embeddings
@@ -1083,19 +1095,19 @@ class PredictionModel(nn.Module):
         # Concatenate JEPA tokens and input tokens as memory
         memory = torch.cat([jepa_tokens, input_emb], dim=1)
         
-        # Start with empty output sequence
-        output_tokens = torch.zeros((batch_size, 0), dtype=torch.long, device=device)
+        # Start with START_TOKEN
+        output_tokens = torch.full(
+            (batch_size, 1),
+            START_TOKEN,
+            dtype=torch.long,
+            device=device,
+        )
         
         # Generate tokens one at a time
         for pos in range(25):
             # Embed current output sequence
-            if output_tokens.shape[1] > 0:
-                output_emb = self.token_embedding(output_tokens)
-                output_emb = output_emb + self.output_grid_position_embeddings[:output_tokens.shape[1]]
-            else:
-                # Start with a dummy embedding for the first token
-                output_emb = torch.zeros((batch_size, 1, self.d_model), device=device)
-                output_emb = output_emb + self.output_grid_position_embeddings[0:1]
+            output_emb = self.token_embedding(output_tokens)
+            output_emb = output_emb + self.output_grid_position_embeddings[:output_tokens.shape[1]]
             
             # Create causal mask
             seq_len = output_emb.shape[1]
@@ -1111,12 +1123,9 @@ class PredictionModel(nn.Module):
             next_token = logits.argmax(dim=-1, keepdim=True)  # (batch_size, 1)
             
             # Append to output sequence
-            if output_tokens.shape[1] == 0:
-                output_tokens = next_token
-            else:
-                output_tokens = torch.cat([output_tokens, next_token], dim=1)
+            output_tokens = torch.cat([output_tokens, next_token], dim=1)
         
-        return output_tokens
+        return output_tokens[:, 1:]
 
 
 def sig_reg(x: torch.Tensor, num_slices: int) -> torch.Tensor:
@@ -1981,7 +1990,7 @@ def main():
         dropout=0.1,
         embedding_dim=512,
         # Data parameters
-        vocab_size=10,
+        vocab_size=11,
         # Training parameters
         num_epochs=100,
         batch_size=128,
