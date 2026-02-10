@@ -24,13 +24,13 @@ def parse_epoch_line(line: str):
     """Parse an epoch summary line for JEPA model.
     
     Example format:
-    "Epoch 1/150 - Train JEPA Loss: 0.515991, Train Pred Loss: 1.175712, Test Pred Loss: 1.174907, Time: 306.76s"
-    "Epoch 1/100 - Train JEPA Loss: 0.552229, Train Pred Loss: 0.106552, Eval Pred Loss: 0.095103, Time: 458.53s"
+    "Epoch 1/100 - Train JEPA Loss: 0.502885, Train Pred Loss: 1.110385, Time: 292.98s"
+    "Epoch 10/100 - Train JEPA Loss: 0.260319, Train Pred Loss: 0.406913, Eval Pred Loss: 0.440668, Time: 473.36s"
     
     Returns:
-        dict with keys: epoch, train_jepa_loss, train_pred_loss, test_pred_loss, time
+        dict with keys: epoch, train_jepa_loss, train_pred_loss, time, and optionally test_pred_loss
     """
-    # Try the new format with "Eval Pred Loss"
+    # Try the format with "Eval Pred Loss"
     pattern = r"Epoch (\d+)/\d+ - Train JEPA Loss: ([\d.]+), Train Pred Loss: ([\d.]+), Eval Pred Loss: ([\d.]+), Time: ([\d.]+)s"
     match = re.match(pattern, line)
     if match:
@@ -42,17 +42,17 @@ def parse_epoch_line(line: str):
             'time': float(match.group(5))
         }
     
-    # Try the old format with "Test Pred Loss"
-    pattern = r"Epoch (\d+)/\d+ - Train JEPA Loss: ([\d.]+), Train Pred Loss: ([\d.]+), Test Pred Loss: ([\d.]+), Time: ([\d.]+)s"
+    # Try the format without "Eval Pred Loss" (most common)
+    pattern = r"Epoch (\d+)/\d+ - Train JEPA Loss: ([\d.]+), Train Pred Loss: ([\d.]+), Time: ([\d.]+)s"
     match = re.match(pattern, line)
     if match:
         return {
             'epoch': int(match.group(1)),
             'train_jepa_loss': float(match.group(2)),
             'train_pred_loss': float(match.group(3)),
-            'test_pred_loss': float(match.group(4)),
-            'time': float(match.group(5))
+            'time': float(match.group(4))
         }
+    
     return None
 
 
@@ -225,8 +225,11 @@ def write_to_tensorboard(metrics, log_dir: Path, model_name: str):
         # Write loss metrics (always present)
         writer.add_scalar("Loss/train_jepa", epoch_data['train_jepa_loss'], epoch)
         writer.add_scalar("Loss/train_pred", epoch_data['train_pred_loss'], epoch)
-        writer.add_scalar("Loss/test_pred", epoch_data['test_pred_loss'], epoch)
         writer.add_scalar("Time/epoch", epoch_data['time'], epoch)
+        
+        # Write test pred loss if available
+        if 'test_pred_loss' in epoch_data:
+            writer.add_scalar("Loss/test_pred", epoch_data['test_pred_loss'], epoch)
         
         # Write JEPA loss components if available
         if 'train_sim' in epoch_data:
@@ -236,8 +239,10 @@ def write_to_tensorboard(metrics, log_dir: Path, model_name: str):
         # Write accuracy metrics if available (convert percentages to decimals)
         if 'train_acc' in epoch_data:
             writer.add_scalar("Accuracy/train", epoch_data['train_acc'] / 100.0, epoch)
-            writer.add_scalar("Accuracy/test", epoch_data['test_acc'] / 100.0, epoch)
             writer.add_scalar("Perfect/train", epoch_data['train_perfect'] / 100.0, epoch)
+        
+        if 'test_acc' in epoch_data:
+            writer.add_scalar("Accuracy/test", epoch_data['test_acc'] / 100.0, epoch)
             writer.add_scalar("Perfect/test", epoch_data['test_perfect'] / 100.0, epoch)
         
         # Write model norms if available
@@ -253,7 +258,7 @@ def write_to_tensorboard(metrics, log_dir: Path, model_name: str):
 
 def main():
     # ============ Configure these variables ============
-    md_file = "mini_arc_jepa/results/20260210_043657_epoch_40_checkpoint.md"
+    md_file = "mini_arc_jepa/results/result.md"
     log_dir = "output/mini_arc_jepa/runs"
     # ===================================================
     
