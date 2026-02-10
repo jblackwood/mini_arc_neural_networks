@@ -943,7 +943,7 @@ class JepaModel(nn.Module):
 
 
 class PredictionModel(nn.Module):
-    """Transformer model that takes JEPA embedding and input grid to predict output grid."""
+    """Auto-regressive GPT-style transformer that takes JEPA embedding and input grid to predict output grid."""
 
     def __init__(
         self,
@@ -982,18 +982,21 @@ class PredictionModel(nn.Module):
         # Learnable position embeddings for JEPA tokens
         self.jepa_position_embeddings = nn.Parameter(torch.randn(self.num_jepa_tokens, d_model))
 
-        # 2D Rotary Position Embeddings for grid positions
-        self.rope = RoPE2D(d_model=d_model, max_grid_size=5)
+        # Learnable position embeddings for input grid
+        self.input_grid_position_embeddings = nn.Parameter(torch.randn(25, d_model))
 
-        # Transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(
+        # Learnable position embeddings for output grid (autoregressive positions)
+        self.output_grid_position_embeddings = nn.Parameter(torch.randn(25, d_model))
+
+        # Transformer decoder layers
+        decoder_layer = nn.TransformerDecoderLayer(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
             batch_first=True,
         )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
+        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers)
 
         # Output projection to vocab_size
         self.output_proj = nn.Linear(d_model, vocab_size)
@@ -1002,12 +1005,14 @@ class PredictionModel(nn.Module):
         self,
         jepa_embedding: torch.Tensor,
         input_grid: torch.Tensor,
+        output_grid: torch.Tensor,
     ) -> torch.Tensor:
-        """Forward pass.
+        """Forward pass with teacher forcing.
 
         Args:
             jepa_embedding: Tensor of shape (batch_size, jepa_embedding_dim)
             input_grid: Tensor of shape (batch_size, 25) with token values
+            output_grid: Tensor of shape (batch_size, 25) with token values
 
         Returns:
             Tensor of shape (batch_size, 25, vocab_size) with output grid logits
@@ -1023,22 +1028,92 @@ class PredictionModel(nn.Module):
         # Embed input grid
         input_emb = self.token_embedding(input_grid)  # (batch_size, 25, d_model)
         
-        # Apply RoPE to input grid
-        input_emb = self.rope(input_emb)  # (batch_size, 25, d_model)
+        # Add position embeddings to input grid
+        input_emb = input_emb + self.input_grid_position_embeddings
         
-        # Concatenate JEPA tokens and input tokens
-        x = torch.cat([jepa_tokens, input_emb], dim=1)  # (batch_size, num_jepa_tokens + 25, d_model)
+        # Concatenate JEPA tokens and input tokens as memory
+        memory = torch.cat([jepa_tokens, input_emb], dim=1)  # (batch_size, num_jepa_tokens + 25, d_model)
         
-        # Apply transformer encoder
-        x = self.transformer_encoder(x)  # (batch_size, num_jepa_tokens + 25, d_model)
+        # Embed output grid tokens
+        output_emb = self.token_embedding(output_grid)  # (batch_size, 25, d_model)
         
-        # Extract output positions (last 25 tokens corresponding to the grid)
-        x = x[:, self.num_jepa_tokens:, :]  # (batch_size, 25, d_model)
+        # Add position embeddings to output grid
+        output_emb = output_emb + self.output_grid_position_embeddings
+        
+        # Create causal mask for autoregressive generation
+        tgt_mask = nn.Transformer.generate_square_subsequent_mask(25, device=output_grid.device)
+        
+        # Apply transformer decoder
+        x = self.transformer_decoder(output_emb, memory, tgt_mask=tgt_mask)  # (batch_size, 25, d_model)
         
         # Project to logits
         logits = self.output_proj(x)  # (batch_size, 25, vocab_size)
         
         return logits
+
+    @torch.no_grad()
+    def generate(
+        self,
+        jepa_embedding: torch.Tensor,
+        input_grid: torch.Tensor,
+    ) -> torch.Tensor:
+        """Generate output grid autoregressively.
+
+        Args:
+            jepa_embedding: Tensor of shape (batch_size, jepa_embedding_dim)
+            input_grid: Tensor of shape (batch_size, 25) with token values
+
+        Returns:
+            Tensor of shape (batch_size, 25) with predicted output tokens
+        """
+        batch_size = input_grid.shape[0]
+        device = input_grid.device
+        
+        # Reshape JEPA embedding to tokens
+        jepa_tokens = jepa_embedding.view(batch_size, self.num_jepa_tokens, self.d_model)
+        jepa_tokens = jepa_tokens + self.jepa_position_embeddings
+        
+        # Embed input grid
+        input_emb = self.token_embedding(input_grid)
+        input_emb = input_emb + self.input_grid_position_embeddings
+        
+        # Concatenate JEPA tokens and input tokens as memory
+        memory = torch.cat([jepa_tokens, input_emb], dim=1)
+        
+        # Start with empty output sequence
+        output_tokens = torch.zeros((batch_size, 0), dtype=torch.long, device=device)
+        
+        # Generate tokens one at a time
+        for pos in range(25):
+            # Embed current output sequence
+            if output_tokens.shape[1] > 0:
+                output_emb = self.token_embedding(output_tokens)
+                output_emb = output_emb + self.output_grid_position_embeddings[:output_tokens.shape[1]]
+            else:
+                # Start with a dummy embedding for the first token
+                output_emb = torch.zeros((batch_size, 1, self.d_model), device=device)
+                output_emb = output_emb + self.output_grid_position_embeddings[0:1]
+            
+            # Create causal mask
+            seq_len = output_emb.shape[1]
+            tgt_mask = nn.Transformer.generate_square_subsequent_mask(seq_len, device=device)
+            
+            # Apply transformer decoder
+            x = self.transformer_decoder(output_emb, memory, tgt_mask=tgt_mask)
+            
+            # Get logits for the last position
+            logits = self.output_proj(x[:, -1, :])  # (batch_size, vocab_size)
+            
+            # Sample next token (greedy decoding)
+            next_token = logits.argmax(dim=-1, keepdim=True)  # (batch_size, 1)
+            
+            # Append to output sequence
+            if output_tokens.shape[1] == 0:
+                output_tokens = next_token
+            else:
+                output_tokens = torch.cat([output_tokens, next_token], dim=1)
+        
+        return output_tokens
 
 
 def sig_reg(x: torch.Tensor, num_slices: int) -> torch.Tensor:
@@ -1204,7 +1279,8 @@ def compute_pred_loss_for_batch(
     """Compute prediction loss for a single batch.
 
     Uses precomputed task centers to predict outputs. When pred_model.training is True,
-    uses all train examples. When False, uses test examples.
+    uses all train examples with teacher forcing. When False, uses autoregressive generation
+    on one random train example and the test example per task.
 
     Args:
         centers: Precomputed task centers from JEPA model (batch_size, embedding_dim)
@@ -1216,7 +1292,7 @@ def compute_pred_loss_for_batch(
         PredLossResult containing loss, num_correct_tokens, num_total_tokens, and num_perfect_tasks
     """
     if pred_model.training:
-        # Training mode: use all train examples
+        # Training mode: use all train examples with teacher forcing
         pred_input_grids = []
         pred_output_grids = []
         for task_dict in batch:
@@ -1230,38 +1306,77 @@ def compute_pred_loss_for_batch(
         # Repeat centers for each train example
         num_examples_per_task = [len(task_dict["train_input_grids"]) for task_dict in batch]
         centers_repeated = torch.cat([centers[i:i+1].repeat(n, 1) for i, n in enumerate(num_examples_per_task)], dim=0)  # (total_examples, embedding_dim)
+        
+        # Forward pass through prediction model with teacher forcing
+        pred_logits = pred_model(centers_repeated, pred_input_batch, pred_output_batch)  # (total_examples, 25, vocab_size)
+        
+        # Compute cross entropy loss
+        pred_loss = F.cross_entropy(
+            pred_logits.view(-1, pred_model.vocab_size),  # (total_examples * 25, vocab_size)
+            pred_output_batch.view(-1),  # (total_examples * 25,)
+        )
+        
+        # Compute accuracy metrics
+        predicted_output_grids = pred_logits.argmax(dim=2)  # (total_examples, 25)
+        correct_per_example = (predicted_output_grids == pred_output_batch).sum(dim=1)  # (total_examples,)
+        num_correct_tokens = correct_per_example.sum().item()
+        num_total_tokens = predicted_output_grids.shape[0] * 25
+        num_perfect_tasks = (correct_per_example == 25).sum().item()
+        
+        return PredLossResult(
+            loss=pred_loss,
+            num_correct_tokens=num_correct_tokens,
+            num_total_tokens=num_total_tokens,
+            num_perfect_tasks=num_perfect_tasks,
+        )
     else:
-        # Evaluation mode: use test examples
-        pred_input_grids = [task_dict["test_input_grid"] for task_dict in batch]
-        pred_output_grids = [task_dict["test_output_grid"] for task_dict in batch]
+        # Evaluation mode: use autoregressive generation
+        # For each task: pick one random train example + test example
+        eval_input_grids = []
+        eval_output_grids = []
+        eval_centers = []
+        
+        for i, task_dict in enumerate(batch):
+            # Pick one random train example
+            num_train_examples = len(task_dict["train_input_grids"])
+            random_idx = int(torch.randint(0, num_train_examples, (1,)).item())
+            eval_input_grids.append(task_dict["train_input_grids"][random_idx])
+            eval_output_grids.append(task_dict["train_output_grids"][random_idx])
+            eval_centers.append(centers[i])
+            
+            # Add test example
+            eval_input_grids.append(task_dict["test_input_grid"])
+            eval_output_grids.append(task_dict["test_output_grid"])
+            eval_centers.append(centers[i])
         
         # Stack into batches
-        pred_input_batch = torch.stack(pred_input_grids, dim=0).to(device)  # (bs, 25)
-        pred_output_batch = torch.stack(pred_output_grids, dim=0).to(device)  # (bs, 25)
-        centers_repeated = centers
-    
-    # Forward pass through prediction model
-    pred_logits = pred_model(centers_repeated, pred_input_batch)  # (num_examples, 25, vocab_size)
-    
-    # Compute cross entropy loss
-    pred_loss = F.cross_entropy(
-        pred_logits.view(-1, pred_model.vocab_size),  # (num_examples * 25, vocab_size)
-        pred_output_batch.view(-1),  # (num_examples * 25,)
-    )
-    
-    # Compute accuracy metrics
-    predicted_output_grids = pred_logits.argmax(dim=2)  # (num_examples, 25)
-    correct_per_example = (predicted_output_grids == pred_output_batch).sum(dim=1)  # (num_examples,)
-    num_correct_tokens = correct_per_example.sum().item()
-    num_total_tokens = predicted_output_grids.shape[0] * 25
-    num_perfect_tasks = (correct_per_example == 25).sum().item()
-    
-    return PredLossResult(
-        loss=pred_loss,
-        num_correct_tokens=num_correct_tokens,
-        num_total_tokens=num_total_tokens,
-        num_perfect_tasks=num_perfect_tasks,
-    )
+        eval_input_batch = torch.stack(eval_input_grids, dim=0).to(device)  # (2 * bs, 25)
+        eval_output_batch = torch.stack(eval_output_grids, dim=0).to(device)  # (2 * bs, 25)
+        eval_centers_batch = torch.stack(eval_centers, dim=0).to(device)  # (2 * bs, embedding_dim)
+        
+        # Generate outputs autoregressively
+        predicted_output_grids = pred_model.generate(eval_centers_batch, eval_input_batch)  # (2 * bs, 25)
+        
+        # Compute accuracy metrics (no loss in eval mode)
+        correct_per_example = (predicted_output_grids == eval_output_batch).sum(dim=1)  # (2 * bs,)
+        num_correct_tokens = int(correct_per_example.sum().item())
+        num_total_tokens = predicted_output_grids.shape[0] * 25
+        num_perfect_tasks = int((correct_per_example == 25).sum().item())
+        
+        # For loss, we'll compute it using teacher forcing for logging purposes
+        with torch.no_grad():
+            pred_logits = pred_model(eval_centers_batch, eval_input_batch, eval_output_batch)
+            pred_loss = F.cross_entropy(
+                pred_logits.view(-1, pred_model.vocab_size),
+                eval_output_batch.view(-1),
+            )
+        
+        return PredLossResult(
+            loss=pred_loss,
+            num_correct_tokens=num_correct_tokens,
+            num_total_tokens=num_total_tokens,
+            num_perfect_tasks=num_perfect_tasks,
+        )
 
 
 def train_and_test_epoch(
@@ -1375,7 +1490,8 @@ def train_and_test_epoch(
         total_test_correct_tokens += test_pred_result.num_correct_tokens
         total_test_tokens += test_pred_result.num_total_tokens
         total_test_perfect += test_pred_result.num_perfect_tasks
-        total_test_tasks += len(examples)
+        # In eval mode, we generate 2 examples per task (1 train + 1 test)
+        total_test_tasks += test_pred_result.num_total_tokens // 25
         
         # Track data loading time (time not spent in other operations)
         batch_time = time.time() - batch_start_time
@@ -1693,15 +1809,18 @@ def train(config: Config):
         pred_token_emb_mean_sq = pred_model.token_embedding.weight.pow(2).mean().item()
         pred_output_proj_mean_sq = pred_model.output_proj.weight.pow(2).mean().item()
         
-        # Transformer layers for prediction model
+        # Transformer layers for prediction model (decoder layers)
         pred_transformer_weights: List[torch.Tensor] = []
-        for layer_module in pred_model.transformer_encoder.layers:
-            encoder_layer = cast(nn.TransformerEncoderLayer, layer_module)
-            if encoder_layer.self_attn.in_proj_weight is not None:
-                pred_transformer_weights.append(encoder_layer.self_attn.in_proj_weight.flatten())
-            pred_transformer_weights.append(encoder_layer.self_attn.out_proj.weight.flatten())
-            pred_transformer_weights.append(encoder_layer.linear1.weight.flatten())
-            pred_transformer_weights.append(encoder_layer.linear2.weight.flatten())
+        for layer_module in pred_model.transformer_decoder.layers:
+            decoder_layer = cast(nn.TransformerDecoderLayer, layer_module)
+            if decoder_layer.self_attn.in_proj_weight is not None:
+                pred_transformer_weights.append(decoder_layer.self_attn.in_proj_weight.flatten())
+            pred_transformer_weights.append(decoder_layer.self_attn.out_proj.weight.flatten())
+            if decoder_layer.multihead_attn.in_proj_weight is not None:
+                pred_transformer_weights.append(decoder_layer.multihead_attn.in_proj_weight.flatten())
+            pred_transformer_weights.append(decoder_layer.multihead_attn.out_proj.weight.flatten())
+            pred_transformer_weights.append(decoder_layer.linear1.weight.flatten())
+            pred_transformer_weights.append(decoder_layer.linear2.weight.flatten())
         pred_transformer_mean_sq = torch.cat(pred_transformer_weights).pow(2).mean().item()
 
         # Log to console
