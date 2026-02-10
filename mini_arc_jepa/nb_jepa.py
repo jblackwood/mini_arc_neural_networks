@@ -1325,6 +1325,7 @@ def train_and_test_epoch(
         jepa_result = compute_jepa_loss_for_batch(
             jepa_model, examples, device, lambd, num_slices
         )
+        torch.cuda.synchronize()  # Wait for GPU to finish JEPA forward pass
         total_jepa_compute_time += time.time() - jepa_compute_start
 
         # Optimize JEPA model
@@ -1332,6 +1333,7 @@ def train_and_test_epoch(
         jepa_optimizer.zero_grad()
         jepa_result.total_loss.backward()
         jepa_optimizer.step()
+        torch.cuda.synchronize()  # Wait for GPU to finish JEPA backward pass and optimizer step
         total_jepa_backward_time += time.time() - jepa_backward_start
 
         # Train prediction model with train examples
@@ -1344,6 +1346,7 @@ def train_and_test_epoch(
         pred_optimizer.zero_grad()
         train_pred_result.loss.backward()
         pred_optimizer.step()
+        torch.cuda.synchronize()  # Wait for GPU to finish predictor training
         total_pred_train_time += time.time() - pred_train_start
         
         # Evaluate prediction model with test examples
@@ -1354,6 +1357,7 @@ def train_and_test_epoch(
             test_pred_result = compute_pred_loss_for_batch(
                 jepa_result.centers, pred_model, examples, device
             )
+        torch.cuda.synchronize()  # Wait for GPU to finish predictor evaluation
         total_pred_eval_time += time.time() - pred_eval_start
         
         # Accumulate metrics
