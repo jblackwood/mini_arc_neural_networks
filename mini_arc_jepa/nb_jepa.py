@@ -48,6 +48,7 @@ class Config:
     num_slices: int
     mode: Literal["train", "learning_rate_test"]
     checkpoint_save_interval: int
+    eval_epoch_interval: int
     # Google Drive location for Colab
     google_drive_dir: str
     # Optional: Load existing models to continue training
@@ -136,12 +137,12 @@ class EpochMetrics:
     train_jepa_sim: float
     train_jepa_sig_reg: float
     train_pred_loss: float
-    eval_pred_loss: float
-    eval_train_accuracy: float
-    eval_train_perfect_rate: float
-    eval_test_accuracy: float
-    eval_test_perfect_rate: float
     timing: TimingMetrics
+    eval_pred_loss: Optional[float] = None
+    eval_train_accuracy: Optional[float] = None
+    eval_train_perfect_rate: Optional[float] = None
+    eval_test_accuracy: Optional[float] = None
+    eval_test_perfect_rate: Optional[float] = None
 
 
 class ARCTaskData(TypedDict):
@@ -1418,6 +1419,7 @@ def train_and_test_epoch(
     device: torch.device,
     lambd: float,
     num_slices: int,
+    run_eval: bool,
 ) -> EpochMetrics:
     """Train both JEPA and prediction models for one epoch, and evaluate prediction model.
 
@@ -1430,6 +1432,7 @@ def train_and_test_epoch(
         device: Device to train on
         lambd: Weight for sig_reg loss in JEPA loss
         num_slices: Number of random projections for sig_reg
+        run_eval: Whether to run evaluation (test prediction) or skip it
 
     Returns:
         EpochMetrics containing losses, accuracies, and timing information
@@ -1493,15 +1496,27 @@ def train_and_test_epoch(
         total_pred_train_time += time.time() - pred_train_start
         
         # Evaluate prediction model with test examples
-        pred_eval_start = time.time()
-        pred_model.eval()
-        with torch.no_grad():
-            # No need to detach centers here - torch.no_grad() already prevents gradient computation
-            test_pred_result = compute_pred_loss_for_batch(
-                jepa_result.centers, pred_model, examples, device
+        if run_eval:
+            pred_eval_start = time.time()
+            pred_model.eval()
+            with torch.no_grad():
+                # No need to detach centers here - torch.no_grad() already prevents gradient computation
+                test_pred_result = compute_pred_loss_for_batch(
+                    jepa_result.centers, pred_model, examples, device
+                )
+            torch.cuda.synchronize()  # Wait for GPU to finish predictor evaluation
+            total_pred_eval_time += time.time() - pred_eval_start
+        else:
+            # Create dummy result when skipping evaluation
+            test_pred_result = PredLossResult(
+                loss=torch.tensor(0.0),
+                train_num_correct_tokens=0,
+                train_num_total_tokens=0,
+                train_num_perfect_tasks=0,
+                test_num_correct_tokens=0,
+                test_num_total_tokens=0,
+                test_num_perfect_tasks=0,
             )
-        torch.cuda.synchronize()  # Wait for GPU to finish predictor evaluation
-        total_pred_eval_time += time.time() - pred_eval_start
         
         # Accumulate metrics
         total_jepa_loss += jepa_result.total_loss.item()
@@ -1528,29 +1543,44 @@ def train_and_test_epoch(
         
         num_batches += 1
 
-    eval_train_accuracy = total_eval_train_correct_tokens / total_eval_train_tokens if total_eval_train_tokens > 0 else 0.0
-    eval_train_perfect_rate = total_eval_train_perfect / (total_eval_train_tokens // 25) if total_eval_train_tokens > 0 else 0.0
-    eval_test_accuracy = total_eval_test_correct_tokens / total_eval_test_tokens if total_eval_test_tokens > 0 else 0.0
-    eval_test_perfect_rate = total_eval_test_perfect / (total_eval_test_tokens // 25) if total_eval_test_tokens > 0 else 0.0
+    if run_eval:
+        eval_train_accuracy = total_eval_train_correct_tokens / total_eval_train_tokens if total_eval_train_tokens > 0 else 0.0
+        eval_train_perfect_rate = total_eval_train_perfect / (total_eval_train_tokens // 25) if total_eval_train_tokens > 0 else 0.0
+        eval_test_accuracy = total_eval_test_correct_tokens / total_eval_test_tokens if total_eval_test_tokens > 0 else 0.0
+        eval_test_perfect_rate = total_eval_test_perfect / (total_eval_test_tokens // 25) if total_eval_test_tokens > 0 else 0.0
 
-    return EpochMetrics(
-        train_jepa_loss=total_jepa_loss / num_batches,
-        train_jepa_sim=total_jepa_sim / num_batches,
-        train_jepa_sig_reg=total_jepa_sig_reg / num_batches,
-        train_pred_loss=total_train_pred_loss / num_batches,
-        eval_pred_loss=total_test_pred_loss / num_batches,
-        eval_train_accuracy=eval_train_accuracy,
-        eval_train_perfect_rate=eval_train_perfect_rate,
-        eval_test_accuracy=eval_test_accuracy,
-        eval_test_perfect_rate=eval_test_perfect_rate,
-        timing=TimingMetrics(
-            data_load_time=total_data_load_time,
-            jepa_compute_time=total_jepa_compute_time,
-            jepa_backward_time=total_jepa_backward_time,
-            pred_train_time=total_pred_train_time,
-            pred_eval_time=total_pred_eval_time,
-        ),
-    )
+        return EpochMetrics(
+            train_jepa_loss=total_jepa_loss / num_batches,
+            train_jepa_sim=total_jepa_sim / num_batches,
+            train_jepa_sig_reg=total_jepa_sig_reg / num_batches,
+            train_pred_loss=total_train_pred_loss / num_batches,
+            timing=TimingMetrics(
+                data_load_time=total_data_load_time,
+                jepa_compute_time=total_jepa_compute_time,
+                jepa_backward_time=total_jepa_backward_time,
+                pred_train_time=total_pred_train_time,
+                pred_eval_time=total_pred_eval_time,
+            ),
+            eval_pred_loss=total_test_pred_loss / num_batches,
+            eval_train_accuracy=eval_train_accuracy,
+            eval_train_perfect_rate=eval_train_perfect_rate,
+            eval_test_accuracy=eval_test_accuracy,
+            eval_test_perfect_rate=eval_test_perfect_rate,
+        )
+    else:
+        return EpochMetrics(
+            train_jepa_loss=total_jepa_loss / num_batches,
+            train_jepa_sim=total_jepa_sim / num_batches,
+            train_jepa_sig_reg=total_jepa_sig_reg / num_batches,
+            train_pred_loss=total_train_pred_loss / num_batches,
+            timing=TimingMetrics(
+                data_load_time=total_data_load_time,
+                jepa_compute_time=total_jepa_compute_time,
+                jepa_backward_time=total_jepa_backward_time,
+                pred_train_time=total_pred_train_time,
+                pred_eval_time=total_pred_eval_time,
+            ),
+        )
 
 
 def jepa_learning_rate_test(
@@ -1784,6 +1814,9 @@ def train(config: Config):
     for epoch in range(start_epoch, start_epoch + config.num_epochs):
         epoch_start_time = time.time()
 
+        # Determine if we should run evaluation this epoch
+        run_eval = (epoch + 1) % config.eval_epoch_interval == 0
+
         # Train and test both models
         metrics = train_and_test_epoch(
             jepa_model,
@@ -1794,6 +1827,7 @@ def train(config: Config):
             device,
             config.lambd,
             config.num_slices,
+            run_eval,
         )
 
         # Calculate epoch time
@@ -1848,32 +1882,52 @@ def train(config: Config):
         pred_transformer_mean_sq = torch.cat(pred_transformer_weights).pow(2).mean().item()
 
         # Log to console
-        print(
-            f"Epoch {epoch + 1}/{start_epoch + config.num_epochs} - "
-            f"Train JEPA Loss: {metrics.train_jepa_loss:.6f}, Train Pred Loss: {metrics.train_pred_loss:.6f}, "
-            f"Eval Pred Loss: {metrics.eval_pred_loss:.6f}, "
-            f"Time: {epoch_time:.2f}s"
-        )
+        if metrics.eval_pred_loss is not None:
+            print(
+                f"Epoch {epoch + 1}/{start_epoch + config.num_epochs} - "
+                f"Train JEPA Loss: {metrics.train_jepa_loss:.6f}, Train Pred Loss: {metrics.train_pred_loss:.6f}, "
+                f"Eval Pred Loss: {metrics.eval_pred_loss:.6f}, "
+                f"Time: {epoch_time:.2f}s"
+            )
+        else:
+            print(
+                f"Epoch {epoch + 1}/{start_epoch + config.num_epochs} - "
+                f"Train JEPA Loss: {metrics.train_jepa_loss:.6f}, Train Pred Loss: {metrics.train_pred_loss:.6f}, "
+                f"Time: {epoch_time:.2f}s"
+            )
         print(
             f"  JEPA Loss Components - "
             f"Train Sim: {metrics.train_jepa_sim:.6f}, Train SigReg: {metrics.train_jepa_sig_reg:.6f}"
         )
-        print(
-            f"  Eval Accuracy (Train Examples) - "
-            f"Accuracy: {metrics.eval_train_accuracy*100:.2f}%, Perfect: {metrics.eval_train_perfect_rate*100:.2f}%"
-        )
-        print(
-            f"  Eval Accuracy (Test Examples) - "
-            f"Accuracy: {metrics.eval_test_accuracy*100:.2f}%, Perfect: {metrics.eval_test_perfect_rate*100:.2f}%"
-        )
-        print(
-            f"  Timing Breakdown - "
-            f"Data: {metrics.timing.data_load_time:.2f}s ({metrics.timing.data_load_time/epoch_time*100:.1f}%), "
-            f"JEPA Compute: {metrics.timing.jepa_compute_time:.2f}s ({metrics.timing.jepa_compute_time/epoch_time*100:.1f}%), "
-            f"JEPA Backward: {metrics.timing.jepa_backward_time:.2f}s ({metrics.timing.jepa_backward_time/epoch_time*100:.1f}%), "
-            f"Pred Train: {metrics.timing.pred_train_time:.2f}s ({metrics.timing.pred_train_time/epoch_time*100:.1f}%), "
-            f"Pred Eval: {metrics.timing.pred_eval_time:.2f}s ({metrics.timing.pred_eval_time/epoch_time*100:.1f}%)"
-        )
+        if metrics.eval_train_accuracy is not None:
+            assert metrics.eval_train_perfect_rate is not None
+            assert metrics.eval_test_accuracy is not None
+            assert metrics.eval_test_perfect_rate is not None
+            print(
+                f"  Eval Accuracy (Train Examples) - "
+                f"Accuracy: {metrics.eval_train_accuracy*100:.2f}%, Perfect: {metrics.eval_train_perfect_rate*100:.2f}%"
+            )
+            print(
+                f"  Eval Accuracy (Test Examples) - "
+                f"Accuracy: {metrics.eval_test_accuracy*100:.2f}%, Perfect: {metrics.eval_test_perfect_rate*100:.2f}%"
+            )
+        if metrics.eval_pred_loss is not None:
+            print(
+                f"  Timing Breakdown - "
+                f"Data: {metrics.timing.data_load_time:.2f}s ({metrics.timing.data_load_time/epoch_time*100:.1f}%), "
+                f"JEPA Compute: {metrics.timing.jepa_compute_time:.2f}s ({metrics.timing.jepa_compute_time/epoch_time*100:.1f}%), "
+                f"JEPA Backward: {metrics.timing.jepa_backward_time:.2f}s ({metrics.timing.jepa_backward_time/epoch_time*100:.1f}%), "
+                f"Pred Train: {metrics.timing.pred_train_time:.2f}s ({metrics.timing.pred_train_time/epoch_time*100:.1f}%), "
+                f"Pred Eval: {metrics.timing.pred_eval_time:.2f}s ({metrics.timing.pred_eval_time/epoch_time*100:.1f}%)"
+            )
+        else:
+            print(
+                f"  Timing Breakdown - "
+                f"Data: {metrics.timing.data_load_time:.2f}s ({metrics.timing.data_load_time/epoch_time*100:.1f}%), "
+                f"JEPA Compute: {metrics.timing.jepa_compute_time:.2f}s ({metrics.timing.jepa_compute_time/epoch_time*100:.1f}%), "
+                f"JEPA Backward: {metrics.timing.jepa_backward_time:.2f}s ({metrics.timing.jepa_backward_time/epoch_time*100:.1f}%), "
+                f"Pred Train: {metrics.timing.pred_train_time:.2f}s ({metrics.timing.pred_train_time/epoch_time*100:.1f}%)"
+            )
         print(
             f"  Model Norms - "
             f"JEPA: {jepa_weight_norm:.4f}, Pred: {pred_weight_norm:.4f}, "
@@ -1883,19 +1937,20 @@ def train(config: Config):
         # Log to tensorboard
         writer.add_scalar("Loss/train_jepa", metrics.train_jepa_loss, epoch)
         writer.add_scalar("Loss/train_pred", metrics.train_pred_loss, epoch)
-        writer.add_scalar("Loss/eval_pred", metrics.eval_pred_loss, epoch)
         writer.add_scalar("Loss/train_jepa_sim", metrics.train_jepa_sim, epoch)
         writer.add_scalar("Loss/train_jepa_sig_reg", metrics.train_jepa_sig_reg, epoch)
-        writer.add_scalar("Accuracy/eval_train_accuracy", metrics.eval_train_accuracy, epoch)
-        writer.add_scalar("Accuracy/eval_train_perfect_rate", metrics.eval_train_perfect_rate, epoch)
-        writer.add_scalar("Accuracy/eval_test_accuracy", metrics.eval_test_accuracy, epoch)
-        writer.add_scalar("Accuracy/eval_test_perfect_rate", metrics.eval_test_perfect_rate, epoch)
         writer.add_scalar("Time/epoch", epoch_time, epoch)
         writer.add_scalar("Time/data_load", metrics.timing.data_load_time, epoch)
         writer.add_scalar("Time/jepa_compute", metrics.timing.jepa_compute_time, epoch)
         writer.add_scalar("Time/jepa_backward", metrics.timing.jepa_backward_time, epoch)
         writer.add_scalar("Time/pred_train", metrics.timing.pred_train_time, epoch)
-        writer.add_scalar("Time/pred_eval", metrics.timing.pred_eval_time, epoch)
+        if metrics.eval_pred_loss is not None:
+            writer.add_scalar("Loss/eval_pred", metrics.eval_pred_loss, epoch)
+            writer.add_scalar("Accuracy/eval_train_accuracy", metrics.eval_train_accuracy, epoch)
+            writer.add_scalar("Accuracy/eval_train_perfect_rate", metrics.eval_train_perfect_rate, epoch)
+            writer.add_scalar("Accuracy/eval_test_accuracy", metrics.eval_test_accuracy, epoch)
+            writer.add_scalar("Accuracy/eval_test_perfect_rate", metrics.eval_test_perfect_rate, epoch)
+            writer.add_scalar("Time/pred_eval", metrics.timing.pred_eval_time, epoch)
         writer.add_scalar("Model/jepa_weight_norm", jepa_weight_norm, epoch)
         writer.add_scalar("Model/pred_weight_norm", pred_weight_norm, epoch)
         writer.add_scalar("Model/jepa_output_proj_scale", jepa_output_proj_scale, epoch)
@@ -1999,6 +2054,7 @@ def main():
         num_slices=32,
         mode="train",
         checkpoint_save_interval=10,
+        eval_epoch_interval=10,
         # Google Drive location for Colab
         google_drive_dir="/content/drive/MyDrive/sparse_arc",
         # Optional: Load existing models to continue training
