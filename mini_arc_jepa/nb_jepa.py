@@ -42,6 +42,7 @@ class Config:
     batch_size: int
     learning_rate: float
     lambd: float
+    num_slices: int
     mode: Literal["train", "learning_rate_test"]
     checkpoint_save_interval: int
     # Google Drive location for Colab
@@ -1040,14 +1041,14 @@ class PredictionModel(nn.Module):
         return logits
 
 
-def sig_reg(x: torch.Tensor, num_slices: int = 256) -> torch.Tensor:
+def sig_reg(x: torch.Tensor, num_slices: int) -> torch.Tensor:
     """Sketched Isotropic Gaussian Regularization (SIG-Reg).
     
     Computes the Epps-Pulley test statistic to measure deviation from standard normal.
     
     Args:
         x: Input tensor of shape (batch_size, embedding_dim)
-        num_slices: Number of random projections (default 256)
+        num_slices: Number of random projections
     
     Returns:
         Test statistic tensor of shape (num_slices,) representing deviation from normality
@@ -1149,6 +1150,7 @@ def compute_jepa_loss_for_batch(
     batch: List[ARCTaskData],
     device: torch.device,
     lambd: float,
+    num_slices: int,
 ) -> JepaLossResult:
     """Compute LeJEPA loss for a single batch.
 
@@ -1159,6 +1161,7 @@ def compute_jepa_loss_for_batch(
         batch: List of task dicts, each with train_input_grids, train_output_grids, etc.
         device: Device to compute on
         lambd: Weight for sig_reg loss in JEPA loss
+        num_slices: Number of random projections for sig_reg
 
     Returns:
         JepaLossResult containing total_loss, sim_loss, sig_reg_loss, and centers
@@ -1176,7 +1179,7 @@ def compute_jepa_loss_for_batch(
     sig_reg_vals = []
     for view_idx in range(num_views):
         view_emb = all_emb_reshaped[view_idx]  # (bs, K)
-        sig_reg_val = sig_reg(view_emb)  # (num_slices,)
+        sig_reg_val = sig_reg(view_emb, num_slices)  # (num_slices,)
         sig_reg_vals.append(sig_reg_val.mean())
     
     sig_reg_loss = torch.stack(sig_reg_vals).mean()
@@ -1269,6 +1272,7 @@ def train_and_test_epoch(
     pred_optimizer: torch.optim.Optimizer,
     device: torch.device,
     lambd: float,
+    num_slices: int,
 ) -> EpochMetrics:
     """Train both JEPA and prediction models for one epoch, and evaluate prediction model.
 
@@ -1280,6 +1284,7 @@ def train_and_test_epoch(
         pred_optimizer: Optimizer for prediction model
         device: Device to train on
         lambd: Weight for sig_reg loss in JEPA loss
+        num_slices: Number of random projections for sig_reg
 
     Returns:
         EpochMetrics containing losses, accuracies, and timing information
@@ -1318,7 +1323,7 @@ def train_and_test_epoch(
         # Compute JEPA loss and get centers
         jepa_compute_start = time.time()
         jepa_result = compute_jepa_loss_for_batch(
-            jepa_model, examples, device, lambd
+            jepa_model, examples, device, lambd, num_slices
         )
         total_jepa_compute_time += time.time() - jepa_compute_start
 
@@ -1408,6 +1413,7 @@ def jepa_learning_rate_test(
     jepa_train_loader: DataLoader,
     device: torch.device,
     lambd: float,
+    num_slices: int,
 ):
     """Test JEPA model learning rate by starting at 1e-7 and doubling every batch.
 
@@ -1416,6 +1422,7 @@ def jepa_learning_rate_test(
         jepa_train_loader: JEPA training data loader
         device: Device to train on
         lambd: Weight for sig_reg loss in JEPA loss
+        num_slices: Number of random projections for sig_reg
     """
     print("\nStarting JEPA learning rate test...")
     lr = 1e-7
@@ -1431,7 +1438,7 @@ def jepa_learning_rate_test(
 
         # Compute JEPA loss
         jepa_result = compute_jepa_loss_for_batch(
-            jepa_model, examples, device, lambd
+            jepa_model, examples, device, lambd, num_slices
         )
 
         # Backward pass for JEPA model
@@ -1577,7 +1584,7 @@ def train(config: Config):
 
     # Check if running learning rate test
     if config.mode == "learning_rate_test":
-        jepa_learning_rate_test(jepa_model, data_loader, device, config.lambd)
+        jepa_learning_rate_test(jepa_model, data_loader, device, config.lambd, config.num_slices)
         pred_learning_rate_test(jepa_model, pred_model, data_loader, device)
         return
 
@@ -1642,6 +1649,7 @@ def train(config: Config):
             pred_optimizer,
             device,
             config.lambd,
+            config.num_slices,
         )
 
         # Calculate epoch time
@@ -1838,6 +1846,7 @@ def main():
         batch_size=128,
         learning_rate=2e-4,
         lambd=0.05,
+        num_slices=32,
         mode="train",
         checkpoint_save_interval=10,
         # Google Drive location for Colab
