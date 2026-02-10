@@ -2051,7 +2051,7 @@ def main():
         batch_size=128,
         learning_rate=2e-4,
         lambd=0.05,
-        num_slices=32,
+        num_slices=256,
         mode="train",
         checkpoint_save_interval=10,
         eval_epoch_interval=10,
