@@ -1,4 +1,4 @@
-# sparse_arc: Exploring Neural Network Approaches to ARC with Regularized Task Embeddings
+# Exploring Neural Network Approaches to ARC with Regularized Task Embeddings
 
 This repository is an exploration of different deep learning techniques applied to the [**ARC-AGI tasks**](https://arcprize.org/arc), specifically the [**MINI-ARC**](https://github.com/KSB21ST/MINI-ARC) variant (5×5 grids, 149 tasks). The central question driving this work: can regularizing the task embedding space improve a neural network's ability to generalize across ARC tasks?
 
