@@ -34,7 +34,7 @@ Nearly all modules share the same core inference procedure, inspired by masked d
 
 | Module | Approach | Key idea |
 |---|---|---|
-| `mini_arc_eqm/` | Equilibrium Matching | Iteratively denoise task embedding and input/output grids similar to equilibrium matching and diffusion|
+| `mini_arc_eqm/` | Equilibrium Matching | Basic iterative denoise task embedding and input/output grids similar to equilibrium matching and diffusion|
 | `mini_arc_vae/` | VAE | Iteratively denoise but with a latent VAE bottleneck|
 | `mini_arc_jepa/` | JEPA | A LeJEPA-style encoder builds an isotropic gaussian embedding of each task and decoder takes the embedding and an input to produce an output grid  |
 | `mini_arc_rq/` | Random Projection Quantizer | Task token projected into a frozen random codebook |
