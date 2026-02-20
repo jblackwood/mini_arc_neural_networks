@@ -36,7 +36,7 @@ Nearly all modules share the same core inference procedure, inspired by masked d
 |---|---|---|
 | [`nb_eqm.py`](https://github.com/jblackwood/mini_arc_neural_networks/blob/main/mini_arc_eqm/nb_eqm.py) | Equilibrium Matching | Basic iterative denoise task embedding and input/output grids similar to equilibrium matching and diffusion|
 | [`nb_vae.py`](https://github.com/jblackwood/mini_arc_neural_networks/blob/main/mini_arc_vae/nb_vae.py) | VAE | Iteratively denoise but with a latent VAE bottleneck|
-| [`nb_jepa.py`](https://github.com/jblackwood/mini_arc_neural_networks/blob/main/mini_arc_jepa/nb_jepa.py) | JEPA | A LeJEPA-style encoder builds an isotropic gaussian embedding of each task and decoder takes the embedding and an input to produce an output grid  |
+| [`nb_jepa.py`](https://github.com/jblackwood/mini_arc_neural_networks/blob/main/mini_arc_jepa/nb_jepa.py) | JEPA | A LeJEPA-style encoder builds an isotropic gaussian embedding of each task and decoder takes the embedding and an input grid to produce an output grid  |
 | [`nb_rq.py`](https://github.com/jblackwood/mini_arc_neural_networks/blob/main/mini_arc_rq/nb_rq.py) | Random Projection Quantizer | Task token projected into a frozen random codebook |
 | [`nb_fsq.py`](https://github.com/jblackwood/mini_arc_neural_networks/blob/main/mini_arc_fsq/nb_fsq.py) | Finite Scalar Quantization | Task token quantized to a discrete bounded integer lattice |
 | [`nb_2vec.py`](https://github.com/jblackwood/mini_arc_neural_networks/blob/main/mini_arc_2vec/nb_2vec.py) | wave2vec 2.0 style | Gumbel softmax over quantized task token categories |
