@@ -13,7 +13,7 @@ My approach in this repository is motivated by the following thinking:
    My intuition was that regularizing the task embedding space — through noise injection (VAE-style), vector quantization, or LeJEPA-style compression to an isotropic gaussian — might help the model learn more structured, generalizable representations of ARC tasks. Techniques explored include:
    - **VAE**: Gaussian noise injection via the reparameterization trick
    - **JEPA (Joint Embedding Predictive Architecture)**: Latent space compression inspired by LeJEPA, which regularizes embeddings toward an isotropic Gaussian
-   - **wave2vec / Random Projection Quantizer (RQ)**: Random projection into a discrete codebook, inspired by wav2vec 2.0
+   - **wave2vec 2.0 / Random Projection Quantizer (RQ)**: Random projection into a discrete codebook with Gumbel softmax quantization, inspired by wav2vec 2.0
    - **Finite Scalar Quantization (FSQ)**: Deterministic quantization to a bounded integer lattice
    - **Equilibrium Matching (EQM)**: Iterative denoising / equilibrium-finding in the embedding space
 
@@ -26,16 +26,20 @@ My approach in this repository is motivated by the following thinking:
 
 Each of the 149 MINI-ARC tasks is augmented using all 8 symmetries of the square (rotations and reflections) combined with random color permutations, producing ~50,000 tasks in total. Tasks are split 80/20 into train (120 tasks) and test (29 tasks) sets at the task level before augmenting, so the test set contains entirely unseen task types.
 
+### Shared iterative denoising approach
+
+Nearly all modules share the same core inference procedure, inspired by masked diffusion. The output grid is initially fully masked (all 25 tokens set to a special mask value). At each of 25 iterations, the model takes the input grid, the current (partially unmasked) output grid, and the task embedding as inputs, then predicts a probability distribution over all output positions. The mask token at the most confident position is replaced with the predicted token, and the process repeats until the output is fully revealed. What differs between modules is how the **task embedding** is represented and regularized during training. In some approaches (e.g. JEPA) I also experimented with a GPT-style autoregressive decoder — predicting output tokens sequentially left-to-right rather than via iterative denoising — and observed similar accuracy plateaus, further suggesting the bottleneck is not the decoding strategy.
+
 ### Module overview
 
 | Module | Approach | Key idea |
 |---|---|---|
-| `mini_arc_eqm/` | Equilibrium Matching | Task token is iteratively refined at test time via gradient-based denoising |
-| `mini_arc_vae/` | VAE | Task token sampled from a learned Gaussian distribution (reparameterization trick) |
-| `mini_arc_jepa/` | JEPA | A context encoder and target encoder are trained with a predictor to compress task latents |
-| `mini_arc_rq/` | Random Projection Quantizer | Task token projected into a frozen random codebook, inspired by wav2vec 2.0 |
+| `mini_arc_eqm/` | Equilibrium Matching | Iteratively denoise task embedding and input/output grids similar to equilibrium matching and diffusion|
+| `mini_arc_vae/` | VAE | Iteratively denoise but with a latent VAE bottleneck|
+| `mini_arc_jepa/` | JEPA | A LeJEPA-style encoder builds an isotropic gaussian embedding of each task and decoder takes the embedding and an input to produce an output grid  |
+| `mini_arc_rq/` | Random Projection Quantizer | Task token projected into a frozen random codebook |
 | `mini_arc_fsq/` | Finite Scalar Quantization | Task token quantized to a discrete bounded integer lattice |
-| `mini_arc_2vec/` | wave2vec-style | Contrastive learning over quantized task token categories |
+| `mini_arc_2vec/` | wave2vec 2.0 style | Gumbel softmax over quantized task token categories |
 
 Each module contains:
 - `nb_*.py` — the main training script (designed to run locally or in a Colab notebook)
@@ -44,11 +48,11 @@ Each module contains:
 
 ### Evaluation
 
-The primary metric is **task accuracy**: the fraction of test tasks for which the model predicts the correct output grid for the held-out test example (exact match). At test time, the task token is optimized via gradient descent using the training examples of the task, then frozen to generate the test prediction.
+The primary metric is **task accuracy**: the fraction of test tasks for which the model predicts the correct output grid for the held-out test example (exact match).
 
 ## Learnings
 
-Despite the variety of regularization techniques, **all approaches plateau at approximately 25% task accuracy** on the MINI-ARC test set with ~5M parameter transformer encoder models. This plateau is remarkably consistent across VAE, quantization (FSQ, RQ), denoising (equilibrium matching) and JEPA, suggesting that the bottleneck is not the structure of the task embedding space but something more fundamental.
+Despite the variety of regularization techniques, **all approaches plateau at approximately 25% task accuracy** on the MINI-ARC test set with ~5M parameter transformer encoder models. This plateau is remarkably consistent across VAE, quantization (FSQ, RQ, wave2vec 2.0 style gumbel softmax), iterative denoising (equilibrium matching) and LeJEPA, suggesting that the bottleneck is not the structure of the task embedding space but something more fundamental.
 
 This convergence of results has convinced me that **pure neural network approaches are insufficient** for robust ARC generalization, and that further progress requires additional methods (e.g. neuro-symbolic).
 
