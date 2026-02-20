@@ -7,13 +7,13 @@ This repository is an exploration of different deep learning techniques applied 
 My approach in this repository is motivated by the following thinking:
 
 1. **Inspired by the Tiny Recursive Model (TRM)**
-   The recent success of the [Tiny Recursive Model](https://arcprize.org/) on ARC-AGI suggested that relatively small transformer-based models with learned per-task embeddings are a promising direction. The core idea is that a model can learn a shared input-output transformation function, conditioned on a compact task-specific latent vector that gets optimized at test time.
+   The recent success of the [Tiny Recursive Model](https://arxiv.org/abs/2510.04871) on ARC-AGI suggested that relatively small transformer-based models with learned per-task embeddings are a promising direction. The core idea is that a model can learn a shared input-output transformation function, conditioned on a compact task-specific latent vector that gets optimized at test time.
 
 2. **The Regularization Hypothesis**
-   My intuition was that regularizing the task embedding space — through noise injection (VAE-style), vector quantization, or LeJEPA-style compression to an isotropic gaussian — might help the model learn more structured, generalizable representations of ARC tasks. Techniques explored include:
+   My intuition was that regularizing the task embedding space — through noise injection (VAE-style), vector quantization, or LeJEPA-style compression to an isotropic Gaussian — might help the model learn more structured, generalizable representations of ARC tasks. Techniques explored include:
    - **VAE**: Gaussian noise injection via the reparameterization trick
    - **JEPA (Joint Embedding Predictive Architecture)**: Latent space compression inspired by LeJEPA, which regularizes embeddings toward an isotropic Gaussian
-   - **wave2vec 2.0 / Random Projection Quantizer (RQ)**: Random projection into a discrete codebook with Gumbel softmax quantization, inspired by wav2vec 2.0
+   - **wav2vec 2.0 / Random Projection Quantizer (RQ)**: Random projection into a discrete codebook with Gumbel softmax quantization, inspired by wav2vec 2.0
    - **Finite Scalar Quantization (FSQ)**: Deterministic quantization to a bounded integer lattice
    - **Equilibrium Matching (EQM)**: Iterative denoising / equilibrium-finding in the embedding space
 
@@ -36,10 +36,10 @@ Nearly all modules share the same core inference procedure, inspired by masked d
 |---|---|---|
 | [`nb_eqm.py`](https://github.com/jblackwood/mini_arc_neural_networks/blob/main/mini_arc_eqm/nb_eqm.py) | Equilibrium Matching | Basic iterative denoise task embedding and input/output grids similar to equilibrium matching and diffusion|
 | [`nb_vae.py`](https://github.com/jblackwood/mini_arc_neural_networks/blob/main/mini_arc_vae/nb_vae.py) | VAE | Iteratively denoise but with a latent VAE bottleneck|
-| [`nb_jepa.py`](https://github.com/jblackwood/mini_arc_neural_networks/blob/main/mini_arc_jepa/nb_jepa.py) | JEPA | A LeJEPA-style encoder builds an isotropic gaussian embedding of each task and decoder takes the embedding and an input grid to produce an output grid  |
+| [`nb_jepa.py`](https://github.com/jblackwood/mini_arc_neural_networks/blob/main/mini_arc_jepa/nb_jepa.py) | JEPA | A LeJEPA-style encoder builds an isotropic Gaussian embedding of each task and a decoder takes the embedding and an input grid to produce an output grid  |
 | [`nb_rq.py`](https://github.com/jblackwood/mini_arc_neural_networks/blob/main/mini_arc_rq/nb_rq.py) | Random Projection Quantizer | Task token projected into a frozen random codebook |
 | [`nb_fsq.py`](https://github.com/jblackwood/mini_arc_neural_networks/blob/main/mini_arc_fsq/nb_fsq.py) | Finite Scalar Quantization | Task token quantized to a discrete bounded integer lattice |
-| [`nb_2vec.py`](https://github.com/jblackwood/mini_arc_neural_networks/blob/main/mini_arc_2vec/nb_2vec.py) | wave2vec 2.0 style | Gumbel softmax over quantized task token categories |
+| [`nb_2vec.py`](https://github.com/jblackwood/mini_arc_neural_networks/blob/main/mini_arc_2vec/nb_2vec.py) | wav2vec 2.0 style | Gumbel softmax over quantized task token categories |
 
 ### Standalone scripts
 
@@ -55,7 +55,7 @@ The primary metric is **task accuracy**: the fraction of test tasks for which th
 
 ## Learnings
 
-Despite the variety of regularization techniques, **all approaches plateau at approximately 25% task accuracy** on the MINI-ARC test set with ~5M parameter transformer encoder models. This plateau is remarkably consistent across VAE, quantization (FSQ, RQ, wave2vec 2.0 style gumbel softmax), iterative denoising (equilibrium matching) and LeJEPA, suggesting that the bottleneck is not the structure of the task embedding space but something more fundamental.
+Despite the variety of regularization techniques, **all approaches plateau at approximately 25% task accuracy** on the MINI-ARC test set with ~5M parameter transformer encoder models. This plateau is remarkably consistent across VAE, quantization (FSQ, RQ, wav2vec 2.0 style Gumbel softmax), iterative denoising (equilibrium matching) and LeJEPA, suggesting that the bottleneck is not the structure of the task embedding space but something more fundamental.
 
 This convergence of results has convinced me that **pure neural network approaches are insufficient** for robust ARC generalization, and that further progress requires additional methods (e.g. neuro-symbolic).
 
