@@ -34,17 +34,20 @@ Nearly all modules share the same core inference procedure, inspired by masked d
 
 | Module | Approach | Key idea |
 |---|---|---|
-| `mini_arc_eqm/` | Equilibrium Matching | Basic iterative denoise task embedding and input/output grids similar to equilibrium matching and diffusion|
-| `mini_arc_vae/` | VAE | Iteratively denoise but with a latent VAE bottleneck|
-| `mini_arc_jepa/` | JEPA | A LeJEPA-style encoder builds an isotropic gaussian embedding of each task and decoder takes the embedding and an input to produce an output grid  |
-| `mini_arc_rq/` | Random Projection Quantizer | Task token projected into a frozen random codebook |
-| `mini_arc_fsq/` | Finite Scalar Quantization | Task token quantized to a discrete bounded integer lattice |
-| `mini_arc_2vec/` | wave2vec 2.0 style | Gumbel softmax over quantized task token categories |
+| [`nb.py`](https://github.com/jblackwood/mini_arc_neural_networks/blob/main/mini_arc_eqm/nb.py) | Equilibrium Matching | Basic iterative denoise task embedding and input/output grids similar to equilibrium matching and diffusion|
+| [`nb_vae.py`](https://github.com/jblackwood/mini_arc_neural_networks/blob/main/mini_arc_vae/nb_vae.py) | VAE | Iteratively denoise but with a latent VAE bottleneck|
+| [`nb_jepa.py`](https://github.com/jblackwood/mini_arc_neural_networks/blob/main/mini_arc_jepa/nb_jepa.py) | JEPA | A LeJEPA-style encoder builds an isotropic gaussian embedding of each task and decoder takes the embedding and an input to produce an output grid  |
+| [`nb_rq.py`](https://github.com/jblackwood/mini_arc_neural_networks/blob/main/mini_arc_rq/nb_rq.py) | Random Projection Quantizer | Task token projected into a frozen random codebook |
+| [`nb_fsq.py`](https://github.com/jblackwood/mini_arc_neural_networks/blob/main/mini_arc_fsq/nb_fsq.py) | Finite Scalar Quantization | Task token quantized to a discrete bounded integer lattice |
+| [`nb_2vec.py`](https://github.com/jblackwood/mini_arc_neural_networks/blob/main/mini_arc_2vec/nb_2vec.py) | wave2vec 2.0 style | Gumbel softmax over quantized task token categories |
 
-Each module contains:
-- `nb_*.py` — the main training script (designed to run locally or in a Colab notebook)
-- `create_tensor_board_events.py` — utilities for visualizing training runs in TensorBoard
-- `results/` — saved checkpoints and training logs
+### Standalone scripts
+
+Each `nb_*.py` script is intentionally self-contained — all model definitions, dataset creation, training loop, and evaluation code lives in a single file with no local package dependencies. This makes it easy to copy-paste the entire file into a [Google Colab](https://colab.research.google.com/) notebook cell and run it without any additional setup. Each script will automatically download the MINI-ARC dataset on first run and save checkpoints and TensorBoard logs to the configured output directory (or Google Drive when running in Colab).
+
+Each module also contains:
+- `create_tensor_board_events.py` — utilities for replaying training metrics into TensorBoard
+- `results/` — saved checkpoint metadata and training logs
 
 ### Evaluation
 
