@@ -24,7 +24,7 @@ My approach in this repository is motivated by the following thinking:
 
 ### Data augmentation
 
-Each of the 149 MINI-ARC tasks is augmented using all 8 symmetries of the square (rotations and reflections) combined with random color permutations, producing up to ~330 unique variants per task. Tasks are split 80/20 into train (120 tasks) and test (29 tasks) sets at the task level, so the test set contains entirely unseen task types.
+Each of the 149 MINI-ARC tasks is augmented using all 8 symmetries of the square (rotations and reflections) combined with random color permutations, producing ~50,000 tasks in total. Tasks are split 80/20 into train (120 tasks) and test (29 tasks) sets at the task level before augmenting, so the test set contains entirely unseen task types.
 
 ### Module overview
 
