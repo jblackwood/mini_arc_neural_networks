@@ -61,6 +61,6 @@ This convergence of results has convinced me that **pure neural network approach
 These findings motivate me to explore hybrid neuro-symbolic approaches. In particular, I am interested in combining learned neural representations (like the task embeddings here) with structured program search. Specifically, I am inspired by:
 
 - **Search-based RL** algorithms such as AlphaGo/AlphaZero and [EfficientZero](https://arxiv.org/abs/2111.00210) applied to program synthesis — using a world model to plan over a DSL action space.
-- **[clingoARC](https://github.com/jblackwood/clingoArc)** (my companion repository): encoding ARC program search as first-order logic metaprogramming and solving with Answer Set Programming. The grounding bottleneck encountered there motivates using neural heuristics to drastically prune the search space.
+- **[clingoARC](https://github.com/jblackwood/clingoArc)** (my repository from Answer Set Programming explorations): encoding ARC program search as first-order logic metaprogramming and solving with Answer Set Programming. The grounding bottleneck encountered there motivates using neural heuristics to drastically prune the search space.
 
 ```
