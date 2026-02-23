@@ -16,7 +16,7 @@ My approach in this repository is motivated by the following thinking:
    - **wav2vec 2.0 style quantization**: Use gumbel softmaxes to quantize, similar to wav2vec 2.0
    - **Random Projection Quantizer (RQ)**: Random projection into a discrete codebook with Gumbel softmax quantization, inspired by BEST-RQ
    - **Finite Scalar Quantization (FSQ)**: Deterministic quantization to a bounded integer lattice
-   - **Equilibrium Matching (EQM)**: Iterative denoising / equilibrium-finding in the embedding space
+   - **Equilibrium Matching (EQM)**: Iterative denoising / equilibrium-finding in the embedding space (similar to discrete diffusion or iteratively sampling from a BERT model)
 
 3. **MINI-ARC for Efficiency**
    Rather than training on full ARC grids (up to 30×30), all experiments use MINI-ARC (fixed 5×5 grids). Combined with aggressive data augmentation — random grid rotations, reflections, and color permutations — this yields ~50,000 training tasks from the original 120, making rapid iteration practical on a single GPU.
