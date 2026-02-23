@@ -13,7 +13,8 @@ My approach in this repository is motivated by the following thinking:
    My intuition was that regularizing the task embedding space — through noise injection (VAE-style), vector quantization, or LeJEPA-style compression to an isotropic Gaussian — might help the model learn more structured, generalizable representations of ARC tasks. Techniques explored include:
    - **VAE**: Gaussian noise injection via the reparameterization trick
    - **JEPA (Joint Embedding Predictive Architecture)**: Latent space compression inspired by LeJEPA, which regularizes embeddings toward an isotropic Gaussian
-   - **wav2vec 2.0 / Random Projection Quantizer (RQ)**: Random projection into a discrete codebook with Gumbel softmax quantization, inspired by wav2vec 2.0
+   - **wav2vec 2.0 style quantization**: Use gumbel softmaxes to quantize, similar to wav2vec 2.0
+   - **Random Projection Quantizer (RQ)**: Random projection into a discrete codebook with Gumbel softmax quantization, inspired by BEST-RQ
    - **Finite Scalar Quantization (FSQ)**: Deterministic quantization to a bounded integer lattice
    - **Equilibrium Matching (EQM)**: Iterative denoising / equilibrium-finding in the embedding space
 
