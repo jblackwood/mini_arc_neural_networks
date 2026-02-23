@@ -19,7 +19,7 @@ My approach in this repository is motivated by the following thinking:
    - **Equilibrium Matching (EQM)**: Iterative denoising / equilibrium-finding in the embedding space (similar to discrete diffusion or iteratively sampling from a BERT model)
 
 3. **MINI-ARC for Efficiency**
-   Rather than training on full ARC grids (up to 30×30), all experiments use MINI-ARC (fixed 5×5 grids). Combined with aggressive data augmentation — random grid rotations, reflections, and color permutations — this yields ~50,000 training tasks while still making rapid iteration practical on a single GPU.
+   Rather than training on full ARC grids (up to 30×30), all experiments use MINI-ARC (fixed 5×5 grids). Combined with aggressive data augmentation — random grid rotations, reflections, and color permutations — this yields ~50,000 tasks while still making rapid iteration practical on a single GPU.
 
 ## Details of the approach
 
