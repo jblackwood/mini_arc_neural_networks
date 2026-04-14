@@ -36,7 +36,6 @@ Nearly all modules share the same core inference procedure, inspired by masked d
 | [`nb_rq.py`](https://github.com/jblackwood/mini_arc_neural_networks/blob/main/mini_arc_rq/nb_rq.py) | Random Projection Quantizer | Task token projected into a frozen random codebook |
 | [`nb_fsq.py`](https://github.com/jblackwood/mini_arc_neural_networks/blob/main/mini_arc_fsq/nb_fsq.py) | Finite Scalar Quantization | Task token quantized to a discrete bounded integer lattice |
 | [`nb_2vec.py`](https://github.com/jblackwood/mini_arc_neural_networks/blob/main/mini_arc_2vec/nb_2vec.py) | wav2vec 2.0 style | Gumbel softmax over quantized task token categories |
-| [`nb_vae.py`](https://github.com/jblackwood/mini_arc_neural_networks/blob/main/mini_arc_vae/nb_vae.py) | VAE | Iteratively denoise but with a latent VAE bottleneck|
 | [`nb_jepa.py`](https://github.com/jblackwood/mini_arc_neural_networks/blob/main/mini_arc_jepa/nb_jepa.py) | JEPA | A LeJEPA-style encoder builds an isotropic Gaussian embedding of each task and a decoder takes the embedding and an input grid to produce an output grid  |
 
 
@@ -54,7 +53,7 @@ The primary metric is **task accuracy**: the fraction of test tasks for which th
 
 ## Learnings
 
-Despite the variety of regularization techniques, **all approaches plateau at approximately 25% task accuracy** on the MINI-ARC test set with ~5M parameter transformer encoder models. This plateau is remarkably consistent across VAE, quantization (FSQ, RQ, wav2vec 2.0 style Gumbel softmax), iterative denoising (equilibrium matching) and LeJEPA, suggesting that the bottleneck is not the structure of the task embedding space but something more fundamental.
+Despite the variety of regularization techniques, **all approaches plateau at approximately 25% task accuracy** on the MINI-ARC test set with ~5M parameter transformer encoder models. This plateau is remarkably consistent across quantization (FSQ, RQ, wav2vec 2.0 style Gumbel softmax) and LeJEPA, suggesting that the bottleneck is not the structure of the task embedding space but something more fundamental.
 
 This convergence of results has convinced me that **pure neural network approaches are insufficient** for robust ARC generalization, and that further progress requires additional methods (e.g. neuro-symbolic).
 
