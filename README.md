@@ -64,4 +64,3 @@ These findings motivate me to explore hybrid neuro-symbolic approaches. In parti
 - **Search-based RL** algorithms such as AlphaGo/AlphaZero and [EfficientZero](https://arxiv.org/abs/2111.00210) applied to program synthesis — using a world model to plan over a DSL action space.
 - **[clingoARC](https://github.com/jblackwood/clingoArc)** (my repository from Answer Set Programming explorations): encoding ARC program search as first-order logic metaprogramming and solving with Answer Set Programming. The grounding bottleneck encountered there motivates using neural heuristics to drastically prune the search space.
 
-```
